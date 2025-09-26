@@ -248,6 +248,7 @@ def merge_video(target_path : str, temp_video_fps : Fps, output_video_resolution
 	if _is_cuda_encoder_preferred(output_video_encoder):
 		output_video_encoder = 'h264_nvenc'
 		state_manager.set_item('output_video_encoder', output_video_encoder)
+		logger.debug('Using NVENC video encoder for merge', __name__)
 
 	output_video_encoder = fix_video_encoder(temp_video_format, output_video_encoder)
 	commands = ffmpeg_builder.chain(

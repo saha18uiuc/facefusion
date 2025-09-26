@@ -3,7 +3,7 @@ from functools import lru_cache
 from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 from time import time
-from facefusion import profiler
+from facefusion import profilerZ
 
 import cv2
 import numpy

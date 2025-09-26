@@ -436,8 +436,17 @@ def process_video(start_time : float) -> ErrorCode:
 		if tracking_enabled is None:
 			state_manager.set_item('enable_face_tracking', True)
 		interval_value = state_manager.get_item('face_tracker_detection_interval')
-		if not isinstance(interval_value, int) or interval_value < 10:
-			state_manager.set_item('face_tracker_detection_interval', 10)
+		if not isinstance(interval_value, int) or interval_value < 20:
+			state_manager.set_item('face_tracker_detection_interval', 20)
+		min_points = state_manager.get_item('face_tracker_min_points')
+		if not isinstance(min_points, int) or min_points > 10:
+			state_manager.set_item('face_tracker_min_points', 10)
+		match_iou = state_manager.get_item('face_tracker_match_iou')
+		if not isinstance(match_iou, (int, float)) or match_iou > 0.25:
+			state_manager.set_item('face_tracker_match_iou', 0.25)
+		state_manager.set_item('face_swapper_batching', 'always')
+		state_manager.set_item('face_swapper_use_trt', True)
+		state_manager.set_item('face_swapper_trt_max_batch', 128)
 
 	logger.info(wording.get('extracting_frames').format(resolution = pack_resolution(temp_video_resolution), fps = temp_video_fps), __name__)
 
