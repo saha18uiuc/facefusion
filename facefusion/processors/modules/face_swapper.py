@@ -566,6 +566,7 @@ def _build_prepared_source_for_face(source_face: Face, target_face: Face) -> Dic
 	- For frame-based models (blendswap/uniface): returns the prepared source frame (1,C,H,W)
 	- For embedding-based models: returns the balanced source embedding (1,D)
 	"""
+	model_options = get_model_options()
 	model_type = model_options.get('type')
 	if model_type in [ 'blendswap', 'uniface' ]:
 		return { 'kind': 'frame', 'tensor': prepare_source_frame(source_face) }
