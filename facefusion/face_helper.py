@@ -1,9 +1,14 @@
 from functools import lru_cache
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy
 from cv2.typing import Size
+
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore
 
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
 
@@ -121,14 +126,25 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 	paste_width = x2 - x1
 	paste_height = y2 - y1
 
+	if paste_width <= 0 or paste_height <= 0:
+		return temp_vision_frame
+
+	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1).astype(numpy.float32)
+	if not numpy.any(inverse_mask):
+		return temp_vision_frame
+
+	gpu_result = _paste_back_cuda(temp_vision_frame, crop_vision_frame, inverse_mask, paste_matrix, paste_bounding_box)
+	if gpu_result is not None:
+		return gpu_result
+
 	if _has_cv2_cuda():
 		try:
 			# Warp on GPU, blend on CPU for simplicity and correctness
 			gpu_mask = cv2.cuda_GpuMat()
 			gpu_mask.upload(crop_mask.astype(numpy.float32))
 			inv_mask_gpu = cv2.cuda.warpAffine(gpu_mask, paste_matrix, (paste_width, paste_height))
-			inverse_mask = inv_mask_gpu.download().clip(0, 1)
-			inverse_mask = numpy.expand_dims(inverse_mask, axis = -1)
+			mask_roi = inv_mask_gpu.download().clip(0, 1)
+			mask_roi = numpy.expand_dims(mask_roi, axis = -1)
 
 			gpu_crop = cv2.cuda_GpuMat()
 			gpu_crop.upload(crop_vision_frame)
@@ -137,14 +153,13 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 
 			temp_vision_frame = temp_vision_frame.copy()
 			paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-			paste_vision_frame = paste_vision_frame * (1 - inverse_mask) + inverse_vision_frame * inverse_mask
+			paste_vision_frame = paste_vision_frame * (1 - mask_roi) + inverse_vision_frame * mask_roi
 			temp_vision_frame[y1:y2, x1:x2] = paste_vision_frame.astype(temp_vision_frame.dtype)
 			return temp_vision_frame
 		except Exception:
 			pass
 
-	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1).astype(numpy.float32)
-	# Use vectorized OpenCV ops for blending (faster than NumPy broadcasting on large frames)
+	inverse_mask_expanded = numpy.expand_dims(inverse_mask, axis = -1)
 	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
 	temp_vision_frame = temp_vision_frame.copy()
 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
@@ -152,13 +167,77 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 	paste_f32 = paste_vision_frame.astype(numpy.float32)
 	inv_frame_f32 = inverse_vision_frame.astype(numpy.float32)
 	# Expand mask to 3 channels via OpenCV
-	mask3 = cv2.merge([ inverse_mask, inverse_mask, inverse_mask ])
+	mask3 = cv2.merge([ inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0] ])
 	one_minus = 1.0 - mask3
 	part_a = cv2.multiply(paste_f32, one_minus)
 	part_b = cv2.multiply(inv_frame_f32, mask3)
 	blend = cv2.add(part_a, part_b)
 	temp_vision_frame[y1:y2, x1:x2] = blend.astype(temp_vision_frame.dtype)
 	return temp_vision_frame
+
+
+_GPU_WARP_AVAILABLE: Optional[bool] = None
+
+
+def _should_use_cuda_warp(area: int) -> bool:
+	global _GPU_WARP_AVAILABLE
+	if torch is None or not torch.cuda.is_available():
+		return False
+	if _GPU_WARP_AVAILABLE is False:
+		return False
+	if area < 65_536:  # Skip very small regions to avoid kernel launch overhead
+		return False
+	try:
+		from facefusion import state_manager
+		providers = state_manager.get_item('execution_providers') or []
+		if not any(str(provider).lower() in ('cuda', 'tensorrt') for provider in providers):
+			return False
+	except Exception:
+		pass
+	return True
+
+
+def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox) -> Optional[VisionFrame]:
+	global _GPU_WARP_AVAILABLE
+	if torch is None:
+		return None
+	x1, y1, x2, y2 = map(int, paste_box)
+	width = x2 - x1
+	height = y2 - y1
+	area = width * height
+	if width <= 0 or height <= 0 or not _should_use_cuda_warp(area):
+		return None
+	try:
+		from facefusion.gpu.kernels import warp_blend as cuda_warp_blend
+	except Exception:
+		_GPU_WARP_AVAILABLE = False
+		return None
+	device = torch.device('cuda')
+	try:
+		src_rgba_np = numpy.concatenate(
+			[
+				crop_frame.astype(numpy.float32) * (1.0 / 255.0),
+				numpy.ones((crop_frame.shape[0], crop_frame.shape[1], 1), dtype = numpy.float32)
+			], axis = -1)
+		src_tensor = torch.from_numpy(src_rgba_np).contiguous().to(device)
+		mask_tensor = torch.from_numpy(roi_mask.astype(numpy.float32)).contiguous().to(device)
+		bg_roi = temp_frame[y1:y2, x1:x2]
+		if bg_roi.shape[0] != height or bg_roi.shape[1] != width:
+			return None
+		bg_rgba_np = numpy.empty((height, width, 4), dtype = numpy.uint8)
+		bg_rgba_np[:, :, :3] = bg_roi
+		bg_rgba_np[:, :, 3] = 255
+		bg_tensor = torch.from_numpy(bg_rgba_np).contiguous().to(device)
+		affine_tensor = torch.from_numpy(paste_matrix.astype(numpy.float32).reshape(6)).contiguous().to(device)
+		out_tensor = cuda_warp_blend(src_tensor, mask_tensor, bg_tensor, affine_tensor)
+		out_np = out_tensor[..., :3].contiguous().cpu().numpy()
+		_GPU_WARP_AVAILABLE = True
+		temp_out = temp_frame.copy()
+		temp_out[y1:y2, x1:x2] = out_np
+		return temp_out
+	except Exception:
+		_GPU_WARP_AVAILABLE = False
+		return None
 
 
 def calculate_paste_area(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, affine_matrix : Matrix) -> Tuple[BoundingBox, Matrix]:

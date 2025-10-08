@@ -5,6 +5,8 @@ from typing import List, Optional
 
 from onnxruntime import InferenceSession, SessionOptions, GraphOptimizationLevel, ExecutionMode
 
+import torch
+
 from facefusion import logger, process_manager, state_manager, wording
 from facefusion.app_context import detect_app_context
 from facefusion.execution import create_inference_session_providers
@@ -87,6 +89,30 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
                 sess_options.execution_mode = ExecutionMode.ORT_PARALLEL
             except Exception:
                 pass
+        else:
+            try:
+                device_index = int(execution_device_id)
+            except Exception:
+                device_index = 0
+            try:
+                with torch.cuda.device(device_index):
+                    user_stream = torch.cuda.current_stream()
+                    stream_ptr = str(user_stream.cuda_stream)  # type: ignore[attr-defined]
+                updated_providers = []
+                for provider, options in inference_session_providers:
+                    if isinstance(options, dict) and provider in ('TensorrtExecutionProvider', 'CUDAExecutionProvider'):
+                        provider_options = dict(options)
+                        provider_options['has_user_compute_stream'] = '1'
+                        provider_options['user_compute_stream'] = stream_ptr
+                        if provider == 'TensorrtExecutionProvider':
+                            provider_options.setdefault('trt_fp16_enable', True)
+                            provider_options.setdefault('trt_timing_cache_enable', True)
+                        updated_providers.append((provider, provider_options))
+                    else:
+                        updated_providers.append((provider, options))
+                inference_session_providers = updated_providers
+            except Exception as stream_exception:
+                logger.debug(f'Falling back to provider-managed stream: {stream_exception}', __name__)
 
         if configured_threads:
             sess_options.intra_op_num_threads = configured_threads

@@ -14,7 +14,7 @@ import cv2
 import numpy
 from tqdm import tqdm
 
-from facefusion import benchmarker, cli_helper, content_analyser, face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, hash_helper, logger, process_manager, state_manager, video_manager, voice_extractor, wording
+from facefusion import benchmarker, cli_helper, content_analyser, face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, gpu_video_pipeline, hash_helper, logger, process_manager, state_manager, video_manager, voice_extractor, wording
 from facefusion.args import apply_args, collect_job_args, reduce_job_args, reduce_step_args
 from facefusion.audio import create_empty_audio_frame, get_audio_frame, get_voice_frame
 from facefusion.common_helper import get_first
@@ -602,11 +602,13 @@ def is_process_stopping() -> bool:
 def _can_use_streaming_pipeline() -> bool:
 	if not state_manager.get_item('enable_streaming_pipeline'):
 		return False
+	if gpu_video_pipeline.is_available():
+		return True
 	try:
 		import av  # type: ignore
 		return True
 	except Exception:
-		logger.debug('Streaming pipeline disabled because PyAV is unavailable', __name__)
+		logger.debug('Streaming pipeline disabled because GPU pipeline and PyAV are unavailable', __name__)
 		return False
 
 
@@ -766,6 +768,22 @@ def _run_streaming_loop(
 def process_video_streaming(temp_video_resolution : Tuple[int, int], temp_video_fps : float, trim_frame_start : int, trim_frame_end : int) -> bool:
 	target_path = state_manager.get_item('target_path')
 	temp_video_path = get_temp_file_path(target_path)
+	if gpu_video_pipeline.is_available():
+		try:
+			processed = _process_video_gpu_pipeline(
+				target_path,
+				temp_video_path,
+				temp_video_resolution,
+				temp_video_fps,
+				trim_frame_start,
+				trim_frame_end
+			)
+		except Exception as exception:
+			logger.debug(f'GPU streaming pipeline failed: {exception}', __name__)
+			processed = 0
+		if processed > 0:
+			return True
+
 	writer = open_rawvideo_writer(temp_video_path, temp_video_resolution, temp_video_fps)
 	if writer is None or writer.stdin is None:
 		logger.debug('Failed to initialise ffmpeg rawvideo writer; reverting to temp-frame pipeline', __name__)
@@ -819,3 +837,48 @@ def process_video_streaming(temp_video_resolution : Tuple[int, int], temp_video_
 		logger.debug(f'Streaming pipeline ({backend}) did not process any frames', __name__)
 		return False
 	return True
+
+
+def _process_video_gpu_pipeline(
+	target_path: str,
+	temp_video_path: str,
+	temp_video_resolution: Tuple[int, int],
+	temp_video_fps: float,
+	trim_frame_start: int,
+	trim_frame_end: int
+) -> int:
+	if trim_frame_start or trim_frame_end:
+		logger.debug('GPU pipeline trimming not yet supported, falling back', __name__)
+		return 0
+	width, height = temp_video_resolution
+	config = gpu_video_pipeline.PipelineConfig(
+		src=target_path,
+		dst=temp_video_path,
+		fps=temp_video_fps,
+		width=width,
+		height=height,
+		device=int(get_first(state_manager.get_item('execution_device_ids')) or 0),
+		chunk_size=1
+	)
+
+	reference_number = state_manager.get_item('reference_frame_number')
+	reference_vision_frame = _cached_reference_frame(target_path, reference_number)
+	source_paths = tuple(state_manager.get_item('source_paths') or [])
+	source_vision_frames = _cached_source_frames(source_paths)
+	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
+	providers = state_manager.get_item('execution_providers') or []
+
+	def process_frame_callback(frame_index: int, frame_bgr_cpu: numpy.ndarray) -> numpy.ndarray:
+		processed_cpu = process_frame_runtime(
+			frame_bgr_cpu,
+			trim_frame_start + frame_index,
+			reference_vision_frame,
+			source_vision_frames,
+			source_audio_path,
+			temp_video_fps
+		)
+		return numpy.ascontiguousarray(processed_cpu)
+
+	logger.debug(f'Launching GPU streaming pipeline on providers: {providers}', __name__)
+	processed = gpu_video_pipeline.run_pipeline(config, process_frame_callback)
+	return processed
