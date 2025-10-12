@@ -157,6 +157,8 @@ class NvdecNvencPipeline:
             dst=config.dst,
             format='mp4'
         )
+        with contextlib.suppress(Exception):
+            writer.set_muxer_option('vsync', 'cfr')
         writer.add_video_stream(
             frame_rate=config.fps,
             width=config.width,

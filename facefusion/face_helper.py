@@ -10,6 +10,13 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     torch = None  # type: ignore
 
+try:
+    from cv2 import ximgproc  # type: ignore[attr-defined]
+    _HAS_XIMGPROC = True
+except Exception:  # pragma: no cover - optional dependency
+    ximgproc = None  # type: ignore
+    _HAS_XIMGPROC = False
+
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
 
 # Detect CUDA support in OpenCV if available
@@ -126,6 +133,8 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 	paste_width = x2 - x1
 	paste_height = y2 - y1
 
+	crop_mask = _refine_mask_with_guided_filter(crop_vision_frame, crop_mask)
+
 	if paste_width <= 0 or paste_height <= 0:
 		return temp_vision_frame
 
@@ -238,6 +247,24 @@ def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask:
 	except Exception:
 		_GPU_WARP_AVAILABLE = False
 		return None
+
+
+def _refine_mask_with_guided_filter(crop_frame: VisionFrame, mask: Mask) -> Mask:
+	if mask.size == 0:
+		return mask
+	mask_f = mask.astype(numpy.float32)
+	mask_f = numpy.clip(mask_f, 0.0, 1.0)
+	if _HAS_XIMGPROC:
+		try:
+			guide = cv2.cvtColor(crop_frame, cv2.COLOR_BGR2GRAY)
+			radius = 8
+			eps = 1e-4
+			refined = ximgproc.guidedFilter(guide, mask_f, radius, eps)
+			return numpy.clip(refined, 0.0, 1.0)
+		except Exception:
+			pass
+	# lightweight fallback: gentle gaussian smooth
+	return cv2.GaussianBlur(mask_f, (0, 0), 1.2)
 
 
 def calculate_paste_area(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, affine_matrix : Matrix) -> Tuple[BoundingBox, Matrix]:

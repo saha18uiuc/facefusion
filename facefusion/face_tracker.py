@@ -7,6 +7,7 @@ from typing import Callable, Dict, List, Optional
 
 import cv2
 import numpy
+import math
 
 from facefusion import state_manager
 from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle
@@ -22,6 +23,37 @@ class _TrackedFace:
     last_detection_frame: int = 0
 
 
+class _OneEuroFilter:
+    def __init__(self, fps: float = 30.0, min_cutoff: float = 1.2, beta: float = 0.05, dcut: float = 1.0) -> None:
+        self._te = 1.0 / max(1e-3, fps)
+        self._min_cutoff = float(min_cutoff)
+        self._beta = float(beta)
+        self._dcut = float(dcut)
+        self._x_prev: Optional[float] = None
+        self._dx_prev: float = 0.0
+
+    def _alpha(self, cutoff: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / self._te)
+
+    def reset(self, value: float) -> None:
+        self._x_prev = value
+        self._dx_prev = 0.0
+
+    def filter(self, value: float) -> float:
+        if self._x_prev is None:
+            self.reset(value)
+            return value
+        dx = (value - self._x_prev) / self._te
+        alpha_d = self._alpha(self._dcut)
+        self._dx_prev = alpha_d * dx + (1.0 - alpha_d) * self._dx_prev
+        cutoff = self._min_cutoff + self._beta * abs(self._dx_prev)
+        alpha = self._alpha(cutoff)
+        filtered = alpha * value + (1.0 - alpha) * self._x_prev
+        self._x_prev = filtered
+        return filtered
+
+
 class FaceTracker:
     def __init__(self) -> None:
         self._tracks: Dict[int, _TrackedFace] = {}
@@ -35,6 +67,12 @@ class FaceTracker:
         self._min_points = 10
         self._match_iou = 0.3
         self._config_signature: Optional[tuple[int, int, int, float]] = None
+        self._filters: Dict[int, List[_OneEuroFilter]] = {}
+        fps = state_manager.get_item('output_video_fps')
+        try:
+            self._fps = float(fps) if fps else 30.0
+        except Exception:
+            self._fps = 30.0
 
     def reset(self) -> None:
         with self._lock:
@@ -42,6 +80,7 @@ class FaceTracker:
             self._next_track_id = 0
             self._prev_gray = None
             self._frame_index = 0
+            self._filters.clear()
 
     def process_frame(self, vision_frame: VisionFrame, detect_fn: Callable[[VisionFrame], List[Face]]) -> List[Face]:
         with self._lock:
@@ -108,6 +147,7 @@ class FaceTracker:
                 track.points_68 = face.landmark_set.get('68').astype(numpy.float32)
                 track.misses = 0
                 track.last_detection_frame = self._frame_index
+                self._reset_filters(matched_id, track.points_68)
                 unmatched_track_ids.discard(matched_id)
                 assigned.append(track.face)
             else:
@@ -120,6 +160,7 @@ class FaceTracker:
             track.misses += 1
             if track.misses > self._max_missed:
                 del self._tracks[track_id]
+                self._filters.pop(track_id, None)
 
         return assigned
 
@@ -148,6 +189,7 @@ class FaceTracker:
             last_detection_frame=self._frame_index,
         )
         self._tracks[self._next_track_id] = track
+        self._filters[self._next_track_id] = self._build_filters(track.points_68)
         self._next_track_id += 1
         return track.face
 
@@ -190,7 +232,14 @@ class FaceTracker:
 
             updated = track.points_68.copy()
             updated[status_mask] = next_points.reshape(-1, 2)[status_mask]
-            track.points_68 = updated
+            filters = self._filters.get(track_id)
+            if filters is None:
+                filters = self._build_filters(updated)
+                self._filters[track_id] = filters
+            flat = updated.reshape(-1)
+            for idx in range(flat.shape[0]):
+                flat[idx] = filters[idx].filter(float(flat[idx]))
+            track.points_68 = flat.reshape(updated.shape)
 
             min_xy = updated.min(axis=0)
             max_xy = updated.max(axis=0)
@@ -226,8 +275,26 @@ class FaceTracker:
 
         for track_id in remove_ids:
             self._tracks.pop(track_id, None)
+            self._filters.pop(track_id, None)
 
         return tracked_faces
+
+    def _build_filters(self, points: numpy.ndarray) -> List[_OneEuroFilter]:
+        total = int(points.size)
+        filters = [_OneEuroFilter(fps=self._fps) for _ in range(total)]
+        flat = points.reshape(-1)
+        for idx, value in enumerate(flat):
+            filters[idx].reset(float(value))
+        return filters
+
+    def _reset_filters(self, track_id: int, points: numpy.ndarray) -> None:
+        filters = self._filters.get(track_id)
+        if filters is None or len(filters) != points.size:
+            self._filters[track_id] = self._build_filters(points)
+            return
+        flat = points.reshape(-1)
+        for idx, value in enumerate(flat):
+            filters[idx].reset(float(value))
 
 
 def _compute_iou(box_a: numpy.ndarray, box_b: numpy.ndarray) -> float:

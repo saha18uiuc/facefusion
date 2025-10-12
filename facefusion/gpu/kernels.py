@@ -15,6 +15,15 @@ def _load_module() -> object:
     #include <torch/extension.h>
     #include <ATen/cuda/CUDAContext.h>
     #include <ATen/cuda/CUDAUtils.h>
+    #include <math.h>
+
+    __device__ __forceinline__ float srgb_to_linear(float c) {
+        return (c <= 0.04045f) ? (c / 12.92f) : powf((c + 0.055f) * (1.0f / 1.055f), 2.4f);
+    }
+
+    __device__ __forceinline__ float linear_to_srgb(float c) {
+        return (c <= 0.0031308f) ? (12.92f * c) : (1.055f * powf(c, 1.0f / 2.4f) - 0.055f);
+    }
 
     __global__ void warp_blend_kernel(
         cudaTextureObject_t src_tex,
@@ -42,19 +51,32 @@ def _load_module() -> object:
 
         float a = alpha[y * width + x];
         float inv_a = 1.0f - a;
+        float3 src_srgb = make_float3(sample.x, sample.y, sample.z);
+        float3 bg_srgb = make_float3(bg_px.x * (1.0f / 255.0f),
+                                     bg_px.y * (1.0f / 255.0f),
+                                     bg_px.z * (1.0f / 255.0f));
 
-        float3 bgf = make_float3(bg_px.x * (1.0f/255.0f), bg_px.y * (1.0f/255.0f), bg_px.z * (1.0f/255.0f));
-        float3 sf = make_float3(sample.x, sample.y, sample.z);
-        float3 outc;
-        outc.x = sf.x * a + bgf.x * inv_a;
-        outc.y = sf.y * a + bgf.y * inv_a;
-        outc.z = sf.z * a + bgf.z * inv_a;
+        float3 src_lin = make_float3(srgb_to_linear(src_srgb.x),
+                                     srgb_to_linear(src_srgb.y),
+                                     srgb_to_linear(src_srgb.z));
+        float3 bg_lin = make_float3(srgb_to_linear(bg_srgb.x),
+                                    srgb_to_linear(bg_srgb.y),
+                                    srgb_to_linear(bg_srgb.z));
+
+        float3 out_lin;
+        out_lin.x = fmaf(src_lin.x - bg_lin.x, a, bg_lin.x);
+        out_lin.y = fmaf(src_lin.y - bg_lin.y, a, bg_lin.y);
+        out_lin.z = fmaf(src_lin.z - bg_lin.z, a, bg_lin.z);
+
+        float3 out_srgb = make_float3(linear_to_srgb(out_lin.x),
+                                      linear_to_srgb(out_lin.y),
+                                      linear_to_srgb(out_lin.z));
 
         uchar4* out_row = reinterpret_cast<uchar4*>(reinterpret_cast<char*>(out) + y * out_stride);
         out_row[x] = make_uchar4(
-            static_cast<unsigned char>(fminf(fmaxf(outc.x * 255.0f, 0.0f), 255.0f)),
-            static_cast<unsigned char>(fminf(fmaxf(outc.y * 255.0f, 0.0f), 255.0f)),
-            static_cast<unsigned char>(fminf(fmaxf(outc.z * 255.0f, 0.0f), 255.0f)),
+            static_cast<unsigned char>(fminf(fmaxf(out_srgb.x * 255.0f, 0.0f), 255.0f)),
+            static_cast<unsigned char>(fminf(fmaxf(out_srgb.y * 255.0f, 0.0f), 255.0f)),
+            static_cast<unsigned char>(fminf(fmaxf(out_srgb.z * 255.0f, 0.0f), 255.0f)),
             255
         );
     }
