@@ -221,6 +221,7 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 		return temp_vision_frame
 
 	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1).astype(numpy.float32)
+	inverse_mask = cv2.GaussianBlur(inverse_mask, (0, 0), 1.0)
 	if not numpy.any(inverse_mask):
 		return temp_vision_frame
 
@@ -263,7 +264,14 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 	part_a = cv2.multiply(paste_f32, one_minus)
 	part_b = cv2.multiply(inv_frame_f32, mask3)
 	blend = cv2.add(part_a, part_b)
-	temp_vision_frame[y1:y2, x1:x2] = blend.astype(temp_vision_frame.dtype)
+	blend_u8 = numpy.clip(blend, 0.0, 255.0).astype(temp_vision_frame.dtype)
+	try:
+		mask_u8 = numpy.clip(inverse_mask * 255.0, 0.0, 255.0).astype(numpy.uint8)
+		clone = cv2.seamlessClone(blend_u8, paste_vision_frame, mask_u8, (max(1, paste_width // 2), max(1, paste_height // 2)), cv2.NORMAL_CLONE)
+		blend_u8 = clone
+	except cv2.error:
+		pass
+	temp_vision_frame[y1:y2, x1:x2] = blend_u8
 	return temp_vision_frame
 
 
@@ -276,10 +284,16 @@ def _should_use_cuda_warp(area: int) -> bool:
 		return False
 	if _GPU_WARP_AVAILABLE is False:
 		return False
+	try:
+		from facefusion import state_manager
+		enabled = state_manager.get_item('enable_gpu_compositor')
+		if not enabled:
+			return False
+	except Exception:
+		return False
 	if area < 65_536:  # Skip very small regions to avoid kernel launch overhead
 		return False
 	try:
-		from facefusion import state_manager
 		providers = state_manager.get_item('execution_providers') or []
 		if not any(str(provider).lower() in ('cuda', 'tensorrt') for provider in providers):
 			return False
@@ -348,6 +362,13 @@ def _refine_mask_with_guided_filter(crop_frame: VisionFrame, mask: Mask) -> Mask
 		return mask
 	mask_f = mask.astype(numpy.float32)
 	mask_f = numpy.clip(mask_f, 0.0, 1.0)
+	if mask_f.ndim == 2:
+		kernel = numpy.ones((3, 3), numpy.uint8)
+		mask_binary = (mask_f >= 0.5).astype(numpy.uint8)
+		mask_closed = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel, iterations = 1)
+		mask_open = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel, iterations = 1)
+		mask_f = cv2.GaussianBlur(mask_open.astype(numpy.float32), (0, 0), 1.0)
+		mask_f = numpy.clip(mask_f, 0.0, 1.0)
 	if _HAS_XIMGPROC:
 		try:
 			guide = cv2.cvtColor(crop_frame, cv2.COLOR_BGR2GRAY)
