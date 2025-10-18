@@ -349,6 +349,12 @@ class GpuRoiComposer:
         mask_numpy: numpy.ndarray,
         flow_bundle: Optional[Tuple['cv2.cuda.GpuMat', 'cv2.cuda.GpuMat']]
     ) -> Tuple[torch.Tensor, numpy.ndarray]:
+        area = float(mask_numpy.sum())
+        min_keep = max(32.0, 0.01 * mask_numpy.size)
+        if area < min_keep:
+            state.prev_mask = None
+            return mask_tensor, mask_numpy
+
         if state.prev_mask is None or flow_bundle is None:
             state.prev_mask = mask_numpy.copy()
             return mask_tensor, mask_numpy
@@ -357,8 +363,9 @@ class GpuRoiComposer:
         warped_mask, reliable = state.warp_mask(state.prev_mask, flow_gpu, cost_gpu, float(self.temporal_tau))
         reliable_t = torch.from_numpy(reliable).to(self.device, dtype=torch.float32)
         warped_t = torch.from_numpy(warped_mask).to(self.device, dtype=torch.float32)
-        mask_tensor = torch.clamp(mask_tensor * (1.0 - reliable_t) + warped_t * reliable_t, 0.0, 1.0)
+        mask_tensor = torch.clamp(mask_tensor * (1.0 - reliable_t) + torch.clamp(warped_t, 0.0, 1.0) * reliable_t, 0.0, 1.0)
         mask_numpy = mask_tensor.detach().cpu().numpy().astype(numpy.float32)
+        state.prev_mask = mask_numpy.copy()
         return mask_tensor, mask_numpy
 
     def _apply_temporal(
@@ -370,6 +377,14 @@ class GpuRoiComposer:
         blended_lin: torch.Tensor,
         mask_numpy: numpy.ndarray
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        area = float(mask_numpy.sum())
+        min_keep = max(32.0, 0.01 * mask_numpy.size)
+        if area < min_keep:
+            state.prev_bg_gray = curr_gray
+            state.prev_comp_bgr = frame_bgr.cpu().numpy()
+            state.prev_mask = None
+            return frame_bgr, blended_lin
+
         if state.prev_bg_gray is None or state.prev_comp_bgr is None:
             state.prev_bg_gray = curr_gray
             state.prev_comp_bgr = frame_bgr.cpu().numpy()

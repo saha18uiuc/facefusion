@@ -326,6 +326,14 @@ def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask:
 			extras=extra_payload
 		)
 		out_np = result.frame_bgr.contiguous().cpu().numpy()
+		mask_comp = result.mask.squeeze(0).contiguous().cpu().numpy()
+		mask_area = float(mask_comp.sum())
+		if mask_area > max(64.0, 0.01 * mask_comp.size):
+			mask_u8 = numpy.clip(mask_comp * 255.0, 0.0, 255.0).astype(numpy.uint8)
+			try:
+				out_np = cv2.seamlessClone(out_np, bg_contig, mask_u8, (max(1, width // 2), max(1, height // 2)), cv2.NORMAL_CLONE)
+			except cv2.error:
+				pass
 		_GPU_WARP_AVAILABLE = True
 		temp_out = temp_frame.copy()
 		temp_out[y1:y2, x1:x2] = out_np
