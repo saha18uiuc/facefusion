@@ -1,8 +1,7 @@
-"""CUDA kernels compiled at runtime for GPU-accelerated post-processing."""
+"""CUDA kernels compiled at runtime for GPU-accelerated ROI warping."""
 from __future__ import annotations
 
 import functools
-from typing import Tuple
 
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -17,24 +16,51 @@ def _load_module() -> object:
     #include <ATen/cuda/CUDAUtils.h>
     #include <math.h>
 
-    __device__ __forceinline__ float srgb_to_linear(float c) {
-        return (c <= 0.04045f) ? (c / 12.92f) : powf((c + 0.055f) * (1.0f / 1.055f), 2.4f);
+    __device__ __forceinline__ float catmull_rom(float p0, float p1, float p2, float p3, float t) {
+        float a0 = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
+        float a1 = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
+        float a2 = -0.5f * p0 + 0.5f * p2;
+        return ((a0 * t + a1) * t + a2) * t + p1;
     }
 
-    __device__ __forceinline__ float linear_to_srgb(float c) {
-        return (c <= 0.0031308f) ? (12.92f * c) : (1.055f * powf(c, 1.0f / 2.4f) - 0.055f);
+    __device__ __forceinline__ float4 sample_catmull_rom(cudaTextureObject_t tex, float sx, float sy) {
+        float fx = floorf(sx);
+        float fy = floorf(sy);
+        float tx = sx - fx;
+        float ty = sy - fy;
+
+        int ix = static_cast<int>(fx);
+        int iy = static_cast<int>(fy);
+
+        float4 rows[4];
+        for (int j = -1; j <= 2; ++j) {
+            float4 p0 = tex2D<float4>(tex, static_cast<float>(ix - 1) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+            float4 p1 = tex2D<float4>(tex, static_cast<float>(ix) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+            float4 p2 = tex2D<float4>(tex, static_cast<float>(ix + 1) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+            float4 p3 = tex2D<float4>(tex, static_cast<float>(ix + 2) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+
+            rows[j + 1].x = catmull_rom(p0.x, p1.x, p2.x, p3.x, tx);
+            rows[j + 1].y = catmull_rom(p0.y, p1.y, p2.y, p3.y, tx);
+            rows[j + 1].z = catmull_rom(p0.z, p1.z, p2.z, p3.z, tx);
+            rows[j + 1].w = catmull_rom(p0.w, p1.w, p2.w, p3.w, tx);
+        }
+
+        float4 result;
+        result.x = catmull_rom(rows[0].x, rows[1].x, rows[2].x, rows[3].x, ty);
+        result.y = catmull_rom(rows[0].y, rows[1].y, rows[2].y, rows[3].y, ty);
+        result.z = catmull_rom(rows[0].z, rows[1].z, rows[2].z, rows[3].z, ty);
+        result.w = catmull_rom(rows[0].w, rows[1].w, rows[2].w, rows[3].w, ty);
+        return result;
     }
 
-    __global__ void warp_blend_kernel(
+    __global__ void warp_catmull_kernel(
         cudaTextureObject_t src_tex,
-        const uchar4* __restrict__ bg,
-        const float* __restrict__ alpha,
-        uchar4* __restrict__ out,
+        float* __restrict__ out,
         const float* __restrict__ affine,
         int width,
         int height,
-        size_t bg_stride,
-        size_t out_stride
+        int channels,
+        size_t out_stride_bytes
     ) {
         int x = blockIdx.x * blockDim.x + threadIdx.x;
         int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -42,43 +68,27 @@ def _load_module() -> object:
             return;
         }
 
-        float sx = affine[0] * x + affine[1] * y + affine[2];
-        float sy = affine[3] * x + affine[4] * y + affine[5];
-        float4 sample = tex2D<float4>(src_tex, sx + 0.5f, sy + 0.5f);
+        float sx = affine[0] * static_cast<float>(x) + affine[1] * static_cast<float>(y) + affine[2];
+        float sy = affine[3] * static_cast<float>(x) + affine[4] * static_cast<float>(y) + affine[5];
 
-        const uchar4* bg_row = reinterpret_cast<const uchar4*>(reinterpret_cast<const char*>(bg) + y * bg_stride);
-        uchar4 bg_px = bg_row[x];
+        float4 sample = sample_catmull_rom(src_tex, sx, sy);
 
-        float a = alpha[y * width + x];
-        float inv_a = 1.0f - a;
-        float3 src_srgb = make_float3(sample.x, sample.y, sample.z);
-        float3 bg_srgb = make_float3(bg_px.x * (1.0f / 255.0f),
-                                     bg_px.y * (1.0f / 255.0f),
-                                     bg_px.z * (1.0f / 255.0f));
+        char* base = reinterpret_cast<char*>(out);
+        float* row_ptr = reinterpret_cast<float*>(base + static_cast<size_t>(y) * out_stride_bytes);
+        float* pixel_ptr = row_ptr + static_cast<size_t>(x) * channels;
 
-        float3 src_lin = make_float3(srgb_to_linear(src_srgb.x),
-                                     srgb_to_linear(src_srgb.y),
-                                     srgb_to_linear(src_srgb.z));
-        float3 bg_lin = make_float3(srgb_to_linear(bg_srgb.x),
-                                    srgb_to_linear(bg_srgb.y),
-                                    srgb_to_linear(bg_srgb.z));
-
-        float3 out_lin;
-        out_lin.x = fmaf(src_lin.x - bg_lin.x, a, bg_lin.x);
-        out_lin.y = fmaf(src_lin.y - bg_lin.y, a, bg_lin.y);
-        out_lin.z = fmaf(src_lin.z - bg_lin.z, a, bg_lin.z);
-
-        float3 out_srgb = make_float3(linear_to_srgb(out_lin.x),
-                                      linear_to_srgb(out_lin.y),
-                                      linear_to_srgb(out_lin.z));
-
-        uchar4* out_row = reinterpret_cast<uchar4*>(reinterpret_cast<char*>(out) + y * out_stride);
-        out_row[x] = make_uchar4(
-            static_cast<unsigned char>(fminf(fmaxf(out_srgb.x * 255.0f, 0.0f), 255.0f)),
-            static_cast<unsigned char>(fminf(fmaxf(out_srgb.y * 255.0f, 0.0f), 255.0f)),
-            static_cast<unsigned char>(fminf(fmaxf(out_srgb.z * 255.0f, 0.0f), 255.0f)),
-            255
-        );
+        if (channels >= 1) {
+            pixel_ptr[0] = sample.x;
+        }
+        if (channels >= 2) {
+            pixel_ptr[1] = sample.y;
+        }
+        if (channels >= 3) {
+            pixel_ptr[2] = sample.z;
+        }
+        if (channels >= 4) {
+            pixel_ptr[3] = sample.w;
+        }
     }
 
     static cudaTextureObject_t create_texture(const torch::Tensor& src) {
@@ -86,9 +96,12 @@ def _load_module() -> object:
         cudaResourceDesc res_desc{};
         cudaTextureDesc tex_desc{};
 
+        TORCH_CHECK(src.dim() == 3, "src tensor must be HxWxC");
         auto sizes = src.sizes();
         int height = static_cast<int>(sizes[0]);
         int width = static_cast<int>(sizes[1]);
+        int channels = static_cast<int>(sizes[2]);
+        TORCH_CHECK(channels == 4, "src tensor expects 4 channels (B, G, R, extra)");
 
         res_desc.resType = cudaResourceTypePitch2D;
         res_desc.res.pitch2D.devPtr = const_cast<void*>(src.data_ptr());
@@ -99,7 +112,7 @@ def _load_module() -> object:
 
         tex_desc.addressMode[0] = cudaAddressModeClamp;
         tex_desc.addressMode[1] = cudaAddressModeClamp;
-        tex_desc.filterMode = cudaFilterModeLinear;
+        tex_desc.filterMode = cudaFilterModePoint;
         tex_desc.readMode = cudaReadModeElementType;
         tex_desc.normalizedCoords = 0;
 
@@ -113,49 +126,41 @@ def _load_module() -> object:
         }
     }
 
-    torch::Tensor warp_blend(
+    torch::Tensor warp_face(
         torch::Tensor src,
-        torch::Tensor alpha,
-        torch::Tensor bg,
-        torch::Tensor affine
+        torch::Tensor affine,
+        int64_t width,
+        int64_t height
     ) {
         TORCH_CHECK(src.is_cuda(), "src must be CUDA");
-        TORCH_CHECK(alpha.is_cuda(), "alpha must be CUDA");
-        TORCH_CHECK(bg.is_cuda(), "bg must be CUDA");
         TORCH_CHECK(affine.is_cuda(), "affine must be CUDA");
         TORCH_CHECK(src.dtype() == torch::kFloat32, "src tensor expects float32");
-        TORCH_CHECK(alpha.dtype() == torch::kFloat32, "alpha tensor expects float32");
-        TORCH_CHECK(bg.dtype() == torch::kUInt8, "bg tensor expects uint8");
+        TORCH_CHECK(affine.dtype() == torch::kFloat32, "affine tensor expects float32");
         TORCH_CHECK(affine.numel() == 6, "affine must have 6 elements");
+        TORCH_CHECK(width > 0 && height > 0, "output width/height must be positive");
 
-        TORCH_CHECK(alpha.dim() == 2, "alpha tensor must be 2D (H, W)");
-        auto height = alpha.size(0);
-        auto width = alpha.size(1);
-
-        TORCH_CHECK(bg.size(0) == height && bg.size(1) == width,
-                    "background ROI dimensions must match alpha dimensions");
-
-        auto options = bg.options();
-        auto out = torch::empty_like(bg);
+        int channels = static_cast<int>(src.size(2));
+        auto options = src.options();
+        auto out = torch::empty({height, width, channels}, options);
 
         cudaTextureObject_t tex = create_texture(src);
 
         const dim3 block(16, 16);
-        const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+        const dim3 grid(
+            static_cast<unsigned int>((width + block.x - 1) / block.x),
+            static_cast<unsigned int>((height + block.y - 1) / block.y)
+        );
 
         auto stream = at::cuda::getCurrentCUDAStream();
-        size_t bg_stride_bytes = bg.stride(0) * bg.element_size();
-        size_t out_stride_bytes = out.stride(0) * out.element_size();
+        size_t out_stride_bytes = static_cast<size_t>(out.stride(0)) * out.element_size();
 
-        warp_blend_kernel<<<grid, block, 0, stream.stream()>>>(
+        warp_catmull_kernel<<<grid, block, 0, stream.stream()>>>(
             tex,
-            reinterpret_cast<const uchar4*>(bg.data_ptr()),
-            alpha.data_ptr<float>(),
-            reinterpret_cast<uchar4*>(out.data_ptr()),
+            out.data_ptr<float>(),
             affine.data_ptr<float>(),
-            width,
-            height,
-            bg_stride_bytes,
+            static_cast<int>(width),
+            static_cast<int>(height),
+            channels,
             out_stride_bytes
         );
         destroy_texture(tex);
@@ -164,18 +169,19 @@ def _load_module() -> object:
     }
 
     PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-        m.def("warp_blend", &warp_blend, "Fused affine warp, bilinear sample, and alpha blend");
+        m.def("warp_face", &warp_face, "Catmull-Rom warp of source ROI into destination frame");
     }
     """
     return load_inline(
         name="facefusion_cuda_kernels",
         cpp_sources="",
         cuda_sources=cuda_src,
-        functions=["warp_blend"],
+        functions=["warp_face"],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
 
 
-def warp_blend(src_rgba: torch.Tensor, alpha: torch.Tensor, background_bgr: torch.Tensor, affine: torch.Tensor) -> torch.Tensor:
+def warp_face(src_rgba: torch.Tensor, affine: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    """Warp ``src_rgba`` (BGR + extra channel) into an ROI with Catmull-Rom sampling."""
     module = _load_module()
-    return module.warp_blend(src_rgba, alpha, background_bgr, affine)
+    return module.warp_face(src_rgba, affine, int(width), int(height))

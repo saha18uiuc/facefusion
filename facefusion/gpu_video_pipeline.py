@@ -166,6 +166,16 @@ class NvdecNvencPipeline:
             encoder='h264_nvenc',
             hw_accel=f'cuda:{config.device}',
             pixel_format='nv12',
+            encoder_option={
+                'preset': 'p4',
+                'tune': 'hq',
+                'rc': 'vbr_hq',
+                'cq': '19',
+                'bf': '2',
+                'spatial_aq': '1',
+                'temporal_aq': '1',
+                'look_ahead': '0',
+            },
         )
         writer.set_audio_stream(None)
         writer.open()

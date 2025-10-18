@@ -799,6 +799,14 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 
 	# Scale faces to temp_vision_frame size for correct warping
 	scaled_faces : List[Face] = [scale_face(tf, target_vision_frame, temp_vision_frame) for tf in target_faces]
+	track_tokens : Dict[int, Optional[str]] = {}
+	try:
+		tracker_instance = face_tracker.get_tracker()
+		for face_index, scaled_face in enumerate(scaled_faces):
+			track_id = tracker_instance.get_track_token(scaled_face)
+			track_tokens[face_index] = str(track_id) if track_id is not None else None
+	except Exception:
+		track_tokens = { face_index: None for face_index in range(len(scaled_faces)) }
 
 	# The common single-face / no-tiling case gains nothing from the batch path and
 	# pays extra Cupy/IO-binding setup cost, so keep the lean sequential swap.
@@ -959,7 +967,8 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 		# Paste back in stable order (by face index)
 		for fi in range(len(scaled_faces)):
 			crop_swapped, crop_mask, affine_matrix = results[fi]
-			temp_vision_frame = paste_back(temp_vision_frame, crop_swapped, crop_mask, affine_matrix)
+			track_token = track_tokens.get(fi)
+			temp_vision_frame = paste_back(temp_vision_frame, crop_swapped, crop_mask, affine_matrix, track_token=track_token)
 		return temp_vision_frame
 
 	if outputs_batch is None:
@@ -1000,7 +1009,8 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 			crop_mask = numpy.ones(crop_swapped.shape[:2], dtype=numpy.float32)
 			# Paste back
 			affine_matrix = affine_matrix if affine_matrix is not None else numpy.eye(2, 3, dtype=numpy.float32)
-			temp_vision_frame = paste_back(temp_vision_frame, crop_swapped, crop_mask, affine_matrix)
+			track_token = track_tokens.get(fi)
+			temp_vision_frame = paste_back(temp_vision_frame, crop_swapped, crop_mask, affine_matrix, track_token=track_token)
 	paste_end = time()
 
 	faces_batched = len(scaled_faces)
@@ -1052,7 +1062,15 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 		crop_masks.append(region_mask)
 
 	crop_mask = numpy.minimum.reduce(crop_masks).clip(0, 1)
-	paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix)
+	track_token = None
+	try:
+		tracker_instance = face_tracker.get_tracker()
+		track_id = tracker_instance.get_track_token(target_face)
+		if track_id is not None:
+			track_token = str(track_id)
+	except Exception:
+		track_token = None
+	paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix, track_token=track_token)
 	return paste_vision_frame
 
 

@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy
@@ -11,6 +11,11 @@ except Exception:  # pragma: no cover - optional dependency
     torch = None  # type: ignore
 
 try:
+    from facefusion.gpu.compositor import get_composer  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    get_composer = None  # type: ignore
+
+try:
     from cv2 import ximgproc  # type: ignore[attr-defined]
     _HAS_XIMGPROC = True
 except Exception:  # pragma: no cover - optional dependency
@@ -18,6 +23,7 @@ except Exception:  # pragma: no cover - optional dependency
     _HAS_XIMGPROC = False
 
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
+from facefusion import state_manager
 
 # Detect CUDA support in OpenCV if available
 def _has_cv2_cuda() -> bool:
@@ -87,6 +93,78 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
 }
 
 
+class _OneEuroScalarFilter:
+	def __init__(self, fps: float, min_cutoff: float = 1.0, beta: float = 0.03, dcutoff: float = 1.0) -> None:
+		self._te = 1.0 / max(1e-3, fps)
+		self._min_cutoff = float(min_cutoff)
+		self._beta = float(beta)
+		self._dcutoff = float(dcutoff)
+		self._x_prev: Optional[float] = None
+		self._dx_prev: float = 0.0
+
+	def _alpha(self, cutoff: float) -> float:
+		tau = 1.0 / (2.0 * numpy.pi * cutoff)
+		return 1.0 / (1.0 + tau / self._te)
+
+	def reset(self, value: float) -> None:
+		self._x_prev = value
+		self._dx_prev = 0.0
+
+	def filter(self, value: float) -> float:
+		if self._x_prev is None:
+			self.reset(value)
+			return value
+		dx = (value - self._x_prev) / self._te
+		alpha_d = self._alpha(self._dcutoff)
+		self._dx_prev = alpha_d * dx + (1.0 - alpha_d) * self._dx_prev
+		cutoff = self._min_cutoff + self._beta * abs(self._dx_prev)
+		alpha = self._alpha(cutoff)
+		filtered = alpha * value + (1.0 - alpha) * self._x_prev
+		self._x_prev = filtered
+		return filtered
+
+
+class _AffineSmoother:
+	def __init__(self, fps: float) -> None:
+		self._filters = [_OneEuroScalarFilter(fps=fps) for _ in range(6)]
+		self._initialized = False
+
+	def apply(self, matrix: Matrix) -> Matrix:
+		flat = numpy.asarray(matrix, dtype = numpy.float32).reshape(-1)
+		if not self._initialized:
+			for filt, value in zip(self._filters, flat):
+				filt.reset(float(value))
+			self._initialized = True
+			return flat.reshape(matrix.shape)
+		smoothed = numpy.empty_like(flat)
+		for idx, value in enumerate(flat):
+			smoothed[idx] = self._filters[idx].filter(float(value))
+		return smoothed.reshape(matrix.shape)
+
+
+_AFFINE_SMOOTHERS: Dict[str, _AffineSmoother] = {}
+
+
+def _smooth_affine_matrix(track_token: Optional[str], matrix: Matrix) -> Matrix:
+	if track_token is None:
+		return matrix
+	key = str(track_token)
+	smoother = _AFFINE_SMOOTHERS.get(key)
+	if smoother is None:
+		fps = state_manager.get_item('output_video_fps')
+		try:
+			fps_val = float(fps) if fps else 30.0
+		except Exception:
+			fps_val = 30.0
+		smoother = _AffineSmoother(fps_val)
+		_AFFINE_SMOOTHERS[key] = smoother
+	return smoother.apply(matrix)
+
+
+def reset_affine_smoothers() -> None:
+	_AFFINE_SMOOTHERS.clear()
+
+
 def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
 	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
@@ -127,13 +205,17 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
 	return crop_vision_frame, affine_matrix
 
 
-def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
+def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix, track_token: Optional[object] = None) -> VisionFrame:
+	track_key = str(track_token) if track_token is not None else None
+	if track_key is not None:
+		affine_matrix = _smooth_affine_matrix(track_key, affine_matrix)
 	paste_bounding_box, paste_matrix = calculate_paste_area(temp_vision_frame, crop_vision_frame, affine_matrix)
 	x1, y1, x2, y2 = paste_bounding_box
 	paste_width = x2 - x1
 	paste_height = y2 - y1
 
 	crop_mask = _refine_mask_with_guided_filter(crop_vision_frame, crop_mask)
+	sdf_map = _compute_signed_distance(crop_mask)
 
 	if paste_width <= 0 or paste_height <= 0:
 		return temp_vision_frame
@@ -142,7 +224,7 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 	if not numpy.any(inverse_mask):
 		return temp_vision_frame
 
-	gpu_result = _paste_back_cuda(temp_vision_frame, crop_vision_frame, inverse_mask, paste_matrix, paste_bounding_box)
+	gpu_result = _paste_back_cuda(temp_vision_frame, crop_vision_frame, inverse_mask, paste_matrix, paste_bounding_box, track_key, sdf_map)
 	if gpu_result is not None:
 		return gpu_result
 
@@ -206,9 +288,9 @@ def _should_use_cuda_warp(area: int) -> bool:
 	return True
 
 
-def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox) -> Optional[VisionFrame]:
+def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox, track_token: Optional[str], sdf_map: Optional[Mask]) -> Optional[VisionFrame]:
 	global _GPU_WARP_AVAILABLE
-	if torch is None:
+	if torch is None or get_composer is None:
 		return None
 	x1, y1, x2, y2 = map(int, paste_box)
 	width = x2 - x1
@@ -216,30 +298,34 @@ def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask:
 	area = width * height
 	if width <= 0 or height <= 0 or not _should_use_cuda_warp(area):
 		return None
-	try:
-		from facefusion.gpu.kernels import warp_blend as cuda_warp_blend
-	except Exception:
-		_GPU_WARP_AVAILABLE = False
-		return None
 	device = torch.device('cuda')
 	try:
-		src_rgba_np = numpy.concatenate(
-			[
-				crop_frame.astype(numpy.float32) * (1.0 / 255.0),
-				numpy.ones((crop_frame.shape[0], crop_frame.shape[1], 1), dtype = numpy.float32)
-			], axis = -1)
-		src_tensor = torch.from_numpy(src_rgba_np).contiguous().to(device)
-		mask_tensor = torch.from_numpy(roi_mask.astype(numpy.float32)).contiguous().to(device)
 		bg_roi = temp_frame[y1:y2, x1:x2]
 		if bg_roi.shape[0] != height or bg_roi.shape[1] != width:
 			return None
-		bg_rgba_np = numpy.empty((height, width, 4), dtype = numpy.uint8)
-		bg_rgba_np[:, :, :3] = bg_roi
-		bg_rgba_np[:, :, 3] = 255
-		bg_tensor = torch.from_numpy(bg_rgba_np).contiguous().to(device)
-		affine_tensor = torch.from_numpy(paste_matrix.astype(numpy.float32).reshape(6)).contiguous().to(device)
-		out_tensor = cuda_warp_blend(src_tensor, mask_tensor, bg_tensor, affine_tensor)
-		out_np = out_tensor[..., :3].contiguous().cpu().numpy()
+
+		composer = get_composer(device, height, width)
+		crop_contig = numpy.ascontiguousarray(crop_frame)
+		mask_contig = numpy.ascontiguousarray(roi_mask)
+		bg_contig = numpy.ascontiguousarray(bg_roi)
+		src_tensor = torch.from_numpy(crop_contig).to(device, non_blocking=True)
+		mask_tensor = torch.from_numpy(mask_contig).to(device, non_blocking=True)
+		bg_tensor = torch.from_numpy(bg_contig).to(device, non_blocking=True)
+		affine_tensor = torch.from_numpy(paste_matrix.astype(numpy.float32)).to(device, non_blocking=True)
+		extra_payload = { 'bg_reference': bg_contig }
+		if sdf_map is not None:
+			sdf_tensor = torch.from_numpy(numpy.ascontiguousarray(sdf_map)).to(device, non_blocking=True)
+			extra_payload['sdf'] = sdf_tensor
+
+		result = composer.compose(
+			src_tensor,
+			mask_tensor,
+			bg_tensor,
+			affine_tensor,
+			track_token=track_token,
+			extras=extra_payload
+		)
+		out_np = result.frame_bgr.contiguous().cpu().numpy()
 		_GPU_WARP_AVAILABLE = True
 		temp_out = temp_frame.copy()
 		temp_out[y1:y2, x1:x2] = out_np
@@ -265,6 +351,17 @@ def _refine_mask_with_guided_filter(crop_frame: VisionFrame, mask: Mask) -> Mask
 			pass
 	# lightweight fallback: gentle gaussian smooth
 	return cv2.GaussianBlur(mask_f, (0, 0), 1.2)
+
+
+def _compute_signed_distance(mask: Mask) -> Mask:
+	if mask.size == 0:
+		return numpy.zeros_like(mask, dtype = numpy.float32)
+	mask_binary = (mask >= 0.5).astype(numpy.uint8)
+	if not mask_binary.any():
+		return numpy.zeros_like(mask, dtype = numpy.float32)
+	inside = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 3)
+	out = cv2.distanceTransform(1 - mask_binary, cv2.DIST_L2, 3)
+	return (inside - out).astype(numpy.float32)
 
 
 def calculate_paste_area(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, affine_matrix : Matrix) -> Tuple[BoundingBox, Matrix]:

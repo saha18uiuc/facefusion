@@ -10,7 +10,12 @@ import numpy
 import math
 
 from facefusion import state_manager
-from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle
+from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle, reset_affine_smoothers
+
+try:
+    from facefusion.gpu.compositor import reset_all_temporal_states  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    reset_all_temporal_states = None  # type: ignore
 from facefusion.types import Face, VisionFrame
 
 
@@ -68,6 +73,8 @@ class FaceTracker:
         self._match_iou = 0.3
         self._config_signature: Optional[tuple[int, int, int, float]] = None
         self._filters: Dict[int, List[_OneEuroFilter]] = {}
+        self._face_to_track: Dict[int, int] = {}
+        self._track_to_face_id: Dict[int, int] = {}
         fps = state_manager.get_item('output_video_fps')
         try:
             self._fps = float(fps) if fps else 30.0
@@ -81,6 +88,11 @@ class FaceTracker:
             self._prev_gray = None
             self._frame_index = 0
             self._filters.clear()
+            self._face_to_track.clear()
+            self._track_to_face_id.clear()
+            reset_affine_smoothers()
+            if reset_all_temporal_states:
+                reset_all_temporal_states()
 
     def process_frame(self, vision_frame: VisionFrame, detect_fn: Callable[[VisionFrame], List[Face]]) -> List[Face]:
         with self._lock:
@@ -148,6 +160,7 @@ class FaceTracker:
                 track.misses = 0
                 track.last_detection_frame = self._frame_index
                 self._reset_filters(matched_id, track.points_68)
+                self._update_face_index(matched_id, track.face)
                 unmatched_track_ids.discard(matched_id)
                 assigned.append(track.face)
             else:
@@ -190,6 +203,7 @@ class FaceTracker:
         )
         self._tracks[self._next_track_id] = track
         self._filters[self._next_track_id] = self._build_filters(track.points_68)
+        self._update_face_index(self._next_track_id, track.face)
         self._next_track_id += 1
         return track.face
 
@@ -271,11 +285,15 @@ class FaceTracker:
                 angle=angle
             )
             track.misses = 0
+            self._update_face_index(track_id, track.face)
             tracked_faces.append(track.face)
 
         for track_id in remove_ids:
             self._tracks.pop(track_id, None)
             self._filters.pop(track_id, None)
+            face_id = self._track_to_face_id.pop(track_id, None)
+            if face_id is not None:
+                self._face_to_track.pop(face_id, None)
 
         return tracked_faces
 
@@ -295,6 +313,18 @@ class FaceTracker:
         flat = points.reshape(-1)
         for idx, value in enumerate(flat):
             filters[idx].reset(float(value))
+
+    def _update_face_index(self, track_id: int, face: Face) -> None:
+        face_id = id(face)
+        previous_face_id = self._track_to_face_id.get(track_id)
+        if previous_face_id is not None and previous_face_id != face_id:
+            self._face_to_track.pop(previous_face_id, None)
+        self._track_to_face_id[track_id] = face_id
+        self._face_to_track[face_id] = track_id
+
+    def get_track_token(self, face: Face) -> Optional[int]:
+        with self._lock:
+            return self._face_to_track.get(id(face))
 
 
 def _compute_iou(box_a: numpy.ndarray, box_b: numpy.ndarray) -> float:
