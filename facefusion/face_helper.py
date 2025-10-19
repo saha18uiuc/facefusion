@@ -253,6 +253,7 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 
 	inverse_mask_expanded = numpy.expand_dims(inverse_mask, axis = -1)
 	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
+	inverse_vision_frame = _reinhard_color_transfer(inverse_vision_frame, temp_vision_frame[y1:y2, x1:x2], inverse_mask)
 	temp_vision_frame = temp_vision_frame.copy()
 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
 	# Convert to float32 for stable blending
@@ -300,6 +301,30 @@ def _should_use_cuda_warp(area: int) -> bool:
 	except Exception:
 		pass
 	return True
+
+
+def _reinhard_color_transfer(src: VisionFrame, dst: VisionFrame, mask: Mask) -> VisionFrame:
+	if src.size == 0 or dst.size == 0:
+		return src
+	mask_u8 = numpy.clip(mask, 0.0, 1.0).astype(numpy.float32)
+	mask_binary = (mask_u8 >= 0.4).astype(numpy.uint8)
+	if mask_binary.sum() < 64:
+		return src
+	src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(numpy.float32)
+	dst_lab = cv2.cvtColor(dst, cv2.COLOR_BGR2LAB).astype(numpy.float32)
+	src_pixels = src_lab[mask_binary > 0]
+	dst_pixels = dst_lab[mask_binary > 0]
+	src_mean = src_pixels.mean(axis = 0)
+	src_std = src_pixels.std(axis = 0) + 1e-5
+	dst_mean = dst_pixels.mean(axis = 0)
+	dst_std = dst_pixels.std(axis = 0) + 1e-5
+	result_lab = src_lab.copy()
+	for c in range(3):
+		result_lab[..., c] = (result_lab[..., c] - src_mean[c]) * (dst_std[c] / src_std[c]) + dst_mean[c]
+	result_lab[..., 0] = numpy.clip(result_lab[..., 0], 0.0, 100.0)
+	result_lab[..., 1:] = numpy.clip(result_lab[..., 1:], -128.0, 127.0)
+	result_bgr = cv2.cvtColor(result_lab.astype(numpy.float32), cv2.COLOR_LAB2BGR)
+	return numpy.clip(result_bgr, 0.0, 255.0).astype(src.dtype)
 
 
 def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox, track_token: Optional[str], sdf_map: Optional[Mask]) -> Optional[VisionFrame]:
