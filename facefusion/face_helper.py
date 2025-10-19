@@ -310,14 +310,12 @@ def _reinhard_color_transfer(src: VisionFrame, dst: VisionFrame, mask: Mask) -> 
 	mask_binary = (mask_u8 >= 0.4).astype(numpy.uint8)
 	if mask_binary.sum() < 64:
 		return src
-	if src.dtype != numpy.uint8:
-		src_base = numpy.clip(src * 255.0, 0.0, 255.0).astype(numpy.uint8)
-	else:
-		src_base = src
-	if dst.dtype != numpy.uint8:
-		dst_base = numpy.clip(dst * 255.0, 0.0, 255.0).astype(numpy.uint8)
-	else:
-		dst_base = dst
+	src_base = numpy.clip(src, 0.0, 255.0).astype(numpy.float32, copy=False)
+	dst_base = numpy.clip(dst, 0.0, 255.0).astype(numpy.float32, copy=False)
+	if src_base.max() > 1.5:
+		src_base *= (1.0 / 255.0)
+	if dst_base.max() > 1.5:
+		dst_base *= (1.0 / 255.0)
 	src_lab = cv2.cvtColor(src_base, cv2.COLOR_BGR2LAB).astype(numpy.float32)
 	dst_lab = cv2.cvtColor(dst_base, cv2.COLOR_BGR2LAB).astype(numpy.float32)
 	src_pixels = src_lab[mask_binary > 0]
@@ -332,7 +330,10 @@ def _reinhard_color_transfer(src: VisionFrame, dst: VisionFrame, mask: Mask) -> 
 	result_lab[..., 0] = numpy.clip(result_lab[..., 0], 0.0, 100.0)
 	result_lab[..., 1:] = numpy.clip(result_lab[..., 1:], -128.0, 127.0)
 	result_bgr = cv2.cvtColor(result_lab.astype(numpy.float32), cv2.COLOR_LAB2BGR)
-	return numpy.clip(result_bgr, 0.0, 255.0).astype(src.dtype)
+	result_bgr = numpy.clip(result_bgr, 0.0, 1.0)
+	if src.dtype == numpy.uint8:
+		return numpy.clip(result_bgr * 255.0, 0.0, 255.0).astype(numpy.uint8)
+	return result_bgr.astype(src.dtype, copy=False)
 
 
 def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox, track_token: Optional[str], sdf_map: Optional[Mask]) -> Optional[VisionFrame]:
