@@ -310,8 +310,16 @@ def _reinhard_color_transfer(src: VisionFrame, dst: VisionFrame, mask: Mask) -> 
 	mask_binary = (mask_u8 >= 0.4).astype(numpy.uint8)
 	if mask_binary.sum() < 64:
 		return src
-	src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(numpy.float32)
-	dst_lab = cv2.cvtColor(dst, cv2.COLOR_BGR2LAB).astype(numpy.float32)
+	if src.dtype != numpy.uint8:
+		src_base = numpy.clip(src * 255.0, 0.0, 255.0).astype(numpy.uint8)
+	else:
+		src_base = src
+	if dst.dtype != numpy.uint8:
+		dst_base = numpy.clip(dst * 255.0, 0.0, 255.0).astype(numpy.uint8)
+	else:
+		dst_base = dst
+	src_lab = cv2.cvtColor(src_base, cv2.COLOR_BGR2LAB).astype(numpy.float32)
+	dst_lab = cv2.cvtColor(dst_base, cv2.COLOR_BGR2LAB).astype(numpy.float32)
 	src_pixels = src_lab[mask_binary > 0]
 	dst_pixels = dst_lab[mask_binary > 0]
 	src_mean = src_pixels.mean(axis = 0)
