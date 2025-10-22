@@ -10,7 +10,7 @@ import numpy
 import math
 
 from facefusion import state_manager
-from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle, reset_affine_smoothers
+from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle, reset_affine_smoothers, reset_cpu_temporal_states
 
 try:
     from facefusion.gpu.compositor import reset_all_temporal_states  # type: ignore
@@ -93,6 +93,7 @@ class FaceTracker:
             reset_affine_smoothers()
             if reset_all_temporal_states:
                 reset_all_temporal_states()
+            reset_cpu_temporal_states()
 
     def process_frame(self, vision_frame: VisionFrame, detect_fn: Callable[[VisionFrame], List[Face]]) -> List[Face]:
         with self._lock:
