@@ -313,13 +313,19 @@ def _should_use_cuda_warp(area: int) -> bool:
 
 
 def _fit_color_transform(src: VisionFrame, dst: VisionFrame, mask: Mask) -> Optional[Tuple[numpy.ndarray, numpy.ndarray]]:
-	mask_f = numpy.clip(mask, 0.0, 1.0).astype(numpy.float32)
-	mask_flat = mask_f.reshape(-1)
+	mask_arr = numpy.clip(mask, 0.0, 1.0).astype(numpy.float32)
+	if mask_arr.ndim == 3:
+		mask_arr = mask_arr[..., 0]
+	if mask_arr.shape[:2] != src.shape[:2]:
+		mask_arr = cv2.resize(mask_arr, (src.shape[1], src.shape[0]), interpolation=cv2.INTER_LINEAR)
+	mask_flat = mask_arr.reshape(-1)
 	valid = mask_flat >= 0.4
 	if int(valid.sum()) < 64:
 		return None
-	src_flat = src.reshape(-1, 3).astype(numpy.float32, copy=False)
-	dst_flat = dst.reshape(-1, 3).astype(numpy.float32, copy=False)
+	src_roi = numpy.ascontiguousarray(src)
+	dst_roi = numpy.ascontiguousarray(dst)
+	src_flat = src_roi.reshape(-1, src_roi.shape[2]).astype(numpy.float32, copy=False)
+	dst_flat = dst_roi.reshape(-1, dst_roi.shape[2]).astype(numpy.float32, copy=False)
 	src_scale = 255.0 if src_flat.max() <= 1.5 else 1.0
 	dst_scale = 255.0 if dst_flat.max() <= 1.5 else 1.0
 	src_sel = numpy.clip(src_flat[valid] * src_scale, 0.0, 255.0)
@@ -336,28 +342,33 @@ def _fit_color_transform(src: VisionFrame, dst: VisionFrame, mask: Mask) -> Opti
 
 
 def _apply_color_transform(image: VisionFrame, coeff: numpy.ndarray, bias: numpy.ndarray) -> VisionFrame:
-	flat = image.reshape(-1, 3).astype(numpy.float32, copy=False)
+	img = numpy.ascontiguousarray(image)
+	flat = img.reshape(-1, img.shape[2]).astype(numpy.float32, copy=False)
 	scale = 255.0 if flat.max() <= 1.5 else 1.0
 	flat = numpy.clip(flat * scale, 0.0, 255.0)
 	transformed = flat @ coeff + bias
 	transformed = numpy.clip(transformed, 0.0, 255.0)
-	transformed = transformed.reshape(image.shape)
-	if numpy.issubdtype(image.dtype, numpy.floating):
-		return (transformed / 255.0).astype(image.dtype)
-	return transformed.astype(image.dtype)
+	transformed = transformed.reshape(img.shape)
+	if numpy.issubdtype(img.dtype, numpy.floating):
+		return (transformed / 255.0).astype(img.dtype)
+	return transformed.astype(img.dtype)
 
 
 def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, mask: Mask, update_only: bool = False) -> VisionFrame:
 	if track_token is None:
 		return current_roi
 	key = str(track_token)
-	mask_f = numpy.clip(mask, 0.0, 1.0).astype(numpy.float32)
-	if float(mask_f.sum()) < 64.0:
+	mask_arr = numpy.clip(mask, 0.0, 1.0).astype(numpy.float32)
+	if mask_arr.ndim == 3:
+		mask_arr = mask_arr[..., 0]
+	if mask_arr.shape[:2] != current_roi.shape[:2]:
+		mask_arr = cv2.resize(mask_arr, (current_roi.shape[1], current_roi.shape[0]), interpolation=cv2.INTER_LINEAR)
+	if float(mask_arr.sum()) < 64.0:
 		if update_only:
 			_CPU_TEMPORAL_CACHE[key] = {
 				'roi': current_roi.copy(),
 				'gray': cv2.cvtColor(current_roi, cv2.COLOR_BGR2GRAY),
-				'mask': mask_f.copy()
+				'mask': mask_arr.copy()
 			}
 		else:
 			_CPU_TEMPORAL_CACHE.pop(key, None)
@@ -368,7 +379,7 @@ def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, ma
 		_CPU_TEMPORAL_CACHE[key] = {
 			'roi': current_roi.copy(),
 			'gray': curr_gray,
-			'mask': mask_f.copy()
+			'mask': mask_arr.copy()
 		}
 		return current_roi
 	prev_roi = state.get('roi')
@@ -378,7 +389,7 @@ def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, ma
 		_CPU_TEMPORAL_CACHE[key] = {
 			'roi': current_roi.copy(),
 			'gray': curr_gray,
-			'mask': mask_f.copy()
+			'mask': mask_arr.copy()
 		}
 		return current_roi
 	feature_mask = numpy.clip(prev_mask, 0.0, 1.0).astype(numpy.uint8)
@@ -387,7 +398,7 @@ def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, ma
 		_CPU_TEMPORAL_CACHE[key] = {
 			'roi': current_roi.copy(),
 			'gray': curr_gray,
-			'mask': mask_f.copy()
+			'mask': mask_arr.copy()
 		}
 		return current_roi
 	next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None, winSize=(25, 25), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
@@ -395,7 +406,7 @@ def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, ma
 		_CPU_TEMPORAL_CACHE[key] = {
 			'roi': current_roi.copy(),
 			'gray': curr_gray,
-			'mask': mask_f.copy()
+			'mask': mask_arr.copy()
 		}
 		return current_roi
 	valid = status.flatten() == 1
@@ -405,7 +416,7 @@ def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, ma
 		_CPU_TEMPORAL_CACHE[key] = {
 			'roi': current_roi.copy(),
 			'gray': curr_gray,
-			'mask': mask_f.copy()
+			'mask': mask_arr.copy()
 		}
 		return current_roi
 	affine, inliers = cv2.estimateAffinePartial2D(good_prev, good_curr, method=cv2.RANSAC, ransacReprojThreshold=2.0, maxIters=150)
@@ -413,7 +424,7 @@ def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, ma
 		_CPU_TEMPORAL_CACHE[key] = {
 			'roi': current_roi.copy(),
 			'gray': curr_gray,
-			'mask': mask_f.copy()
+			'mask': mask_arr.copy()
 		}
 		return current_roi
 	prev_warped = cv2.warpAffine(prev_roi, affine, (current_roi.shape[1], current_roi.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
@@ -426,7 +437,7 @@ def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, ma
 	_CPU_TEMPORAL_CACHE[key] = {
 		'roi': blended.copy(),
 		'gray': curr_gray,
-		'mask': mask_f.copy()
+		'mask': mask_arr.copy()
 	}
 	return blended
 
