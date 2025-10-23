@@ -267,12 +267,12 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 		except Exception:
 			pass
 
-	transform_cpu = _fit_color_transform(crop_vision_frame, target_roi, crop_mask)
-	if transform_cpu is not None:
-		coeff_cpu, bias_cpu = transform_cpu
-		crop_vision_frame = _apply_color_transform(crop_vision_frame, coeff_cpu, bias_cpu)
 	inverse_mask_expanded = numpy.expand_dims(inverse_mask, axis = -1)
 	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
+	transform_cpu = _fit_color_transform(inverse_vision_frame, target_roi, inverse_mask)
+	if transform_cpu is not None:
+		coeff_cpu, bias_cpu = transform_cpu
+		inverse_vision_frame = _apply_color_transform(inverse_vision_frame, coeff_cpu, bias_cpu)
 	temp_vision_frame = temp_vision_frame.copy()
 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
 	# Convert to float32 for stable blending
@@ -324,6 +324,8 @@ def _fit_color_transform(src: VisionFrame, dst: VisionFrame, mask: Mask) -> Opti
 		return None
 	src_roi = numpy.ascontiguousarray(src)
 	dst_roi = numpy.ascontiguousarray(dst)
+	if dst_roi.shape[:2] != src_roi.shape[:2]:
+		dst_roi = cv2.resize(dst_roi, (src_roi.shape[1], src_roi.shape[0]), interpolation=cv2.INTER_LINEAR)
 	src_flat = src_roi.reshape(-1, src_roi.shape[2]).astype(numpy.float32, copy=False)
 	dst_flat = dst_roi.reshape(-1, dst_roi.shape[2]).astype(numpy.float32, copy=False)
 	src_scale = 255.0 if src_flat.max() <= 1.5 else 1.0
