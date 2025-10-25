@@ -1,29 +1,11 @@
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import cv2
 import numpy
 from cv2.typing import Size
 
-try:
-    import torch  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    torch = None  # type: ignore
-
-try:
-    from facefusion.gpu.compositor import get_composer  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    get_composer = None  # type: ignore
-
-try:
-    from cv2 import ximgproc  # type: ignore[attr-defined]
-    _HAS_XIMGPROC = True
-except Exception:  # pragma: no cover - optional dependency
-    ximgproc = None  # type: ignore
-    _HAS_XIMGPROC = False
-
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
-from facefusion import state_manager
 
 # Detect CUDA support in OpenCV if available
 def _has_cv2_cuda() -> bool:
@@ -93,85 +75,59 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
 }
 
 
-class _OneEuroScalarFilter:
-	def __init__(self, fps: float, min_cutoff: float = 1.0, beta: float = 0.03, dcutoff: float = 1.0) -> None:
-		self._te = 1.0 / max(1e-3, fps)
-		self._min_cutoff = float(min_cutoff)
-		self._beta = float(beta)
-		self._dcutoff = float(dcutoff)
-		self._x_prev: Optional[float] = None
-		self._dx_prev: float = 0.0
-
-	def _alpha(self, cutoff: float) -> float:
-		tau = 1.0 / (2.0 * numpy.pi * cutoff)
-		return 1.0 / (1.0 + tau / self._te)
-
-	def reset(self, value: float) -> None:
-		self._x_prev = value
-		self._dx_prev = 0.0
-
-	def filter(self, value: float) -> float:
-		if self._x_prev is None:
-			self.reset(value)
-			return value
-		dx = (value - self._x_prev) / self._te
-		alpha_d = self._alpha(self._dcutoff)
-		self._dx_prev = alpha_d * dx + (1.0 - alpha_d) * self._dx_prev
-		cutoff = self._min_cutoff + self._beta * abs(self._dx_prev)
-		alpha = self._alpha(cutoff)
-		filtered = alpha * value + (1.0 - alpha) * self._x_prev
-		self._x_prev = filtered
-		return filtered
+def _normalize_mask(mask : Mask) -> numpy.ndarray:
+	if mask.size == 0:
+		return numpy.zeros_like(mask, dtype = numpy.float32)
+	return numpy.clip(mask.astype(numpy.float32), 0.0, 1.0)
 
 
-class _AffineSmoother:
-	def __init__(self, fps: float) -> None:
-		self._filters = [_OneEuroScalarFilter(fps=fps) for _ in range(6)]
-		self._initialized = False
-
-	def apply(self, matrix: Matrix) -> Matrix:
-		flat = numpy.asarray(matrix, dtype = numpy.float32).reshape(-1)
-		if not self._initialized:
-			for filt, value in zip(self._filters, flat):
-				filt.reset(float(value))
-			self._initialized = True
-			return flat.reshape(matrix.shape)
-		smoothed = numpy.empty_like(flat)
-		for idx, value in enumerate(flat):
-			smoothed[idx] = self._filters[idx].filter(float(value))
-		return smoothed.reshape(matrix.shape)
+def _feather_mask(mask : Mask, feather_strength : float = 1.6) -> numpy.ndarray:
+	mask_f32 = _normalize_mask(mask)
+	if mask_f32.size == 0:
+		return mask_f32
+	feather = max(0.6, float(feather_strength))
+	return cv2.GaussianBlur(mask_f32, ksize = (0, 0), sigmaX = feather, sigmaY = feather)
 
 
-_AFFINE_SMOOTHERS: Dict[str, _AffineSmoother] = {}
+def _color_correct_face(face_roi : VisionFrame, background_roi : VisionFrame, mask : Mask) -> VisionFrame:
+	mask_f32 = _normalize_mask(mask)
+	if mask_f32.size == 0:
+		return face_roi
+	mask_binary = mask_f32 > 0.05
+	if not mask_binary.any():
+		return face_roi
+	face_lab = cv2.cvtColor(face_roi, cv2.COLOR_BGR2LAB).astype(numpy.float32)
+	background_lab = cv2.cvtColor(background_roi, cv2.COLOR_BGR2LAB).astype(numpy.float32)
+	flat_mask = mask_binary.reshape(-1)
+	face_pixels = face_lab.reshape(-1, 3)[flat_mask]
+	bg_pixels = background_lab.reshape(-1, 3)[flat_mask]
+	if face_pixels.shape[0] < 32 or bg_pixels.shape[0] < 32:
+		return face_roi
+	face_mean = face_pixels.mean(axis = 0)
+	face_std = face_pixels.std(axis = 0)
+	bg_mean = bg_pixels.mean(axis = 0)
+	bg_std = bg_pixels.std(axis = 0)
+	face_std = numpy.where(face_std < 1e-3, 1.0, face_std)
+	scale = bg_std / face_std
+	corrected_lab = (face_lab - face_mean) * scale + bg_mean
+	corrected_lab = numpy.clip(corrected_lab, 0.0, 255.0).astype(numpy.uint8)
+	corrected_bgr = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
+	result = face_roi.copy()
+	result[mask_binary] = corrected_bgr[mask_binary]
+	return result
 
 
-_CPU_TEMPORAL_CACHE: Dict[str, Dict[str, numpy.ndarray]] = {}
-
-_RNG = numpy.random.default_rng()
-
-
-def _smooth_affine_matrix(track_token: Optional[str], matrix: Matrix) -> Matrix:
-	if track_token is None:
-		return matrix
-	key = str(track_token)
-	smoother = _AFFINE_SMOOTHERS.get(key)
-	if smoother is None:
-		fps = state_manager.get_item('output_video_fps')
-		try:
-			fps_val = float(fps) if fps else 30.0
-		except Exception:
-			fps_val = 30.0
-		smoother = _AffineSmoother(fps_val)
-		_AFFINE_SMOOTHERS[key] = smoother
-	return smoother.apply(matrix)
-
-
-def reset_affine_smoothers() -> None:
-	_AFFINE_SMOOTHERS.clear()
-
-
-def reset_cpu_temporal_states() -> None:
-	_CPU_TEMPORAL_CACHE.clear()
+def _linear_light_blend(background_roi : VisionFrame, face_roi : VisionFrame, mask_3c : numpy.ndarray) -> VisionFrame:
+	if mask_3c.size == 0:
+		return face_roi
+	bg_f = numpy.clip(background_roi.astype(numpy.float32) / 255.0, 0.0, 1.0)
+	face_f = numpy.clip(face_roi.astype(numpy.float32) / 255.0, 0.0, 1.0)
+	mask_f = numpy.clip(mask_3c.astype(numpy.float32), 0.0, 1.0)
+	bg_linear = numpy.power(bg_f + 1e-6, 2.2)
+	face_linear = numpy.power(face_f + 1e-6, 2.2)
+	blended_linear = bg_linear * (1.0 - mask_f) + face_linear * mask_f
+	blended = numpy.power(numpy.clip(blended_linear, 0.0, 1.0), 1.0 / 2.2)
+	return numpy.clip(blended * 255.0, 0.0, 255.0).astype(background_roi.dtype)
 
 
 def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
@@ -214,29 +170,11 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
 	return crop_vision_frame, affine_matrix
 
 
-def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix, track_token: Optional[object] = None) -> VisionFrame:
-	track_key = str(track_token) if track_token is not None else None
-	if track_key is not None:
-		affine_matrix = _smooth_affine_matrix(track_key, affine_matrix)
+def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
 	paste_bounding_box, paste_matrix = calculate_paste_area(temp_vision_frame, crop_vision_frame, affine_matrix)
 	x1, y1, x2, y2 = paste_bounding_box
 	paste_width = x2 - x1
 	paste_height = y2 - y1
-	target_roi = temp_vision_frame[y1:y2, x1:x2]
-
-	crop_mask = _refine_mask_with_guided_filter(crop_vision_frame, crop_mask)
-	sdf_map = _compute_signed_distance(crop_mask)
-
-	if paste_width <= 0 or paste_height <= 0:
-		return temp_vision_frame
-
-	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1).astype(numpy.float32)
-	if not numpy.any(inverse_mask):
-		return temp_vision_frame
-
-	gpu_result = _paste_back_cuda(temp_vision_frame, crop_vision_frame, inverse_mask, paste_matrix, paste_bounding_box, track_key, sdf_map)
-	if gpu_result is not None:
-		return gpu_result
 
 	if _has_cv2_cuda():
 		try:
@@ -244,286 +182,32 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 			gpu_mask = cv2.cuda_GpuMat()
 			gpu_mask.upload(crop_mask.astype(numpy.float32))
 			inv_mask_gpu = cv2.cuda.warpAffine(gpu_mask, paste_matrix, (paste_width, paste_height))
-			mask_roi = inv_mask_gpu.download().clip(0, 1)
-			mask_roi = numpy.expand_dims(mask_roi, axis = -1)
+			inverse_mask = inv_mask_gpu.download().clip(0, 1)
+			inverse_mask = numpy.expand_dims(inverse_mask, axis = -1)
 
 			gpu_crop = cv2.cuda_GpuMat()
 			gpu_crop.upload(crop_vision_frame)
 			inv_frame_gpu = cv2.cuda.warpAffine(gpu_crop, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
 			inverse_vision_frame = inv_frame_gpu.download()
-			transform_gpu = _fit_color_transform(inverse_vision_frame, target_roi, mask_roi[..., 0])
-			if transform_gpu is not None:
-				coeff_gpu, bias_gpu = transform_gpu
-				inverse_vision_frame = _apply_color_transform(inverse_vision_frame, coeff_gpu, bias_gpu)
 
 			temp_vision_frame = temp_vision_frame.copy()
 			paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-			paste_vision_frame = paste_vision_frame * (1 - mask_roi) + inverse_vision_frame * mask_roi
-			result_roi = numpy.clip(paste_vision_frame, 0.0, 255.0).astype(temp_vision_frame.dtype)
-			if track_key is not None:
-				result_roi = _temporal_blend_cpu(track_key, result_roi, mask_roi[..., 0])
-			temp_vision_frame[y1:y2, x1:x2] = result_roi
+			paste_vision_frame = paste_vision_frame * (1 - inverse_mask) + inverse_vision_frame * inverse_mask
+			temp_vision_frame[y1:y2, x1:x2] = paste_vision_frame.astype(temp_vision_frame.dtype)
 			return temp_vision_frame
 		except Exception:
 			pass
 
-	inverse_mask_expanded = numpy.expand_dims(inverse_mask, axis = -1)
+	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height))
+	feathered_mask = _feather_mask(inverse_mask)
 	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
-	transform_cpu = _fit_color_transform(inverse_vision_frame, target_roi, inverse_mask)
-	if transform_cpu is not None:
-		coeff_cpu, bias_cpu = transform_cpu
-		inverse_vision_frame = _apply_color_transform(inverse_vision_frame, coeff_cpu, bias_cpu)
 	temp_vision_frame = temp_vision_frame.copy()
 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-	# Convert to float32 for stable blending
-	paste_f32 = paste_vision_frame.astype(numpy.float32)
-	inv_frame_f32 = inverse_vision_frame.astype(numpy.float32)
-	# Expand mask to 3 channels via OpenCV
-	mask3 = cv2.merge([ inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0] ])
-	one_minus = 1.0 - mask3
-	part_a = cv2.multiply(paste_f32, one_minus)
-	part_b = cv2.multiply(inv_frame_f32, mask3)
-	blend = cv2.add(part_a, part_b)
-	result_roi = numpy.clip(blend, 0.0, 255.0).astype(temp_vision_frame.dtype)
-	if track_key is not None:
-		result_roi = _temporal_blend_cpu(track_key, result_roi, inverse_mask)
-	temp_vision_frame[y1:y2, x1:x2] = result_roi
+	corrected_face = _color_correct_face(inverse_vision_frame, paste_vision_frame, feathered_mask)
+	mask3 = cv2.merge([ feathered_mask, feathered_mask, feathered_mask ])
+	blend = _linear_light_blend(paste_vision_frame, corrected_face, mask3)
+	temp_vision_frame[y1:y2, x1:x2] = blend.astype(temp_vision_frame.dtype)
 	return temp_vision_frame
-
-
-_GPU_WARP_AVAILABLE: Optional[bool] = None
-
-
-def _should_use_cuda_warp(area: int) -> bool:
-	global _GPU_WARP_AVAILABLE
-	if torch is None or not torch.cuda.is_available():
-		return False
-	if _GPU_WARP_AVAILABLE is False:
-		return False
-	if area < 65_536:  # Skip very small regions to avoid kernel launch overhead
-		return False
-	try:
-		from facefusion import state_manager
-		providers = state_manager.get_item('execution_providers') or []
-		if not any(str(provider).lower() in ('cuda', 'tensorrt') for provider in providers):
-			return False
-	except Exception:
-		pass
-	return True
-
-
-def _fit_color_transform(src: VisionFrame, dst: VisionFrame, mask: Mask) -> Optional[Tuple[numpy.ndarray, numpy.ndarray]]:
-	mask_arr = numpy.clip(mask, 0.0, 1.0).astype(numpy.float32)
-	if mask_arr.ndim == 3:
-		mask_arr = mask_arr[..., 0]
-	if mask_arr.shape[:2] != src.shape[:2]:
-		mask_arr = cv2.resize(mask_arr, (src.shape[1], src.shape[0]), interpolation=cv2.INTER_LINEAR)
-	mask_flat = mask_arr.reshape(-1)
-	valid = mask_flat >= 0.4
-	if int(valid.sum()) < 64:
-		return None
-	src_roi = numpy.ascontiguousarray(src)
-	dst_roi = numpy.ascontiguousarray(dst)
-	if dst_roi.shape[:2] != src_roi.shape[:2]:
-		dst_roi = cv2.resize(dst_roi, (src_roi.shape[1], src_roi.shape[0]), interpolation=cv2.INTER_LINEAR)
-	src_flat = src_roi.reshape(-1, src_roi.shape[2]).astype(numpy.float32, copy=False)
-	dst_flat = dst_roi.reshape(-1, dst_roi.shape[2]).astype(numpy.float32, copy=False)
-	src_scale = 255.0 if src_flat.max() <= 1.5 else 1.0
-	dst_scale = 255.0 if dst_flat.max() <= 1.5 else 1.0
-	src_sel = numpy.clip(src_flat[valid] * src_scale, 0.0, 255.0)
-	dst_sel = numpy.clip(dst_flat[valid] * dst_scale, 0.0, 255.0)
-	if src_sel.shape[0] > 6000:
-		indices = _RNG.choice(src_sel.shape[0], size=6000, replace=False)
-		src_sel = src_sel[indices]
-		dst_sel = dst_sel[indices]
-	A = numpy.concatenate([src_sel, numpy.ones((src_sel.shape[0], 1), dtype=numpy.float32)], axis=1)
-	solution, _, _, _ = numpy.linalg.lstsq(A, dst_sel, rcond=None)
-	coeff = solution[:3, :]
-	bias = solution[3, :]
-	return coeff, bias
-
-
-def _apply_color_transform(image: VisionFrame, coeff: numpy.ndarray, bias: numpy.ndarray) -> VisionFrame:
-	img = numpy.ascontiguousarray(image)
-	flat = img.reshape(-1, img.shape[2]).astype(numpy.float32, copy=False)
-	scale = 255.0 if flat.max() <= 1.5 else 1.0
-	flat = numpy.clip(flat * scale, 0.0, 255.0)
-	transformed = flat @ coeff + bias
-	transformed = numpy.clip(transformed, 0.0, 255.0)
-	transformed = transformed.reshape(img.shape)
-	if numpy.issubdtype(img.dtype, numpy.floating):
-		return (transformed / 255.0).astype(img.dtype)
-	return transformed.astype(img.dtype)
-
-
-def _temporal_blend_cpu(track_token: Optional[str], current_roi: VisionFrame, mask: Mask, update_only: bool = False) -> VisionFrame:
-	if track_token is None:
-		return current_roi
-	key = str(track_token)
-	mask_arr = numpy.clip(mask, 0.0, 1.0).astype(numpy.float32)
-	if mask_arr.ndim == 3:
-		mask_arr = mask_arr[..., 0]
-	if mask_arr.shape[:2] != current_roi.shape[:2]:
-		mask_arr = cv2.resize(mask_arr, (current_roi.shape[1], current_roi.shape[0]), interpolation=cv2.INTER_LINEAR)
-	if float(mask_arr.sum()) < 64.0:
-		if update_only:
-			_CPU_TEMPORAL_CACHE[key] = {
-				'roi': current_roi.copy(),
-				'gray': cv2.cvtColor(current_roi, cv2.COLOR_BGR2GRAY),
-				'mask': mask_arr.copy()
-			}
-		else:
-			_CPU_TEMPORAL_CACHE.pop(key, None)
-		return current_roi
-	state = _CPU_TEMPORAL_CACHE.get(key)
-	curr_gray = cv2.cvtColor(current_roi, cv2.COLOR_BGR2GRAY)
-	if update_only or state is None:
-		_CPU_TEMPORAL_CACHE[key] = {
-			'roi': current_roi.copy(),
-			'gray': curr_gray,
-			'mask': mask_arr.copy()
-		}
-		return current_roi
-	prev_roi = state.get('roi')
-	prev_gray = state.get('gray')
-	prev_mask = state.get('mask')
-	if prev_roi is None or prev_gray is None or prev_mask is None:
-		_CPU_TEMPORAL_CACHE[key] = {
-			'roi': current_roi.copy(),
-			'gray': curr_gray,
-			'mask': mask_arr.copy()
-		}
-		return current_roi
-	feature_mask = numpy.clip(prev_mask, 0.0, 1.0).astype(numpy.uint8)
-	prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=120, qualityLevel=0.01, minDistance=4, mask=feature_mask)
-	if prev_pts is None or len(prev_pts) < 10:
-		_CPU_TEMPORAL_CACHE[key] = {
-			'roi': current_roi.copy(),
-			'gray': curr_gray,
-			'mask': mask_arr.copy()
-		}
-		return current_roi
-	next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None, winSize=(25, 25), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-	if next_pts is None or status is None:
-		_CPU_TEMPORAL_CACHE[key] = {
-			'roi': current_roi.copy(),
-			'gray': curr_gray,
-			'mask': mask_arr.copy()
-		}
-		return current_roi
-	valid = status.flatten() == 1
-	good_prev = prev_pts[valid]
-	good_curr = next_pts[valid]
-	if good_prev.shape[0] < 10:
-		_CPU_TEMPORAL_CACHE[key] = {
-			'roi': current_roi.copy(),
-			'gray': curr_gray,
-			'mask': mask_arr.copy()
-		}
-		return current_roi
-	affine, inliers = cv2.estimateAffinePartial2D(good_prev, good_curr, method=cv2.RANSAC, ransacReprojThreshold=2.0, maxIters=150)
-	if affine is None:
-		_CPU_TEMPORAL_CACHE[key] = {
-			'roi': current_roi.copy(),
-			'gray': curr_gray,
-			'mask': mask_arr.copy()
-		}
-		return current_roi
-	prev_warped = cv2.warpAffine(prev_roi, affine, (current_roi.shape[1], current_roi.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-	mask_warped = cv2.warpAffine(prev_mask.astype(numpy.float32), affine, (current_roi.shape[1], current_roi.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
-	reliable = numpy.clip(mask_warped, 0.0, 1.0)
-	reliable = cv2.GaussianBlur(reliable, (5, 5), 0)
-	alpha = 0.18
-	blended = current_roi.astype(numpy.float32) * (1.0 - alpha * reliable[..., None]) + prev_warped.astype(numpy.float32) * (alpha * reliable[..., None])
-	blended = numpy.clip(blended, 0.0, 255.0).astype(current_roi.dtype)
-	_CPU_TEMPORAL_CACHE[key] = {
-		'roi': blended.copy(),
-		'gray': curr_gray,
-		'mask': mask_arr.copy()
-	}
-	return blended
-
-
-def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox, track_token: Optional[str], sdf_map: Optional[Mask]) -> Optional[VisionFrame]:
-	global _GPU_WARP_AVAILABLE
-	if torch is None or get_composer is None:
-		return None
-	x1, y1, x2, y2 = map(int, paste_box)
-	width = x2 - x1
-	height = y2 - y1
-	area = width * height
-	if width <= 0 or height <= 0 or not _should_use_cuda_warp(area):
-		return None
-	device = torch.device('cuda')
-	try:
-		bg_roi = temp_frame[y1:y2, x1:x2]
-		if bg_roi.shape[0] != height or bg_roi.shape[1] != width:
-			return None
-		transform = _fit_color_transform(crop_frame, bg_roi, roi_mask)
-		if transform is not None:
-			coeff, bias = transform
-			crop_frame = _apply_color_transform(crop_frame, coeff, bias)
-
-		composer = get_composer(device, height, width)
-		crop_contig = numpy.ascontiguousarray(crop_frame)
-		mask_contig = numpy.ascontiguousarray(roi_mask)
-		bg_contig = numpy.ascontiguousarray(bg_roi)
-		src_tensor = torch.from_numpy(crop_contig).to(device, non_blocking=True)
-		mask_tensor = torch.from_numpy(mask_contig).to(device, non_blocking=True)
-		bg_tensor = torch.from_numpy(bg_contig).to(device, non_blocking=True)
-		affine_tensor = torch.from_numpy(paste_matrix.astype(numpy.float32)).to(device, non_blocking=True)
-		extra_payload = { 'bg_reference': bg_contig }
-		if sdf_map is not None:
-			sdf_tensor = torch.from_numpy(numpy.ascontiguousarray(sdf_map)).to(device, non_blocking=True)
-			extra_payload['sdf'] = sdf_tensor
-
-		result = composer.compose(
-			src_tensor,
-			mask_tensor,
-			bg_tensor,
-			affine_tensor,
-			track_token=track_token,
-			extras=extra_payload
-		)
-		out_np = result.frame_bgr.contiguous().cpu().numpy()
-		if track_token is not None:
-			_temporal_blend_cpu(track_token, out_np, roi_mask, update_only=True)
-		_GPU_WARP_AVAILABLE = True
-		temp_out = temp_frame.copy()
-		temp_out[y1:y2, x1:x2] = out_np
-		return temp_out
-	except Exception:
-		_GPU_WARP_AVAILABLE = False
-		return None
-
-
-def _refine_mask_with_guided_filter(crop_frame: VisionFrame, mask: Mask) -> Mask:
-	if mask.size == 0:
-		return mask
-	mask_f = mask.astype(numpy.float32)
-	mask_f = numpy.clip(mask_f, 0.0, 1.0)
-	if _HAS_XIMGPROC:
-		try:
-			guide = cv2.cvtColor(crop_frame, cv2.COLOR_BGR2GRAY)
-			radius = 8
-			eps = 1e-4
-			refined = ximgproc.guidedFilter(guide, mask_f, radius, eps)
-			return numpy.clip(refined, 0.0, 1.0)
-		except Exception:
-			pass
-	# lightweight fallback: gentle gaussian smooth
-	return cv2.GaussianBlur(mask_f, (0, 0), 1.2)
-
-
-def _compute_signed_distance(mask: Mask) -> Mask:
-	if mask.size == 0:
-		return numpy.zeros_like(mask, dtype = numpy.float32)
-	mask_binary = (mask >= 0.5).astype(numpy.uint8)
-	if not mask_binary.any():
-		return numpy.zeros_like(mask, dtype = numpy.float32)
-	inside = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 3)
-	out = cv2.distanceTransform(1 - mask_binary, cv2.DIST_L2, 3)
-	return (inside - out).astype(numpy.float32)
 
 
 def calculate_paste_area(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, affine_matrix : Matrix) -> Tuple[BoundingBox, Matrix]:
