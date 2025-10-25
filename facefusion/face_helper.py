@@ -130,6 +130,16 @@ def _linear_light_blend(background_roi : VisionFrame, face_roi : VisionFrame, ma
 	return numpy.clip(blended * 255.0, 0.0, 255.0).astype(background_roi.dtype)
 
 
+def reset_affine_smoothers() -> None:
+	"""Legacy hook kept for compatibility; smoothing handled elsewhere."""
+	return None
+
+
+def reset_cpu_temporal_states() -> None:
+	"""Legacy hook kept for compatibility; temporal caches handled elsewhere."""
+	return None
+
+
 def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
 	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
