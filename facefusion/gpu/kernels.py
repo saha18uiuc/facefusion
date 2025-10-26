@@ -16,41 +16,62 @@ def _load_module() -> object:
     #include <ATen/cuda/CUDAUtils.h>
     #include <math.h>
 
-    __device__ __forceinline__ float catmull_rom(float p0, float p1, float p2, float p3, float t) {
-        float a0 = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
-        float a1 = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
-        float a2 = -0.5f * p0 + 0.5f * p2;
-        return ((a0 * t + a1) * t + a2) * t + p1;
+    __device__ __forceinline__ float mitchell1d(float x) {
+        const float B = 1.0f / 3.0f;
+        const float C = 1.0f / 3.0f;
+        x = fabsf(x);
+        if (x < 1.0f) {
+            return ((12.0f - 9.0f * B - 6.0f * C) * x * x * x
+                    + (-18.0f + 12.0f * B + 6.0f * C) * x * x
+                    + (6.0f - 2.0f * B)) / 6.0f;
+        } else if (x < 2.0f) {
+            return ((-B - 6.0f * C) * x * x * x
+                    + (6.0f * B + 30.0f * C) * x * x
+                    + (-12.0f * B - 48.0f * C) * x
+                    + (8.0f * B + 24.0f * C)) / 6.0f;
+        }
+        return 0.0f;
     }
 
-    __device__ __forceinline__ float4 sample_catmull_rom(cudaTextureObject_t tex, float sx, float sy) {
+    __device__ __forceinline__ float4 sample_mitchell(cudaTextureObject_t tex, float sx, float sy) {
         float fx = floorf(sx);
         float fy = floorf(sy);
         float tx = sx - fx;
         float ty = sy - fy;
 
-        int ix = static_cast<int>(fx);
-        int iy = static_cast<int>(fy);
-
-        float4 rows[4];
-        for (int j = -1; j <= 2; ++j) {
-            float4 p0 = tex2D<float4>(tex, static_cast<float>(ix - 1) + 0.5f, static_cast<float>(iy + j) + 0.5f);
-            float4 p1 = tex2D<float4>(tex, static_cast<float>(ix) + 0.5f, static_cast<float>(iy + j) + 0.5f);
-            float4 p2 = tex2D<float4>(tex, static_cast<float>(ix + 1) + 0.5f, static_cast<float>(iy + j) + 0.5f);
-            float4 p3 = tex2D<float4>(tex, static_cast<float>(ix + 2) + 0.5f, static_cast<float>(iy + j) + 0.5f);
-
-            rows[j + 1].x = catmull_rom(p0.x, p1.x, p2.x, p3.x, tx);
-            rows[j + 1].y = catmull_rom(p0.y, p1.y, p2.y, p3.y, tx);
-            rows[j + 1].z = catmull_rom(p0.z, p1.z, p2.z, p3.z, tx);
-            rows[j + 1].w = catmull_rom(p0.w, p1.w, p2.w, p3.w, tx);
+        float wx[4];
+        float wy[4];
+        for (int i = 0; i < 4; ++i) {
+            wx[i] = mitchell1d(tx - (static_cast<float>(i) - 1.0f));
+            wy[i] = mitchell1d(ty - (static_cast<float>(i) - 1.0f));
         }
 
-        float4 result;
-        result.x = catmull_rom(rows[0].x, rows[1].x, rows[2].x, rows[3].x, ty);
-        result.y = catmull_rom(rows[0].y, rows[1].y, rows[2].y, rows[3].y, ty);
-        result.z = catmull_rom(rows[0].z, rows[1].z, rows[2].z, rows[3].z, ty);
-        result.w = catmull_rom(rows[0].w, rows[1].w, rows[2].w, rows[3].w, ty);
-        return result;
+        float4 accum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float weight_sum = 0.0f;
+
+        for (int j = 0; j < 4; ++j) {
+            float py = static_cast<float>(fy + j - 1) + 0.5f;
+            for (int i = 0; i < 4; ++i) {
+                float px = static_cast<float>(fx + i - 1) + 0.5f;
+                float4 sample = tex2D<float4>(tex, px, py);
+                float w = wx[i] * wy[j];
+                accum.x += sample.x * w;
+                accum.y += sample.y * w;
+                accum.z += sample.z * w;
+                accum.w += sample.w * w;
+                weight_sum += w;
+            }
+        }
+
+        if (weight_sum > 0.0f) {
+            float inv = 1.0f / weight_sum;
+            accum.x *= inv;
+            accum.y *= inv;
+            accum.z *= inv;
+            accum.w *= inv;
+        }
+
+        return accum;
     }
 
     __global__ void warp_catmull_kernel(
@@ -71,7 +92,7 @@ def _load_module() -> object:
         float sx = affine[0] * static_cast<float>(x) + affine[1] * static_cast<float>(y) + affine[2];
         float sy = affine[3] * static_cast<float>(x) + affine[4] * static_cast<float>(y) + affine[5];
 
-        float4 sample = sample_catmull_rom(src_tex, sx, sy);
+        float4 sample = sample_mitchell(src_tex, sx, sy);
 
         char* base = reinterpret_cast<char*>(out);
         float* row_ptr = reinterpret_cast<float*>(base + static_cast<size_t>(y) * out_stride_bytes);
@@ -169,7 +190,7 @@ def _load_module() -> object:
     }
 
     PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-        m.def("warp_face", &warp_face, "Catmull-Rom warp of source ROI into destination frame");
+        m.def("warp_face", &warp_face, "Mitchell-Netravali warp of source ROI into destination frame");
     }
     """
     return load_inline(

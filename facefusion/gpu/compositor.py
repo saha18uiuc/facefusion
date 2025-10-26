@@ -153,6 +153,15 @@ class GpuRoiComposer:
         mask = self._prepare_mask_tensor(mask)
         affine = affine.to(self.device, dtype=torch.float32).contiguous().view(-1)
 
+        current_stream = torch.cuda.current_stream(self.device) if torch.cuda.is_available() and self.device.type == 'cuda' else None
+        if current_stream is not None:
+            if src_bgr.is_cuda:
+                src_bgr.record_stream(current_stream)
+            if bg_bgr.is_cuda:
+                bg_bgr.record_stream(current_stream)
+            if mask.is_cuda:
+                mask.record_stream(current_stream)
+
         src_h, src_w, _ = src_bgr.shape
         roi_h, roi_w = bg_bgr.shape
         src_rgba = torch.ones((src_h, src_w, 4), device=self.device, dtype=torch.float32)
@@ -164,6 +173,10 @@ class GpuRoiComposer:
             src_rgba[..., 3] = sdf
 
         warped = warp_face(src_rgba, affine, roi_w, roi_h)
+        if current_stream is not None:
+            warp_fence = torch.cuda.Event(enable_timing=False, blocking=False)
+            warp_fence.record(current_stream)
+            current_stream.wait_event(warp_fence)
         warped_rgb = torch.clamp(warped[..., :3], 0.0, 1.0)
         warped_sdf = warped[..., 3] if warped.size(-1) > 3 else None
 

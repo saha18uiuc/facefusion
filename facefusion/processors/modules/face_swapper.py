@@ -16,7 +16,7 @@ from facefusion.common_helper import get_first, is_macos
 from facefusion.download import conditional_download_hashes, conditional_download_sources, resolve_download_url
 from facefusion.execution import has_execution_provider
 from facefusion.face_analyser import get_average_face, get_many_faces, get_one_face, scale_face
-from facefusion.face_helper import paste_back, warp_face_by_face_landmark_5
+from facefusion.face_helper import paste_back, warp_face_with_matrix, estimate_matrix_by_face_landmark_5, warp_face_by_face_landmark_5
 from facefusion.face_masker import create_area_mask, create_box_mask, create_occlusion_mask, create_region_mask
 from facefusion.face_selector import select_faces, sort_faces_by_order
 from facefusion.filesystem import filter_image_paths, has_image, in_directory, is_image, is_video, resolve_relative_path, same_file_extension
@@ -29,11 +29,18 @@ from facefusion.thread_helper import conditional_thread_semaphore, thread_lock
 from facefusion.hash_helper import create_hash
 from facefusion.types import ApplyStateItem, Args, DownloadScope, Embedding, Face, InferencePool, ModelOptions, ModelSet, ProcessMode, VisionFrame
 from facefusion.vision import read_static_image, read_static_images, read_static_video_frame, unpack_resolution
+from facefusion.temporal_filters import filter_affine, resolve_filter_key
 
 # Shared caches for multi-threaded frame processing
 CACHE_LOCK = thread_lock()
 _SOURCE_FACE_CACHE : Dict[str, Face] = {}
 _SOURCE_EMBEDDING_CACHE : Dict[str, Embedding] = {}
+
+
+def _smooth_affine(affine_matrix: numpy.ndarray, track_token: Optional[str]) -> numpy.ndarray:
+	key = resolve_filter_key(track_token)
+	filtered = filter_affine(affine_matrix.astype(numpy.float32, copy = False), key, time())
+	return filtered.astype(numpy.float32, copy = False)
 
 # Optional CUDA I/O binding via CuPy (reduces copies on CUDA EP)
 try:
@@ -597,7 +604,7 @@ def _forward_swap_face_prepared(prepared_source: Dict[str, Any], crop_vision_fra
 		out = face_swapper.run(None, face_swapper_inputs)[0][0]
 	return out
 
-def _swap_face_to_layers(prepared_source: Dict[str, Any], target_face: Face, base_frame: VisionFrame) -> Tuple[VisionFrame, numpy.ndarray, numpy.ndarray]:
+def _swap_face_to_layers(prepared_source: Dict[str, Any], target_face: Face, base_frame: VisionFrame, track_token: Optional[str] = None) -> Tuple[VisionFrame, numpy.ndarray, numpy.ndarray]:
 	"""Heavy compute for one face; return layers to paste.
 
 	Returns: (swapped_crop: HxWx3 uint8-like, crop_mask: HxW float32 in [0,1], affine_matrix)
@@ -608,9 +615,9 @@ def _swap_face_to_layers(prepared_source: Dict[str, Any], target_face: Face, bas
 	pixel_boost_total = pixel_boost_size[0] // model_size[0]
 
 	# 1) Warp to face-aligned crop
-	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(
-		base_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size
-	)
+	affine_matrix = estimate_matrix_by_face_landmark_5(target_face.landmark_set.get('5/68'), model_template, pixel_boost_size)
+	affine_matrix = _smooth_affine(affine_matrix, track_token)
+	crop_vision_frame, affine_matrix = warp_face_with_matrix(base_frame, affine_matrix, pixel_boost_size)
 
 	# 2) Masks (box/occlusion)
 	crop_masks : List[numpy.ndarray] = []
@@ -811,10 +818,14 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 	# The common single-face / no-tiling case gains nothing from the batch path and
 	# pays extra Cupy/IO-binding setup cost, so keep the lean sequential swap.
 	if len(scaled_faces) == 1 and pixel_boost_total <= 1:
-		return swap_face(source_face, scaled_faces[0], temp_vision_frame)
+		single_track = track_tokens.get(0)
+		return swap_face(source_face, scaled_faces[0], temp_vision_frame, track_token=single_track)
 
 	for face_index, tface in enumerate(scaled_faces):
-		crop_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, tface.landmark_set.get('5/68'), model_template, pixel_boost_size)
+		track = track_tokens.get(face_index)
+		affine_matrix = estimate_matrix_by_face_landmark_5(tface.landmark_set.get('5/68'), model_template, pixel_boost_size)
+		affine_matrix = _smooth_affine(affine_matrix, track)
+		crop_frame, affine_matrix = warp_face_with_matrix(temp_vision_frame, affine_matrix, pixel_boost_size)
 		# Precompute content-agnostic masks
 		masks = []
 		if 'box' in state_manager.get_item('face_mask_types'):
@@ -847,8 +858,10 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 		if (not is_gpu) and ((len(target_faces) <= 2 and pixel_boost_total <= 1) or prefer_seq):
 			# Run original sequential per-face path (fastest for CPU/CoreML single-face cases)
 			seq_start = time()
-			for sf in [scale_face(tf, target_vision_frame, temp_vision_frame) for tf in target_faces]:
-				temp_vision_frame = swap_face(source_face, sf, temp_vision_frame)
+			for idx, tf in enumerate(target_faces):
+				sf = scale_face(tf, target_vision_frame, temp_vision_frame)
+				track = track_tokens.get(idx)
+				temp_vision_frame = swap_face(source_face, sf, temp_vision_frame, track_token=track)
 			seq_total = (time() - seq_start) * 1000.0
 			# per-frame verbose logs removed for speed at info level
 			return temp_vision_frame
@@ -961,7 +974,8 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 		with ThreadPoolExecutor(max_workers=max_workers) as ex:
 			futs = []
 			for fi, sf in enumerate(scaled_faces):
-				futs.append((fi, ex.submit(_swap_face_to_layers, prepared_by_face[fi], sf, temp_vision_frame)))
+				track = track_tokens.get(fi)
+				futs.append((fi, ex.submit(_swap_face_to_layers, prepared_by_face[fi], sf, temp_vision_frame, track)))
 			for fi, fut in futs:
 				results[fi] = fut.result()
 		# Paste back in stable order (by face index)
@@ -1021,12 +1035,14 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 	return temp_vision_frame
 
 
-def swap_face(source_face : Face, target_face : Face, temp_vision_frame : VisionFrame) -> VisionFrame:
+def swap_face(source_face : Face, target_face : Face, temp_vision_frame : VisionFrame, track_token: Optional[str] = None) -> VisionFrame:
 	model_template = get_model_options().get('template')
 	model_size = get_model_options().get('size')
 	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
 	pixel_boost_total = pixel_boost_size[0] // model_size[0]
-	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size)
+	affine_matrix = estimate_matrix_by_face_landmark_5(target_face.landmark_set.get('5/68'), model_template, pixel_boost_size)
+	affine_matrix = _smooth_affine(affine_matrix, track_token)
+	crop_vision_frame, affine_matrix = warp_face_with_matrix(temp_vision_frame, affine_matrix, pixel_boost_size)
 	temp_vision_frames = []
 	crop_masks = []
 
