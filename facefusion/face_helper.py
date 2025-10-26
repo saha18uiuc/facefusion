@@ -96,6 +96,10 @@ def _color_correct_face(face_roi : VisionFrame, background_roi : VisionFrame, ma
 	mask_binary = mask_f32 > 0.05
 	if not mask_binary.any():
 		return face_roi
+	if face_roi.dtype != numpy.uint8:
+		face_roi = numpy.clip(face_roi, 0, 255).astype(numpy.uint8, copy=False)
+	if background_roi.dtype != numpy.uint8:
+		background_roi = numpy.clip(background_roi, 0, 255).astype(numpy.uint8, copy=False)
 	face_lab = cv2.cvtColor(face_roi, cv2.COLOR_BGR2LAB).astype(numpy.float32)
 	background_lab = cv2.cvtColor(background_roi, cv2.COLOR_BGR2LAB).astype(numpy.float32)
 	flat_mask = mask_binary.reshape(-1)
