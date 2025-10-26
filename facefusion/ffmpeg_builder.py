@@ -162,6 +162,12 @@ def set_video_encoder(video_encoder : str) -> Commands:
 	return [ '-c:v', video_encoder ]
 
 
+def enable_cuda_zero_copy(video_encoder : VideoEncoder) -> Commands:
+	if video_encoder in [ 'h264_nvenc', 'hevc_nvenc' ]:
+		return [ '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-init_hw_device', 'cuda=facefusion' ]
+	return []
+
+
 def copy_video_encoder() -> Commands:
 	return set_video_encoder('copy')
 
@@ -198,6 +204,21 @@ def set_video_preset(video_encoder : VideoEncoder, video_preset : VideoPreset) -
 	if video_encoder in [ 'h264_qsv', 'hevc_qsv' ]:
 		return [ '-preset', map_qsv_preset(video_preset) ]
 	return []
+
+
+def set_nvenc_low_latency(video_encoder: VideoEncoder) -> Commands:
+	if video_encoder not in [ 'h264_nvenc', 'hevc_nvenc' ]:
+		return []
+	return [
+		'-rc', 'vbr_hq',
+		'-bf', '0',
+		'-no-scenecut', '1',
+		'-spatial-aq', '1',
+		'-temporal-aq', '0',
+		'-look_ahead', '0',
+		'-b_ref_mode', '0',
+		'-g', '300'
+	]
 
 
 def set_video_fps(video_fps : Fps) -> Commands:

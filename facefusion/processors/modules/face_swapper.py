@@ -29,7 +29,7 @@ from facefusion.thread_helper import conditional_thread_semaphore, thread_lock
 from facefusion.hash_helper import create_hash
 from facefusion.types import ApplyStateItem, Args, DownloadScope, Embedding, Face, InferencePool, ModelOptions, ModelSet, ProcessMode, VisionFrame
 from facefusion.vision import read_static_image, read_static_images, read_static_video_frame, unpack_resolution
-from facefusion.temporal_filters import filter_affine, resolve_filter_key
+from facefusion.temporal_filters import filter_affine, resolve_filter_key, affine_to_similarity, similarity_to_affine
 
 # Shared caches for multi-threaded frame processing
 CACHE_LOCK = thread_lock()
@@ -38,8 +38,16 @@ _SOURCE_EMBEDDING_CACHE : Dict[str, Embedding] = {}
 
 
 def _smooth_affine(affine_matrix: numpy.ndarray, track_token: Optional[str]) -> numpy.ndarray:
+	matrix = affine_matrix.astype(numpy.float32, copy = False)
+	try:
+		condition = numpy.linalg.cond(matrix[:, :2])
+	except numpy.linalg.LinAlgError:
+		condition = float('inf')
+	if not numpy.isfinite(condition) or condition > 1e3:
+		sim_components = affine_to_similarity(matrix)
+		matrix = similarity_to_affine(sim_components)
 	key = resolve_filter_key(track_token)
-	filtered = filter_affine(affine_matrix.astype(numpy.float32, copy = False), key, time())
+	filtered = filter_affine(matrix, key)
 	return filtered.astype(numpy.float32, copy = False)
 
 # Optional CUDA I/O binding via CuPy (reduces copies on CUDA EP)

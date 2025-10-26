@@ -224,10 +224,12 @@ def merge_video(target_path : str, temp_video_fps : Fps, output_video_resolution
 
 	output_video_encoder = fix_video_encoder(temp_video_format, output_video_encoder)
 	commands = ffmpeg_builder.chain(
+		ffmpeg_builder.enable_cuda_zero_copy(output_video_encoder),
 		ffmpeg_builder.set_input_fps(temp_video_fps),
 		ffmpeg_builder.set_input(temp_frames_pattern),
 		ffmpeg_builder.set_media_resolution(pack_resolution(output_video_resolution)),
 		ffmpeg_builder.set_video_encoder(output_video_encoder),
+		ffmpeg_builder.set_nvenc_low_latency(output_video_encoder),
 		ffmpeg_builder.set_video_quality(output_video_encoder, output_video_quality),
 		ffmpeg_builder.set_video_preset(output_video_encoder, output_video_preset),
 		ffmpeg_builder.set_video_fps(output_video_fps),

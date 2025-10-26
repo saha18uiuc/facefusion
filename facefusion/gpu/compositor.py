@@ -41,6 +41,8 @@ class _TemporalState:
         self.prev_comp_bgr: Optional[numpy.ndarray] = None
         self.prev_mask: Optional[numpy.ndarray] = None
         self._pending_gray: Optional[numpy.ndarray] = None
+        self.motion_level: float = 0.0
+        self.occlusion_ratio: float = 0.0
         if not _HAS_OFA:
             raise RuntimeError('OFA unavailable')
         self._flow = cv2.cuda_NvidiaOpticalFlow_2_0.create(
@@ -109,6 +111,8 @@ class _TemporalState:
         mask_gpu = cv2.cuda.compare(cost_gpu, threshold, cv2.CMP_LT)
         mask_gpu = mask_gpu.convertTo(cv2.CV_32F, 1.0 / 255.0)
         mask_gpu = cv2.cuda.blur(mask_gpu, (5, 5))
+        self.occlusion_ratio = 1.0 - float(cv2.cuda.mean(mask_gpu)[0])
+        self.motion_level = self._measure_motion(flow_gpu)
         reliable = mask_gpu.download()
         return warped, reliable
 
@@ -117,6 +121,17 @@ class _TemporalState:
         self.prev_comp_bgr = None
         self.prev_mask = None
         self._pending_gray = None
+        self.motion_level = 0.0
+        self.occlusion_ratio = 0.0
+
+    def _measure_motion(self, flow_gpu: 'cv2.cuda.GpuMat') -> float:
+        try:
+            planes = cv2.cuda.split(flow_gpu)
+            mag = cv2.cuda.magnitude(planes[0], planes[1])
+            return float(cv2.cuda.mean(mag)[0])
+        except Exception:
+            flow = flow_gpu.download()
+            return float(numpy.mean(numpy.linalg.norm(flow, axis=2)))
 
 class GpuRoiComposer:
     """Compose warped face crops back into a frame ROI on the GPU."""
@@ -435,6 +450,17 @@ class GpuRoiComposer:
         mask: torch.Tensor,
         bg_reference: numpy.ndarray
     ) -> torch.Tensor:
+        temporal_state = self._temporal_states.get(track_token)
+        motion_level = 0.0
+        if temporal_state is not None:
+            motion_level = getattr(temporal_state, 'motion_level', 0.0)
+        momentum = self.color_momentum
+        if motion_level > 1.2:
+            momentum = 0.02
+        elif motion_level > 0.6:
+            momentum = 0.05
+        else:
+            momentum = 0.12
         mask_cpu = mask.detach().cpu().numpy()
         region = mask_cpu > 0.1
         if region.sum() < 16:
@@ -456,8 +482,8 @@ class GpuRoiComposer:
             state = _ColorState(src_mean=src_mean, src_std=src_std, tgt_mean=tgt_mean_now, tgt_std=tgt_std_now)
             self._color_states[track_token] = state
         else:
-            state.tgt_mean = (1.0 - self.color_momentum) * state.tgt_mean + self.color_momentum * tgt_mean_now
-            state.tgt_std = (1.0 - self.color_momentum) * state.tgt_std + self.color_momentum * tgt_std_now
+            state.tgt_mean = (1.0 - momentum) * state.tgt_mean + momentum * tgt_mean_now
+            state.tgt_std = (1.0 - momentum) * state.tgt_std + momentum * tgt_std_now
             # Keep source statistics stable once initialised
 
         adjusted_lab = self._reinhard_transfer(warped_lab, state.src_mean, state.src_std, state.tgt_mean, state.tgt_std)

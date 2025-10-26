@@ -16,62 +16,50 @@ def _load_module() -> object:
     #include <ATen/cuda/CUDAUtils.h>
     #include <math.h>
 
-    __device__ __forceinline__ float mitchell1d(float x) {
-        const float B = 1.0f / 3.0f;
-        const float C = 1.0f / 3.0f;
-        x = fabsf(x);
-        if (x < 1.0f) {
-            return ((12.0f - 9.0f * B - 6.0f * C) * x * x * x
-                    + (-18.0f + 12.0f * B + 6.0f * C) * x * x
-                    + (6.0f - 2.0f * B)) / 6.0f;
-        } else if (x < 2.0f) {
-            return ((-B - 6.0f * C) * x * x * x
-                    + (6.0f * B + 30.0f * C) * x * x
-                    + (-12.0f * B - 48.0f * C) * x
-                    + (8.0f * B + 24.0f * C)) / 6.0f;
-        }
-        return 0.0f;
+    __device__ __forceinline__ void catmull_rom_weights(float t, float4& w) {
+        float t2 = t * t;
+        float t3 = t2 * t;
+        w.x = -0.5f * t3 + t2 - 0.5f * t;
+        w.y =  1.5f * t3 - 2.5f * t2 + 1.0f;
+        w.z = -1.5f * t3 + 2.0f * t2 + 0.5f * t;
+        w.w =  0.5f * t3 - 0.5f * t2;
     }
 
-    __device__ __forceinline__ float4 sample_mitchell(cudaTextureObject_t tex, float sx, float sy) {
-        float fx = floorf(sx);
-        float fy = floorf(sy);
-        float tx = sx - fx;
-        float ty = sy - fy;
+    __device__ __forceinline__ float4 sample_bicubic_fast(cudaTextureObject_t tex, float sx, float sy) {
+        float px = floorf(sx);
+        float py = floorf(sy);
+        float fx = sx - px;
+        float fy = sy - py;
 
-        float wx[4];
-        float wy[4];
-        for (int i = 0; i < 4; ++i) {
-            wx[i] = mitchell1d(tx - (static_cast<float>(i) - 1.0f));
-            wy[i] = mitchell1d(ty - (static_cast<float>(i) - 1.0f));
-        }
+        float4 wx;
+        float4 wy;
+        catmull_rom_weights(fx, wx);
+        catmull_rom_weights(fy, wy);
 
-        float4 accum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        float weight_sum = 0.0f;
+        float2 gx = make_float2(wx.x + wx.y, wx.z + wx.w);
+        float2 gy = make_float2(wy.x + wy.y, wy.z + wy.w);
 
-        for (int j = 0; j < 4; ++j) {
-            float py = static_cast<float>(fy + j - 1) + 0.5f;
-            for (int i = 0; i < 4; ++i) {
-                float px = static_cast<float>(fx + i - 1) + 0.5f;
-                float4 sample = tex2D<float4>(tex, px, py);
-                float w = wx[i] * wy[j];
-                accum.x += sample.x * w;
-                accum.y += sample.y * w;
-                accum.z += sample.z * w;
-                accum.w += sample.w * w;
-                weight_sum += w;
-            }
-        }
+        float2 ox = make_float2(
+            gx.x > 1e-3f ? (wx.y / gx.x) - 0.5f : 0.0f,
+            gx.y > 1e-3f ? (wx.w / gx.y) + 0.5f : 0.0f);
+        float2 oy = make_float2(
+            gy.x > 1e-3f ? (wy.y / gy.x) - 0.5f : 0.0f,
+            gy.y > 1e-3f ? (wy.w / gy.y) + 0.5f : 0.0f);
 
-        if (weight_sum > 0.0f) {
-            float inv = 1.0f / weight_sum;
-            accum.x *= inv;
-            accum.y *= inv;
-            accum.z *= inv;
-            accum.w *= inv;
-        }
+        float u0 = px + ox.x + 0.5f;
+        float u1 = px + ox.y + 0.5f;
+        float v0 = py + oy.x + 0.5f;
+        float v1 = py + oy.y + 0.5f;
 
-        return accum;
+        float4 s0 = tex2D<float4>(tex, u0, v0);
+        float4 s1 = tex2D<float4>(tex, u1, v0);
+        float4 s2 = tex2D<float4>(tex, u0, v1);
+        float4 s3 = tex2D<float4>(tex, u1, v1);
+
+        float4 top = s0 * gx.x + s1 * gx.y;
+        float4 bottom = s2 * gx.x + s3 * gx.y;
+        float4 result = top * gy.x + bottom * gy.y;
+        return result;
     }
 
     __global__ void warp_catmull_kernel(
@@ -92,7 +80,7 @@ def _load_module() -> object:
         float sx = affine[0] * static_cast<float>(x) + affine[1] * static_cast<float>(y) + affine[2];
         float sy = affine[3] * static_cast<float>(x) + affine[4] * static_cast<float>(y) + affine[5];
 
-        float4 sample = sample_mitchell(src_tex, sx, sy);
+        float4 sample = sample_bicubic_fast(src_tex, sx, sy);
 
         char* base = reinterpret_cast<char*>(out);
         float* row_ptr = reinterpret_cast<float*>(base + static_cast<size_t>(y) * out_stride_bytes);
@@ -133,7 +121,7 @@ def _load_module() -> object:
 
         tex_desc.addressMode[0] = cudaAddressModeClamp;
         tex_desc.addressMode[1] = cudaAddressModeClamp;
-        tex_desc.filterMode = cudaFilterModePoint;
+        tex_desc.filterMode = cudaFilterModeLinear;
         tex_desc.readMode = cudaReadModeElementType;
         tex_desc.normalizedCoords = 0;
 
@@ -190,7 +178,7 @@ def _load_module() -> object:
     }
 
     PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-        m.def("warp_face", &warp_face, "Mitchell-Netravali warp of source ROI into destination frame");
+        m.def("warp_face", &warp_face, "Fast bicubic warp of source ROI into destination frame");
     }
     """
     return load_inline(

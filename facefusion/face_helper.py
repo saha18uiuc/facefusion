@@ -7,7 +7,7 @@ import numpy
 from cv2.typing import Size
 
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
-from facefusion.temporal_filters import reset_all_filters as reset_alignment_filters, affine_to_se2, resolve_filter_key
+from facefusion.temporal_filters import reset_all_filters as reset_alignment_filters, resolve_filter_key
 from facefusion.thread_helper import thread_lock
 
 # Detect CUDA support in OpenCV if available
@@ -18,9 +18,7 @@ def _has_cv2_cuda() -> bool:
         return False
 
 
-_POSE_ANGLE_THRESHOLD = math.radians(12.0)
-_SCALE_THRESHOLD = 0.12
-_FREEZE_FRAMES = 2
+
 _POISSON_ITERATIONS = 6
 _POISSON_LAMBDA = 3.0
 
@@ -34,13 +32,10 @@ class _SeamTemporalState:
 		self.width = int(width)
 		self.prev_gray: Optional[numpy.ndarray] = None
 		self.prev_mask: Optional[numpy.ndarray] = None
-		self.freeze_counter: int = 0
-		self.last_angle: Optional[float] = None
-		self.last_scale: Optional[float] = None
-		self.curr_gray: Optional[numpy.ndarray] = None
-		self.curr_mask: Optional[numpy.ndarray] = None
-		self.pending_angle: Optional[float] = None
-		self.pending_scale: Optional[float] = None
+		self.motion_level: float = 0.0
+		self.occlusion_ratio: float = 0.0
+		self._pending_gray: Optional[numpy.ndarray] = None
+		self._pending_mask: Optional[numpy.ndarray] = None
 		self.base_x, self.base_y = _make_base_grid(self.width, self.height)
 		self.ofa = _create_ofa(self.width, self.height)
 
@@ -54,68 +49,62 @@ class _SeamTemporalState:
 			self.ofa = _create_ofa(self.width, self.height)
 			self.prev_gray = None
 			self.prev_mask = None
-			self.freeze_counter = 0
-			self.last_angle = None
-			self.last_scale = None
 
-	def prepare(self, raw_mask: numpy.ndarray, bg_roi: numpy.ndarray, theta: float, scale: float) -> Tuple[numpy.ndarray, numpy.ndarray]:
+	def prepare(self, raw_mask: numpy.ndarray, bg_roi: numpy.ndarray) -> Tuple[numpy.ndarray, float, float]:
 		curr_gray = cv2.cvtColor(bg_roi, cv2.COLOR_BGR2GRAY)
-		mask = numpy.clip(raw_mask.astype(numpy.float32, copy = False), 0.0, 1.0)
+		stable_mask = numpy.clip(raw_mask.astype(numpy.float32, copy = False), 0.0, 1.0)
+		motion_level = 0.0
+		occlusion_ratio = 0.0
 		if self.prev_gray is not None and self.prev_mask is not None and self.prev_gray.shape == curr_gray.shape:
-			flow = self._calc_flow(self.prev_gray, curr_gray)
-			if flow is not None and flow.shape[:2] == mask.shape:
-				propagated = _warp_with_flow(self, self.prev_mask.astype(numpy.float32, copy = False), flow)
-				weight = _blend_weight_from_iou(propagated, mask)
-				mask = numpy.clip(weight * propagated + (1.0 - weight) * mask, 0.0, 1.0)
-		delta_angle = _angular_difference(theta, self.last_angle)
-		delta_scale = abs(scale - self.last_scale) / max(abs(self.last_scale) if self.last_scale else 1.0, 1e-3) if self.last_scale is not None else 0.0
-		if self.freeze_counter > 0 and self.prev_mask is not None:
-			mask = numpy.clip(0.8 * self.prev_mask + 0.2 * mask, 0.0, 1.0)
-			self.freeze_counter -= 1
-		elif abs(delta_angle) > _POSE_ANGLE_THRESHOLD or delta_scale > _SCALE_THRESHOLD:
-			if self.prev_mask is not None:
-				mask = numpy.clip(0.85 * self.prev_mask + 0.15 * mask, 0.0, 1.0)
-			self.freeze_counter = _FREEZE_FRAMES
-		self.curr_gray = curr_gray
-		self.curr_mask = mask
-		self.pending_angle = theta
-		self.pending_scale = scale
-		return mask, curr_gray
+			flow_fwd, flow_bwd = self._compute_dense_flow(self.prev_gray, curr_gray)
+			if flow_fwd is not None and flow_bwd is not None:
+				mag = numpy.linalg.norm(flow_fwd, axis = 2)
+				motion_level = float(numpy.mean(mag))
+				occ_mask = _compute_occlusion_mask(flow_fwd, flow_bwd, self.base_x, self.base_y)
+				occlusion_ratio = float(numpy.mean(occ_mask))
+				propagated = _warp_mask_with_flow(self.prev_mask, flow_fwd, self.base_x, self.base_y)
+				if propagated is not None:
+					retracted = _apply_occlusion_retraction(propagated, occ_mask)
+					stable_mask = _blend_stable_mask(retracted, stable_mask)
+					stable_mask = numpy.clip(stable_mask, 0.0, 1.0)
+		self.motion_level = motion_level
+		self.occlusion_ratio = occlusion_ratio
+		self._pending_gray = curr_gray
+		self._pending_mask = stable_mask.copy()
+		return stable_mask, motion_level, occlusion_ratio
 
 	def finalize(self) -> None:
-		if self.curr_gray is not None:
-			self.prev_gray = self.curr_gray
-		if self.curr_mask is not None:
-			self.prev_mask = self.curr_mask.copy()
-		else:
-			self.prev_mask = None
-		self.last_angle = self.pending_angle
-		self.last_scale = self.pending_scale
-		self.curr_gray = None
-		self.curr_mask = None
-		self.pending_angle = None
-		self.pending_scale = None
+		self.prev_gray = self._pending_gray
+		self.prev_mask = None if self._pending_mask is None else self._pending_mask.copy()
+		self._pending_gray = None
+		self._pending_mask = None
 
-	def _calc_flow(self, prev_gray: numpy.ndarray, curr_gray: numpy.ndarray) -> Optional[numpy.ndarray]:
+	def _compute_dense_flow(self, prev_gray: numpy.ndarray, curr_gray: numpy.ndarray) -> Tuple[Optional[numpy.ndarray], Optional[numpy.ndarray]]:
 		if prev_gray.shape != curr_gray.shape:
-			return None
-		if self.ofa is not None:
+			return None, None
+		if self.ofa is not None and _has_cv2_cuda():
 			try:
 				prev_gpu = cv2.cuda_GpuMat()
 				curr_gpu = cv2.cuda_GpuMat()
 				prev_gpu.upload(prev_gray)
 				curr_gpu.upload(curr_gray)
-				flow_gpu = self.ofa.calc(prev_gpu, curr_gpu, None)
-				dense_gpu = self.ofa.convertToDense(flow_gpu)
-				flow = dense_gpu.download()
-				return flow
+				flow_fwd = self.ofa.calc(prev_gpu, curr_gpu, None)
+				flow_bwd = self.ofa.calc(curr_gpu, prev_gpu, None)
+				grid_size = getattr(self.ofa, 'getGridSize', lambda: 4)()
+				if hasattr(self.ofa, 'upSampler'):
+					flow_fwd = self.ofa.upSampler(flow_fwd, (self.height, self.width), grid_size)
+					flow_bwd = self.ofa.upSampler(flow_bwd, (self.height, self.width), grid_size)
+				flow_fwd_np = flow_fwd.download().astype(numpy.float32)
+				flow_bwd_np = flow_bwd.download().astype(numpy.float32)
+				return flow_fwd_np, flow_bwd_np
 			except Exception:
 				self.ofa = None
 		try:
-			flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 2, 21, 3, 5, 1.2, 0)
-			return flow
+			flow_fwd_np = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 21, 3, 5, 1.1, 0).astype(numpy.float32)
+			flow_bwd_np = cv2.calcOpticalFlowFarneback(curr_gray, prev_gray, None, 0.5, 3, 21, 3, 5, 1.1, 0).astype(numpy.float32)
+			return flow_fwd_np, flow_bwd_np
 		except Exception:
-			return None
+			return None, None
 
 
 def _make_base_grid(width: int, height: int) -> Tuple[numpy.ndarray, numpy.ndarray]:
@@ -141,44 +130,46 @@ def _create_ofa(width: int, height: int):
 		return None
 
 
-def _warp_with_flow(state: _SeamTemporalState, image: numpy.ndarray, flow: numpy.ndarray) -> numpy.ndarray:
-	if image.shape[:2] != (state.height, state.width):
-		image = cv2.resize(image, (state.width, state.height), interpolation = cv2.INTER_LINEAR)
-	map_x = state.base_x + flow[..., 0].astype(numpy.float32)
-	map_y = state.base_y + flow[..., 1].astype(numpy.float32)
-	return cv2.remap(image, map_x, map_y, interpolation = cv2.INTER_LINEAR, borderMode = cv2.BORDER_REFLECT101, borderValue = 0)
+def _warp_mask_with_flow(mask: numpy.ndarray, flow: numpy.ndarray, base_x: numpy.ndarray, base_y: numpy.ndarray) -> Optional[numpy.ndarray]:
+	if mask is None or mask.size == 0:
+		return None
+	height, width = mask.shape[:2]
+	if flow.shape[:2] != (height, width):
+		mask = cv2.resize(mask, (flow.shape[1], flow.shape[0]), interpolation = cv2.INTER_LINEAR)
+	height, width = flow.shape[:2]
+	map_x = numpy.clip(base_x[:height, :width] + flow[..., 0], 0.0, width - 1).astype(numpy.float32)
+	map_y = numpy.clip(base_y[:height, :width] + flow[..., 1], 0.0, height - 1).astype(numpy.float32)
+	return cv2.remap(mask.astype(numpy.float32), map_x, map_y, interpolation = cv2.INTER_LINEAR, borderMode = cv2.BORDER_REFLECT101)
 
 
-def _mask_iou(mask_a: numpy.ndarray, mask_b: numpy.ndarray) -> float:
-	a_bin = mask_a > 0.5
-	b_bin = mask_b > 0.5
-	intersection = numpy.logical_and(a_bin, b_bin).sum()
-	union = numpy.logical_or(a_bin, b_bin).sum()
-	if union == 0:
-		return 1.0
-	return float(intersection) / float(union)
+def _remap_flow_component(component: numpy.ndarray, map_x: numpy.ndarray, map_y: numpy.ndarray) -> numpy.ndarray:
+	return cv2.remap(component, map_x, map_y, interpolation = cv2.INTER_LINEAR, borderMode = cv2.BORDER_REFLECT101)
 
 
-def _blend_weight_from_iou(propagated: numpy.ndarray, current: numpy.ndarray) -> float:
-	iou = _mask_iou(propagated, current)
-	if iou >= 0.85:
-		return 0.2
-	if iou >= 0.70:
-		return 0.35
-	if iou >= 0.50:
-		return 0.5
-	return 0.7
+def _compute_occlusion_mask(flow_fwd: numpy.ndarray, flow_bwd: numpy.ndarray, base_x: numpy.ndarray, base_y: numpy.ndarray, threshold: float = 1.0) -> numpy.ndarray:
+	height, width = flow_fwd.shape[:2]
+	map_x = numpy.clip(base_x[:height, :width] + flow_fwd[..., 0], 0.0, width - 1).astype(numpy.float32)
+	map_y = numpy.clip(base_y[:height, :width] + flow_fwd[..., 1], 0.0, height - 1).astype(numpy.float32)
+	back_x = _remap_flow_component(flow_bwd[..., 0], map_x, map_y)
+	back_y = _remap_flow_component(flow_bwd[..., 1], map_x, map_y)
+	err = numpy.sqrt((flow_fwd[..., 0] + back_x) ** 2 + (flow_fwd[..., 1] + back_y) ** 2)
+	return err > float(threshold)
 
 
-def _angular_difference(current: float, previous: Optional[float]) -> float:
-	if previous is None:
-		return 0.0
-	delta = current - previous
-	while delta <= -math.pi:
-		delta += 2.0 * math.pi
-	while delta > math.pi:
-		delta -= 2.0 * math.pi
-	return delta
+def _apply_occlusion_retraction(propagated: numpy.ndarray, occ_mask: numpy.ndarray) -> numpy.ndarray:
+	if propagated is None:
+		return numpy.zeros_like(occ_mask, dtype=numpy.float32)
+	if not numpy.any(occ_mask):
+		return propagated
+	kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+	eroded = cv2.erode(propagated, kernel, iterations = 1)
+	return numpy.where(occ_mask, eroded, propagated)
+
+
+def _blend_stable_mask(propagated: numpy.ndarray, current: numpy.ndarray) -> numpy.ndarray:
+	if propagated is None:
+		return numpy.clip(current, 0.0, 1.0)
+	return numpy.clip(numpy.maximum(current, 0.65 * propagated + 0.35 * current), 0.0, 1.0)
 
 
 def _build_ring_mask(mask: numpy.ndarray) -> Optional[numpy.ndarray]:
@@ -217,6 +208,20 @@ def _apply_screened_poisson_ring(composite: numpy.ndarray, background: numpy.nda
 		updated = (lap + _POISSON_LAMBDA * tgt) / (1.0 + _POISSON_LAMBDA)
 		src[ring_idx3] = updated[ring_idx3]
 	return numpy.clip(src, 0.0, 255.0).astype(composite.dtype)
+
+
+def _apply_gradient_feather(mask: numpy.ndarray) -> numpy.ndarray:
+	if mask.size == 0:
+		return mask
+	mask32 = mask.astype(numpy.float32)
+	gx = cv2.Sobel(mask32, cv2.CV_32F, 1, 0, ksize = 3)
+	gy = cv2.Sobel(mask32, cv2.CV_32F, 0, 1, ksize = 3)
+	grad = numpy.clip(numpy.abs(gx) + numpy.abs(gy), 0.0, 1.0)
+	kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+	dilated = cv2.dilate(mask32, kernel, iterations = 1)
+	feather = 0.35 * grad
+	soft = mask32 * (1.0 - feather) + dilated * feather
+	return numpy.clip(soft, 0.0, 1.0)
 
 
 def _get_seam_state(track_token: Optional[str], shape: Tuple[int, int]) -> Optional[_SeamTemporalState]:
@@ -453,17 +458,17 @@ def paste_back(temp_vision_frame : VisionFrame,
 	output_frame = temp_vision_frame.copy()
 	background_roi = output_frame[y1:y2, x1:x2]
 	background_copy = background_roi.copy()
-	components = affine_to_se2(affine_matrix)
 	state = _get_seam_state(track_token, (paste_height, paste_width))
 	if state is not None:
 		try:
-			stabilized_mask, _ = state.prepare(inverse_mask, background_copy, components.theta, components.scale)
+			stabilized_mask, _, _ = state.prepare(inverse_mask, background_copy)
 		except Exception:
 			state = None
 			stabilized_mask = inverse_mask
 	else:
 		stabilized_mask = inverse_mask
 
+	stabilized_mask = _apply_gradient_feather(stabilized_mask)
 	feathered_mask = _feather_mask(stabilized_mask)
 	corrected_face = _color_correct_face(inverse_vision_frame, background_copy, feathered_mask)
 	mask3 = cv2.merge([ feathered_mask, feathered_mask, feathered_mask ])
@@ -474,7 +479,6 @@ def paste_back(temp_vision_frame : VisionFrame,
 			state.finalize()
 		except Exception:
 			state.finalize()
-
 	output_frame[y1:y2, x1:x2] = blend.astype(output_frame.dtype)
 	return output_frame
 
