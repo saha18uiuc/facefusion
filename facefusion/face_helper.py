@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy
@@ -180,7 +180,12 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
 	return crop_vision_frame, affine_matrix
 
 
-def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
+def paste_back(temp_vision_frame : VisionFrame,
+			crop_vision_frame : VisionFrame,
+			crop_mask : Mask,
+			affine_matrix : Matrix,
+			track_token : Optional[str] = None,
+			**_unused : object) -> VisionFrame:
 	paste_bounding_box, paste_matrix = calculate_paste_area(temp_vision_frame, crop_vision_frame, affine_matrix)
 	x1, y1, x2, y2 = paste_bounding_box
 	paste_width = x2 - x1
