@@ -22,6 +22,13 @@ except Exception:  # pragma: no cover - optional dependency
     ximgproc = None  # type: ignore
     _HAS_XIMGPROC = False
 
+try:
+    from facefusion import temporal_filters  # type: ignore
+    _HAS_TEMPORAL_FILTERS = True
+except Exception:
+    temporal_filters = None  # type: ignore
+    _HAS_TEMPORAL_FILTERS = False
+
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
 from facefusion import state_manager
 
@@ -93,86 +100,57 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
 }
 
 
-class _OneEuroScalarFilter:
-	def __init__(self, fps: float, min_cutoff: float = 1.0, beta: float = 0.03, dcutoff: float = 1.0) -> None:
-		self._te = 1.0 / max(1e-3, fps)
-		self._min_cutoff = float(min_cutoff)
-		self._beta = float(beta)
-		self._dcutoff = float(dcutoff)
-		self._x_prev: Optional[float] = None
-		self._dx_prev: float = 0.0
-
-	def _alpha(self, cutoff: float) -> float:
-		tau = 1.0 / (2.0 * numpy.pi * cutoff)
-		return 1.0 / (1.0 + tau / self._te)
-
-	def reset(self, value: float) -> None:
-		self._x_prev = value
-		self._dx_prev = 0.0
-
-	def filter(self, value: float) -> float:
-		if self._x_prev is None:
-			self.reset(value)
-			return value
-		dx = (value - self._x_prev) / self._te
-		alpha_d = self._alpha(self._dcutoff)
-		self._dx_prev = alpha_d * dx + (1.0 - alpha_d) * self._dx_prev
-		cutoff = self._min_cutoff + self._beta * abs(self._dx_prev)
-		alpha = self._alpha(cutoff)
-		filtered = alpha * value + (1.0 - alpha) * self._x_prev
-		self._x_prev = filtered
-		return filtered
-
-
-class _AffineSmoother:
-	def __init__(self, fps: float) -> None:
-		self._filters = [_OneEuroScalarFilter(fps=fps) for _ in range(6)]
-		self._initialized = False
-
-	def apply(self, matrix: Matrix) -> Matrix:
-		flat = numpy.asarray(matrix, dtype = numpy.float32).reshape(-1)
-		if not self._initialized:
-			for filt, value in zip(self._filters, flat):
-				filt.reset(float(value))
-			self._initialized = True
-			return flat.reshape(matrix.shape)
-		smoothed = numpy.empty_like(flat)
-		for idx, value in enumerate(flat):
-			smoothed[idx] = self._filters[idx].filter(float(value))
-		return smoothed.reshape(matrix.shape)
-
-
-_AFFINE_SMOOTHERS: Dict[str, _AffineSmoother] = {}
-
-
 def _smooth_affine_matrix(track_token: Optional[str], matrix: Matrix) -> Matrix:
+	"""Smooth affine matrix using robust SG-based similarity transform filter."""
 	if track_token is None:
 		return matrix
-	key = str(track_token)
-	smoother = _AFFINE_SMOOTHERS.get(key)
-	if smoother is None:
-		fps = state_manager.get_item('output_video_fps')
-		try:
-			fps_val = float(fps) if fps else 30.0
-		except Exception:
-			fps_val = 30.0
-		smoother = _AffineSmoother(fps_val)
-		_AFFINE_SMOOTHERS[key] = smoother
-	return smoother.apply(matrix)
+	if not _HAS_TEMPORAL_FILTERS:
+		return matrix
+	key = temporal_filters.resolve_filter_key(str(track_token))
+	return temporal_filters.filter_affine(matrix, key)
 
 
 def reset_affine_smoothers() -> None:
-	_AFFINE_SMOOTHERS.clear()
+	"""Reset all temporal filters."""
+	if _HAS_TEMPORAL_FILTERS:
+		temporal_filters.reset_all_filters()
+	_LANDMARK_SMOOTHERS.clear()
 
 
-def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
+# Landmark temporal smoothing to reduce jitter
+_LANDMARK_SMOOTHERS: Dict[str, numpy.ndarray] = {}
+_LANDMARK_ALPHA = 0.65  # EMA smoothing factor: higher = more responsive, lower = more smooth
+
+
+def _smooth_landmarks(track_token: Optional[str], landmarks: FaceLandmark5) -> FaceLandmark5:
+	"""Apply exponential moving average smoothing to face landmarks."""
+	if track_token is None:
+		return landmarks
+
+	key = str(track_token)
+	prev_landmarks = _LANDMARK_SMOOTHERS.get(key)
+
+	if prev_landmarks is None:
+		# First observation - store and return
+		_LANDMARK_SMOOTHERS[key] = landmarks.copy()
+		return landmarks
+
+	# EMA: smoothed = alpha * current + (1 - alpha) * previous
+	smoothed = _LANDMARK_ALPHA * landmarks + (1.0 - _LANDMARK_ALPHA) * prev_landmarks
+	_LANDMARK_SMOOTHERS[key] = smoothed
+	return smoothed
+
+
+def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token: Optional[str] = None) -> Matrix:
+	# Apply temporal smoothing to landmarks before computing affine matrix
+	smoothed_landmarks = _smooth_landmarks(track_token, face_landmark_5)
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
-	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
+	affine_matrix = cv2.estimateAffinePartial2D(smoothed_landmarks, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
 	return affine_matrix
 
 
-def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Tuple[VisionFrame, Matrix]:
-    affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size)
+def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token: Optional[str] = None) -> Tuple[VisionFrame, Matrix]:
+    affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size, track_token)
     if _has_cv2_cuda():
         try:
             gpu_img = cv2.cuda_GpuMat()
