@@ -798,15 +798,35 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 		base_source_emb = _get_cached_source_embedding(source_face)
 
 	# Scale faces to temp_vision_frame size for correct warping
-	scaled_faces : List[Face] = [scale_face(tf, target_vision_frame, temp_vision_frame) for tf in target_faces]
-	track_tokens : Dict[int, Optional[str]] = {}
+	scaled_faces_unsorted : List[Face] = [scale_face(tf, target_vision_frame, temp_vision_frame) for tf in target_faces]
+
+	# CRITICAL FIX: Sort faces by track_id to ensure stable batch index mapping
+	# This prevents face A and face B from swapping batch slots between frames
+	track_tokens_unsorted : Dict[int, Optional[int]] = {}
 	try:
 		tracker_instance = face_tracker.get_tracker()
-		for face_index, scaled_face in enumerate(scaled_faces):
+		for face_index, scaled_face in enumerate(scaled_faces_unsorted):
 			track_id = tracker_instance.get_track_token(scaled_face)
-			track_tokens[face_index] = str(track_id) if track_id is not None else None
+			track_tokens_unsorted[face_index] = track_id
 	except Exception:
-		track_tokens = { face_index: None for face_index in range(len(scaled_faces)) }
+		track_tokens_unsorted = { face_index: None for face_index in range(len(scaled_faces_unsorted)) }
+
+	# Sort faces by track_id (None/untracked faces go last, stable order)
+	face_track_pairs = []
+	for face_index, scaled_face in enumerate(scaled_faces_unsorted):
+		track_id = track_tokens_unsorted.get(face_index)
+		# Use (track_id, face_index) as sort key: track_id primary, face_index secondary for stability
+		sort_key = (track_id if track_id is not None else float('inf'), face_index)
+		face_track_pairs.append((sort_key, scaled_face, track_id))
+
+	# Sort by track_id to ensure same faces always get same batch slots
+	face_track_pairs.sort(key=lambda x: x[0])
+
+	# Extract sorted faces and rebuild track_tokens mapping
+	scaled_faces : List[Face] = [pair[1] for pair in face_track_pairs]
+	track_tokens : Dict[int, Optional[str]] = {}
+	for new_index, (_, _, track_id) in enumerate(face_track_pairs):
+		track_tokens[new_index] = str(track_id) if track_id is not None else None
 
 	# The common single-face / no-tiling case gains nothing from the batch path and
 	# pays extra Cupy/IO-binding setup cost, so keep the lean sequential swap.
@@ -814,7 +834,9 @@ def swap_faces_batch(source_face : Face, target_faces : List[Face], target_visio
 		return swap_face(source_face, scaled_faces[0], temp_vision_frame)
 
 	for face_index, tface in enumerate(scaled_faces):
-		crop_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, tface.landmark_set.get('5/68'), model_template, pixel_boost_size)
+		# Pass track_token to warp to enable temporal smoothing of affine transforms
+		track_token = track_tokens.get(face_index)
+		crop_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, tface.landmark_set.get('5/68'), model_template, pixel_boost_size, track_token=track_token)
 		# Precompute content-agnostic masks
 		masks = []
 		if 'box' in state_manager.get_item('face_mask_types'):
@@ -1026,7 +1048,16 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 	model_size = get_model_options().get('size')
 	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
 	pixel_boost_total = pixel_boost_size[0] // model_size[0]
-	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size)
+	# Get track_token early for use in warp
+	track_token = None
+	try:
+		tracker_instance = face_tracker.get_tracker()
+		track_id = tracker_instance.get_track_token(target_face)
+		if track_id is not None:
+			track_token = str(track_id)
+	except Exception:
+		track_token = None
+	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size, track_token=track_token)
 	temp_vision_frames = []
 	crop_masks = []
 
@@ -1062,14 +1093,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 		crop_masks.append(region_mask)
 
 	crop_mask = numpy.minimum.reduce(crop_masks).clip(0, 1)
-	track_token = None
-	try:
-		tracker_instance = face_tracker.get_tracker()
-		track_id = tracker_instance.get_track_token(target_face)
-		if track_id is not None:
-			track_token = str(track_id)
-	except Exception:
-		track_token = None
+	# track_token already retrieved earlier for warp, reuse for paste_back
 	paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix, track_token=track_token)
 	return paste_vision_frame
 

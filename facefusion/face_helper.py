@@ -115,11 +115,16 @@ def reset_affine_smoothers() -> None:
 	if _HAS_TEMPORAL_FILTERS:
 		temporal_filters.reset_all_filters()
 	_LANDMARK_SMOOTHERS.clear()
+	_AFFINE_MATRIX_CACHE.clear()
 
 
 # Landmark temporal smoothing to reduce jitter
 _LANDMARK_SMOOTHERS: Dict[str, numpy.ndarray] = {}
-_LANDMARK_ALPHA = 0.65  # EMA smoothing factor: higher = more responsive, lower = more smooth
+_LANDMARK_ALPHA = 0.2  # EMA smoothing factor: REDUCED from 0.65 to 0.2 for more stable tracking (higher = responsive, lower = smooth)
+
+# Affine matrix caching for deterministic warps (reduces micro-jitter)
+_AFFINE_MATRIX_CACHE: Dict[str, Matrix] = {}
+_AFFINE_CACHE_ALPHA = 0.2  # Smoothing factor for affine matrix blending
 
 
 def _smooth_landmarks(track_token: Optional[str], landmarks: FaceLandmark5) -> FaceLandmark5:
@@ -136,8 +141,29 @@ def _smooth_landmarks(track_token: Optional[str], landmarks: FaceLandmark5) -> F
 		return landmarks
 
 	# EMA: smoothed = alpha * current + (1 - alpha) * previous
+	# Lower alpha = more smoothing = less jitter
 	smoothed = _LANDMARK_ALPHA * landmarks + (1.0 - _LANDMARK_ALPHA) * prev_landmarks
 	_LANDMARK_SMOOTHERS[key] = smoothed
+	return smoothed
+
+
+def _cache_and_smooth_affine(track_token: Optional[str], affine_matrix: Matrix) -> Matrix:
+	"""Cache and smooth affine matrix to prevent micro-jitter in warping."""
+	if track_token is None:
+		return affine_matrix
+
+	key = str(track_token)
+	prev_matrix = _AFFINE_MATRIX_CACHE.get(key)
+
+	if prev_matrix is None:
+		# First observation - cache and return
+		_AFFINE_MATRIX_CACHE[key] = affine_matrix.copy()
+		return affine_matrix
+
+	# Blend new matrix with cached matrix for stability
+	# This prevents 0.2-0.5px jumps that cause visible jitter
+	smoothed = _AFFINE_CACHE_ALPHA * affine_matrix + (1.0 - _AFFINE_CACHE_ALPHA) * prev_matrix
+	_AFFINE_MATRIX_CACHE[key] = smoothed
 	return smoothed
 
 
@@ -146,22 +172,27 @@ def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_tem
 	smoothed_landmarks = _smooth_landmarks(track_token, face_landmark_5)
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
 	affine_matrix = cv2.estimateAffinePartial2D(smoothed_landmarks, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
+	# Cache and smooth the affine matrix itself to prevent micro-jitter
+	affine_matrix = _cache_and_smooth_affine(track_token, affine_matrix)
 	return affine_matrix
 
 
 def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token: Optional[str] = None) -> Tuple[VisionFrame, Matrix]:
     affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size, track_token)
+    # Force consistent interpolation: INTER_LINEAR for stability (INTER_AREA can have slight rounding differences)
+    # Use BORDER_REPLICATE to match baseline behavior exactly
     if _has_cv2_cuda():
         try:
             gpu_img = cv2.cuda_GpuMat()
             gpu_img.upload(temp_vision_frame)
-            # INTER_AREA for downscale; replicate border to mimic CPU path
-            crop_gpu = cv2.cuda.warpAffine(gpu_img, affine_matrix, crop_size, flags=cv2.INTER_AREA, borderMode=cv2.BORDER_REPLICATE)
+            # Use INTER_LINEAR for consistency across GPU/CPU paths
+            crop_gpu = cv2.cuda.warpAffine(gpu_img, affine_matrix, crop_size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
             crop_vision_frame = crop_gpu.download()
             return crop_vision_frame, affine_matrix
         except Exception:
             pass
-    crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode = cv2.BORDER_REPLICATE, flags = cv2.INTER_AREA)
+    # CPU fallback: use same flags for consistency
+    crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_LINEAR)
     return crop_vision_frame, affine_matrix
 
 
@@ -208,31 +239,36 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 
 	if _has_cv2_cuda():
 		try:
-			# Warp on GPU, blend on CPU for simplicity and correctness
+			# Warp on GPU with consistent INTER_LINEAR, blend on CPU in fp32 for stability
 			gpu_mask = cv2.cuda_GpuMat()
 			gpu_mask.upload(crop_mask.astype(numpy.float32))
-			inv_mask_gpu = cv2.cuda.warpAffine(gpu_mask, paste_matrix, (paste_width, paste_height))
+			inv_mask_gpu = cv2.cuda.warpAffine(gpu_mask, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR)
 			mask_roi = inv_mask_gpu.download().clip(0, 1)
 			mask_roi = numpy.expand_dims(mask_roi, axis = -1)
 
 			gpu_crop = cv2.cuda_GpuMat()
 			gpu_crop.upload(crop_vision_frame)
-			inv_frame_gpu = cv2.cuda.warpAffine(gpu_crop, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
+			inv_frame_gpu = cv2.cuda.warpAffine(gpu_crop, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 			inverse_vision_frame = inv_frame_gpu.download()
 
+			# Blend in fp32 for numerical stability
 			temp_vision_frame = temp_vision_frame.copy()
 			paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-			paste_vision_frame = paste_vision_frame * (1 - mask_roi) + inverse_vision_frame * mask_roi
-			temp_vision_frame[y1:y2, x1:x2] = paste_vision_frame.astype(temp_vision_frame.dtype)
+			paste_f32 = paste_vision_frame.astype(numpy.float32)
+			inv_f32 = inverse_vision_frame.astype(numpy.float32)
+			mask3 = numpy.repeat(mask_roi, 3, axis=-1)
+			blended = paste_f32 * (1.0 - mask3) + inv_f32 * mask3
+			temp_vision_frame[y1:y2, x1:x2] = numpy.clip(blended, 0, 255).astype(temp_vision_frame.dtype)
 			return temp_vision_frame
 		except Exception:
 			pass
 
+	# CPU fallback: use INTER_LINEAR for consistency and blend in fp32
 	inverse_mask_expanded = numpy.expand_dims(inverse_mask, axis = -1)
-	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
+	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 	temp_vision_frame = temp_vision_frame.copy()
 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-	# Convert to float32 for stable blending
+	# Convert to float32 for stable blending - prevents rounding artifacts
 	paste_f32 = paste_vision_frame.astype(numpy.float32)
 	inv_frame_f32 = inverse_vision_frame.astype(numpy.float32)
 	# Expand mask to 3 channels via OpenCV
@@ -241,7 +277,7 @@ def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame,
 	part_a = cv2.multiply(paste_f32, one_minus)
 	part_b = cv2.multiply(inv_frame_f32, mask3)
 	blend = cv2.add(part_a, part_b)
-	temp_vision_frame[y1:y2, x1:x2] = blend.astype(temp_vision_frame.dtype)
+	temp_vision_frame[y1:y2, x1:x2] = numpy.clip(blend, 0, 255).astype(temp_vision_frame.dtype)
 	return temp_vision_frame
 
 

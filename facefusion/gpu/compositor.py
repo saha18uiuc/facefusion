@@ -132,6 +132,9 @@ class GpuRoiComposer:
         self.temporal_tau = 0.35
         self.color_momentum = 0.1
         self._sdf_half_width = 1.5
+        # Temporal snap: if face patch is similar to previous frame, reduce movement
+        self._prev_warped: Dict[str, torch.Tensor] = {}
+        self.snap_threshold = 0.95  # SSIM threshold for temporal snapping (higher = more aggressive)
 
     # ------------------------------------------------------------------
     def compose(
@@ -170,6 +173,10 @@ class GpuRoiComposer:
         if warped_sdf is not None:
             sdf_alpha = self._compute_sdf_alpha(warped_sdf)
             mask = torch.clamp(mask * sdf_alpha, 0.0, 1.0)
+
+        # Apply temporal snap BEFORE color transfer to reduce warping micro-jitter
+        if track_key is not None:
+            warped_rgb = self._apply_temporal_snap(track_key, warped_rgb)
 
         state: Optional[_TemporalState] = None
         curr_gray: Optional[numpy.ndarray] = None
@@ -501,11 +508,48 @@ class GpuRoiComposer:
         t = torch.clamp((sdf + width) / (2.0 * width), 0.0, 1.0)
         return t * t * (3.0 - 2.0 * t)
 
+    def _compute_similarity(self, img1: torch.Tensor, img2: torch.Tensor) -> float:
+        """Fast approximate SSIM using mean squared difference."""
+        if img1.shape != img2.shape:
+            return 0.0
+        # Simple MSE-based similarity (faster than full SSIM)
+        mse = torch.mean((img1 - img2) ** 2).item()
+        # Convert MSE to similarity score (0-1 range, 1 = identical)
+        # Assuming images are in [0, 1] range, MSE of 0.01 is ~90% similar
+        similarity = max(0.0, 1.0 - (mse * 50.0))  # Scale MSE to similarity
+        return similarity
+
+    def _apply_temporal_snap(self, track_token: Optional[str], warped_rgb: torch.Tensor) -> torch.Tensor:
+        """Apply temporal snapping: if current face is very similar to previous, blend toward previous."""
+        if track_token is None:
+            return warped_rgb
+
+        prev_warped = self._prev_warped.get(track_token)
+        if prev_warped is None:
+            # First frame for this track, just cache and return
+            self._prev_warped[track_token] = warped_rgb.detach().clone()
+            return warped_rgb
+
+        # Check similarity
+        similarity = self._compute_similarity(warped_rgb, prev_warped)
+
+        if similarity >= self.snap_threshold:
+            # Very similar to previous frame - blend heavily toward previous to reduce jitter
+            # Use 0.3 weight for current, 0.7 for previous (aggressive smoothing)
+            snapped = 0.3 * warped_rgb + 0.7 * prev_warped
+            self._prev_warped[track_token] = snapped.detach().clone()
+            return snapped
+        else:
+            # Different enough - use current frame but cache it
+            self._prev_warped[track_token] = warped_rgb.detach().clone()
+            return warped_rgb
+
     def reset_temporal_state(self) -> None:
         for state in self._temporal_states.values():
             state.reset()
         self._temporal_states.clear()
         self._color_states.clear()
+        self._prev_warped.clear()
 
 
 _COMPOSER_CACHE: Dict[Tuple[int, int, int], GpuRoiComposer] = {}
