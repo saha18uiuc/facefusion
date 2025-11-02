@@ -1055,6 +1055,11 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 		track_id = tracker_instance.get_track_token(target_face)
 		if track_id is not None:
 			track_token = str(track_id)
+		# Confidence gating: skip swap if confidence dropped significantly
+		if face_tracker.is_enabled() and not tracker_instance.should_use_face(target_face):
+			# Low confidence frame - return unmodified to avoid injecting garbage
+			# The temporal smoothing in compositor will handle the gap gracefully
+			return temp_vision_frame
 	except Exception:
 		track_token = None
 	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size, track_token=track_token)

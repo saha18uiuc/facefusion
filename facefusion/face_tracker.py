@@ -26,6 +26,11 @@ class _TrackedFace:
     points_68: numpy.ndarray
     misses: int = 0
     last_detection_frame: int = 0
+    confidence_history: List[float] = None  # Rolling window of detection confidence scores
+
+    def __post_init__(self):
+        if self.confidence_history is None:
+            self.confidence_history = []
 
 
 class _OneEuroFilter:
@@ -80,6 +85,9 @@ class FaceTracker:
             self._fps = float(fps) if fps else 30.0
         except Exception:
             self._fps = 30.0
+        # Confidence gating parameters
+        self._confidence_window_size = 10  # Rolling window for median calculation
+        self._confidence_drop_threshold = 0.15  # If confidence drops > this below median, skip frame
 
     def reset(self) -> None:
         with self._lock:
@@ -161,6 +169,11 @@ class FaceTracker:
                 track.last_detection_frame = self._frame_index
                 self._reset_filters(matched_id, track.points_68)
                 self._update_face_index(matched_id, track.face)
+                # Record confidence score
+                confidence = float(getattr(face, 'score', 0.9))  # Default to 0.9 if no score
+                track.confidence_history.append(confidence)
+                if len(track.confidence_history) > self._confidence_window_size:
+                    track.confidence_history = track.confidence_history[-self._confidence_window_size:]
                 unmatched_track_ids.discard(matched_id)
                 assigned.append(track.face)
             else:
@@ -201,6 +214,9 @@ class FaceTracker:
             points_68=landmarks.astype(numpy.float32).copy(),
             last_detection_frame=self._frame_index,
         )
+        # Initialize confidence history
+        confidence = float(getattr(face, 'score', 0.9))
+        track.confidence_history = [confidence]
         self._tracks[self._next_track_id] = track
         self._filters[self._next_track_id] = self._build_filters(track.points_68)
         self._update_face_index(self._next_track_id, track.face)
@@ -325,6 +341,52 @@ class FaceTracker:
     def get_track_token(self, face: Face) -> Optional[int]:
         with self._lock:
             return self._face_to_track.get(id(face))
+
+    def update_confidence(self, face: Face, confidence: float) -> None:
+        """Update confidence score for a tracked face."""
+        with self._lock:
+            track_id = self._face_to_track.get(id(face))
+            if track_id is None:
+                return
+            track = self._tracks.get(track_id)
+            if track is None:
+                return
+
+            # Add confidence to rolling window
+            track.confidence_history.append(confidence)
+            # Keep only last N samples
+            if len(track.confidence_history) > self._confidence_window_size:
+                track.confidence_history = track.confidence_history[-self._confidence_window_size:]
+
+    def should_use_face(self, face: Face) -> bool:
+        """Check if face confidence is acceptable. Returns False if confidence dropped significantly."""
+        with self._lock:
+            track_id = self._face_to_track.get(id(face))
+            if track_id is None:
+                return True  # No tracking info, allow by default
+
+            track = self._tracks.get(track_id)
+            if track is None or not track.confidence_history:
+                return True  # No history, allow by default
+
+            if len(track.confidence_history) < 3:
+                return True  # Not enough history to judge
+
+            # Get current confidence
+            current_conf = track.confidence_history[-1]
+
+            # Compute median of history (excluding current)
+            history = track.confidence_history[:-1]
+            median_conf = float(numpy.median(history))
+
+            # Check if current confidence dropped significantly below median
+            drop = median_conf - current_conf
+
+            if drop > self._confidence_drop_threshold:
+                # Confidence dropped significantly - this frame is likely bad
+                return False
+
+            return True
 
 
 def _compute_iou(box_a: numpy.ndarray, box_b: numpy.ndarray) -> float:

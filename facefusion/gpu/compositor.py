@@ -31,6 +31,19 @@ class _ColorState:
     src_std: numpy.ndarray
     tgt_mean: numpy.ndarray
     tgt_std: numpy.ndarray
+    # Linear-space gain/bias for stable relighting
+    gain_rgb: Optional[torch.Tensor] = None  # Per-channel multiplicative gain
+    bias_rgb: Optional[torch.Tensor] = None  # Per-channel additive bias
+
+
+@dataclass
+class _SeamBandState:
+    """Cache for temporal seam band reuse to eliminate edge flicker."""
+    prev_seam_bgr: Optional[torch.Tensor] = None
+    prev_seam_mask: Optional[torch.Tensor] = None
+    prev_center_x: float = 0.0
+    prev_center_y: float = 0.0
+    seam_width: int = 12  # Width of seam band in pixels
 
 
 class _TemporalState:
@@ -41,6 +54,8 @@ class _TemporalState:
         self.prev_comp_bgr: Optional[numpy.ndarray] = None
         self.prev_mask: Optional[numpy.ndarray] = None
         self._pending_gray: Optional[numpy.ndarray] = None
+        # Optical flow-guided fusion state
+        self.prev_face_patch: Optional[torch.Tensor] = None  # Previous swapped face in linear space
         if not _HAS_OFA:
             raise RuntimeError('OFA unavailable')
         self._flow = cv2.cuda_NvidiaOpticalFlow_2_0.create(
@@ -117,6 +132,42 @@ class _TemporalState:
         self.prev_comp_bgr = None
         self.prev_mask = None
         self._pending_gray = None
+        self.prev_face_patch = None
+
+    def warp_face_patch(
+        self,
+        prev_patch_linear: torch.Tensor,
+        flow_gpu: 'cv2.cuda.GpuMat',
+        cost_gpu: 'cv2.cuda.GpuMat',
+        threshold: float
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Warp previous face patch forward using optical flow. Returns (warped_patch, reliability_mask)."""
+        try:
+            # Convert to numpy for cv2 warping
+            prev_np = (prev_patch_linear.detach().cpu().numpy() * 255.0).astype(numpy.uint8)
+
+            planes = cv2.cuda.split(flow_gpu)
+            map_x = cv2.cuda.add(self._grid_x, planes[0])
+            map_y = cv2.cuda.add(self._grid_y, planes[1])
+
+            src_gpu = cv2.cuda_GpuMat()
+            src_gpu.upload(prev_np)
+            warped_gpu = cv2.cuda.remap(src_gpu, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+            warped = warped_gpu.download()
+
+            # Reliability mask
+            mask_gpu = cv2.cuda.compare(cost_gpu, threshold, cv2.CMP_LT)
+            mask_gpu = mask_gpu.convertTo(cv2.CV_32F, 1.0 / 255.0)
+            mask_gpu = cv2.cuda.blur(mask_gpu, (5, 5))
+            reliable = mask_gpu.download()
+
+            # Convert back to tensor
+            warped_tensor = torch.from_numpy(warped.astype(numpy.float32) / 255.0).to(prev_patch_linear.device)
+            reliable_tensor = torch.from_numpy(reliable).to(prev_patch_linear.device)
+
+            return warped_tensor, reliable_tensor
+        except Exception:
+            return None
 
 class GpuRoiComposer:
     """Compose warped face crops back into a frame ROI on the GPU."""
@@ -128,6 +179,7 @@ class GpuRoiComposer:
         self._gaussian_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._temporal_states: Dict[str, _TemporalState] = {}
         self._color_states: Dict[str, _ColorState] = {}
+        self._seam_states: Dict[str, _SeamBandState] = {}
         self.temporal_alpha = 0.2
         self.temporal_tau = 0.35
         self.color_momentum = 0.1
@@ -135,6 +187,11 @@ class GpuRoiComposer:
         # Temporal snap: if face patch is similar to previous frame, reduce movement
         self._prev_warped: Dict[str, torch.Tensor] = {}
         self.snap_threshold = 0.95  # SSIM threshold for temporal snapping (higher = more aggressive)
+        # Seam band temporal reuse parameters
+        self.seam_motion_threshold = 3.0  # pixels - reuse seam if movement < this
+        # Anomaly detection parameters
+        self._prev_quality: Dict[str, float] = {}  # Track quality per face
+        self.anomaly_threshold = 0.70  # If quality drops below this, trigger aggressive smoothing
 
     # ------------------------------------------------------------------
     def compose(
@@ -208,7 +265,48 @@ class GpuRoiComposer:
 
         src_lin = self._srgb_to_linear(warped_rgb_t)
         bg_lin = self._srgb_to_linear(bg_rgb_t)
+
+        # Optical flow-guided temporal fusion: conditionally blend with warped-previous
+        # AND anomaly detection: if quality drops significantly, use more aggressive smoothing
+        is_anomaly = False
+        if state is not None and flow_bundle is not None and state.prev_face_patch is not None:
+            try:
+                flow_gpu, cost_gpu = flow_bundle
+                warp_result = state.warp_face_patch(state.prev_face_patch, flow_gpu, cost_gpu, float(self.temporal_tau))
+                if warp_result is not None:
+                    warped_prev_linear, flow_reliable = warp_result
+                    # Compute similarity between current and warped-previous in linear space
+                    # Use just the face region (where mask > 0.1)
+                    similarity = self._compute_similarity(src_lin.squeeze(0).permute(1, 2, 0), warped_prev_linear)
+
+                    # Anomaly detection: track quality per frame
+                    prev_quality = self._prev_quality.get(track_key, 1.0) if track_key else 1.0
+                    current_quality = similarity
+
+                    # If quality dropped significantly from previous frame, mark as anomaly
+                    if current_quality < self.anomaly_threshold and (prev_quality - current_quality) > 0.15:
+                        is_anomaly = True
+                        # VERY aggressive smoothing for anomaly frames to prevent catastrophic dips
+                        src_lin_permuted = src_lin.squeeze(0).permute(1, 2, 0)
+                        fused = 0.1 * src_lin_permuted + 0.9 * warped_prev_linear  # 90% previous!
+                        src_lin = fused.unsqueeze(0).permute(0, 3, 1, 2)
+                    elif similarity > 0.85:
+                        # Normal high similarity: blend 70% toward stabilized warped-previous
+                        src_lin_permuted = src_lin.squeeze(0).permute(1, 2, 0)
+                        fused = 0.3 * src_lin_permuted + 0.7 * warped_prev_linear
+                        src_lin = fused.unsqueeze(0).permute(0, 3, 1, 2)
+
+                    # Update quality history
+                    if track_key:
+                        self._prev_quality[track_key] = current_quality
+            except Exception:
+                pass  # Fall back to using current frame
+
         blended_lin = self._multi_band_blend(src_lin, bg_lin, mask_t)
+
+        # Cache current face patch in linear space for next frame's optical flow fusion
+        if state is not None:
+            state.prev_face_patch = src_lin.squeeze(0).permute(1, 2, 0).detach().clone()
 
         out_srgb = self._linear_to_srgb(blended_lin)
         out_srgb = self._apply_dither(out_srgb)
@@ -222,6 +320,12 @@ class GpuRoiComposer:
                 frame_bgr, blended_lin = self._apply_temporal(state, curr_gray, flow_bundle, frame_bgr, blended_lin, mask_np)
             except Exception:
                 state.reset()
+
+        # Apply seam band blending with temporal reuse (after temporal smoothing) to eliminate edge flicker
+        if track_key is not None:
+            frame_bgr_float = frame_bgr.float() / 255.0
+            frame_bgr_float = self._apply_seam_band_blending(track_key, frame_bgr_float, mask)
+            frame_bgr = torch.clamp(frame_bgr_float * 255.0 + 0.5, 0.0, 255.0).to(torch.uint8)
 
         return CompositeResult(
             frame_bgr=frame_bgr,
@@ -429,35 +533,71 @@ class GpuRoiComposer:
         mask: torch.Tensor,
         bg_reference: numpy.ndarray
     ) -> torch.Tensor:
+        """Apply color transfer in LINEAR light space with quantized, lowpass gain/bias."""
         mask_cpu = mask.detach().cpu().numpy()
         region = mask_cpu > 0.1
         if region.sum() < 16:
             return warped_rgb
 
-        warped_cpu = numpy.clip(warped_rgb.detach().cpu().numpy().astype(numpy.float32), 0.0, 1.0)
-        bg_float = numpy.clip(bg_reference.astype(numpy.float32) / 255.0, 0.0, 1.0)
+        # Convert to linear space for perceptually uniform color matching
+        warped_linear = self._srgb_to_linear(warped_rgb.unsqueeze(0).permute(0, 3, 1, 2)).squeeze(0).permute(1, 2, 0)
+        bg_float = torch.from_numpy(bg_reference.astype(numpy.float32) / 255.0).to(self.device)
+        bg_linear = self._srgb_to_linear(bg_float.unsqueeze(0).permute(0, 3, 1, 2)).squeeze(0).permute(1, 2, 0)
 
-        warped_lab = cv2.cvtColor(warped_cpu, cv2.COLOR_BGR2LAB)
-        bg_lab = cv2.cvtColor(bg_float, cv2.COLOR_BGR2LAB)
+        # Get masked regions
+        mask_3d = mask.unsqueeze(-1).expand_as(warped_linear)
+        region_tensor = mask > 0.1
 
-        src_mean = warped_lab[region].mean(axis=0)
-        src_std = warped_lab[region].std(axis=0) + 1e-6
-        tgt_mean_now = bg_lab[region].mean(axis=0)
-        tgt_std_now = bg_lab[region].std(axis=0) + 1e-6
+        warped_masked = warped_linear[region_tensor.unsqueeze(-1).expand_as(warped_linear)].view(-1, 3)
+        bg_masked = bg_linear[region_tensor.unsqueeze(-1).expand_as(bg_linear)].view(-1, 3)
 
+        if warped_masked.shape[0] < 16:
+            return warped_rgb
+
+        # Compute per-channel statistics in linear space
+        src_mean_now = warped_masked.mean(dim=0)
+        src_std_now = warped_masked.std(dim=0) + 1e-6
+        tgt_mean_now = bg_masked.mean(dim=0)
+        tgt_std_now = bg_masked.std(dim=0) + 1e-6
+
+        # Compute raw gain and bias
+        raw_gain = tgt_std_now / src_std_now
+        raw_bias = tgt_mean_now - raw_gain * src_mean_now
+
+        # Quantize to prevent micro-pumping (round to nearest 1/256)
+        quantize_steps = 256.0
+        raw_gain = torch.round(raw_gain * quantize_steps) / quantize_steps
+        raw_bias = torch.round(raw_bias * quantize_steps) / quantize_steps
+
+        # Get or create state
         state = self._color_states.get(track_token)
         if state is None:
-            state = _ColorState(src_mean=src_mean, src_std=src_std, tgt_mean=tgt_mean_now, tgt_std=tgt_std_now)
+            # First frame - initialize with quantized values
+            state = _ColorState(
+                src_mean=src_mean_now.detach().cpu().numpy(),
+                src_std=src_std_now.detach().cpu().numpy(),
+                tgt_mean=tgt_mean_now.detach().cpu().numpy(),
+                tgt_std=tgt_std_now.detach().cpu().numpy(),
+                gain_rgb=raw_gain.detach().clone(),
+                bias_rgb=raw_bias.detach().clone()
+            )
             self._color_states[track_token] = state
         else:
-            state.tgt_mean = (1.0 - self.color_momentum) * state.tgt_mean + self.color_momentum * tgt_mean_now
-            state.tgt_std = (1.0 - self.color_momentum) * state.tgt_std + self.color_momentum * tgt_std_now
-            # Keep source statistics stable once initialised
+            # Lowpass filter gain/bias to prevent frame-to-frame pumping
+            momentum = self.color_momentum
+            state.gain_rgb = (1.0 - momentum) * state.gain_rgb + momentum * raw_gain
+            state.bias_rgb = (1.0 - momentum) * state.bias_rgb + momentum * raw_bias
+            # Quantize filtered values too
+            state.gain_rgb = torch.round(state.gain_rgb * quantize_steps) / quantize_steps
+            state.bias_rgb = torch.round(state.bias_rgb * quantize_steps) / quantize_steps
 
-        adjusted_lab = self._reinhard_transfer(warped_lab, state.src_mean, state.src_std, state.tgt_mean, state.tgt_std)
-        adjusted_bgr = cv2.cvtColor(adjusted_lab, cv2.COLOR_LAB2BGR)
-        adjusted_bgr = numpy.clip(adjusted_bgr, 0.0, 1.0).astype(numpy.float32)
-        return torch.from_numpy(adjusted_bgr).to(self.device)
+        # Apply color correction in linear space
+        adjusted_linear = warped_linear * state.gain_rgb + state.bias_rgb
+        adjusted_linear = torch.clamp(adjusted_linear, 0.0, 1.0)
+
+        # Convert back to sRGB
+        adjusted_srgb = self._linear_to_srgb(adjusted_linear.unsqueeze(0).permute(0, 3, 1, 2)).squeeze(0).permute(1, 2, 0)
+        return torch.clamp(adjusted_srgb, 0.0, 1.0)
 
     @staticmethod
     def _reinhard_transfer(
@@ -544,12 +684,67 @@ class GpuRoiComposer:
             self._prev_warped[track_token] = warped_rgb.detach().clone()
             return warped_rgb
 
+    def _apply_seam_band_blending(
+        self,
+        track_token: Optional[str],
+        blended_bgr: torch.Tensor,
+        mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply multiband blending on seam edge with temporal reuse to eliminate edge flicker."""
+        if track_token is None:
+            return blended_bgr
+
+        # Get or create seam state
+        seam_state = self._seam_states.get(track_token)
+        if seam_state is None:
+            seam_state = _SeamBandState()
+            self._seam_states[track_token] = seam_state
+
+        # Compute mask center for motion tracking
+        mask_binary = (mask > 0.5).float()
+        if mask_binary.sum() < 10:
+            return blended_bgr  # No valid mask
+
+        ys, xs = torch.where(mask_binary > 0)
+        center_x = xs.float().mean().item()
+        center_y = ys.float().mean().item()
+
+        # Check if we should reuse previous seam (low motion)
+        if seam_state.prev_seam_bgr is not None:
+            motion = ((center_x - seam_state.prev_center_x) ** 2 +
+                     (center_y - seam_state.prev_center_y) ** 2) ** 0.5
+
+            if motion < self.seam_motion_threshold:
+                # Low motion - reuse previous seam band
+                # Extract seam band region (dilated - original)
+                kernel_size = seam_state.seam_width
+                # Use max pooling as dilation
+                mask_4d = mask.unsqueeze(0).unsqueeze(0)
+                dilated = F.max_pool2d(mask_4d, kernel_size=kernel_size*2+1, stride=1, padding=kernel_size)
+                dilated = dilated.squeeze(0).squeeze(0)
+
+                # Seam band = dilated - original
+                seam_band = torch.clamp(dilated - mask, 0.0, 1.0)
+
+                # Blend previous seam into current frame at seam band
+                seam_band_3d = seam_band.unsqueeze(-1)
+                blended_bgr = blended_bgr * (1.0 - seam_band_3d) + seam_state.prev_seam_bgr * seam_band_3d
+
+        # Update state with current frame
+        seam_state.prev_seam_bgr = blended_bgr.detach().clone()
+        seam_state.prev_center_x = center_x
+        seam_state.prev_center_y = center_y
+
+        return blended_bgr
+
     def reset_temporal_state(self) -> None:
         for state in self._temporal_states.values():
             state.reset()
         self._temporal_states.clear()
         self._color_states.clear()
         self._prev_warped.clear()
+        self._seam_states.clear()
+        self._prev_quality.clear()
 
 
 _COMPOSER_CACHE: Dict[Tuple[int, int, int], GpuRoiComposer] = {}
