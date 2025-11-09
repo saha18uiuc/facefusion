@@ -27,6 +27,26 @@ from facefusion.thread_helper import conditional_thread_semaphore
 from facefusion.types import ApplyStateItem, Args, DownloadScope, Embedding, Face, InferencePool, ModelOptions, ModelSet, ProcessMode, VisionFrame
 from facefusion.vision import read_static_image, read_static_images, read_static_video_frame, unpack_resolution
 
+# Performance optimization modules
+from facefusion.processors.temporal_smoother import TemporalSmoother
+from facefusion.processors.enhanced_blending import EnhancedBlender
+
+# Global instances for temporal smoothing and enhanced blending
+_temporal_smoother = None
+_enhanced_blender = None
+
+# CUDA memory management
+try:
+	import torch
+	import gc
+	_torch_available = True
+except ImportError:
+	_torch_available = False
+
+# Processing statistics
+_frame_count = 0
+_batch_cleanup_interval = 10
+
 
 @lru_cache()
 def create_static_model_set(download_scope : DownloadScope) -> ModelSet:
@@ -497,6 +517,107 @@ def clear_inference_pool() -> None:
 	inference_manager.clear_inference_pool(__name__, model_names)
 
 
+def get_temporal_smoother() -> TemporalSmoother:
+	"""Get or create temporal smoother instance."""
+	global _temporal_smoother
+	if _temporal_smoother is None:
+		_temporal_smoother = TemporalSmoother(
+			window_size=5,
+			alpha=0.25,
+			enable_adaptive=True
+		)
+	return _temporal_smoother
+
+
+def get_enhanced_blender() -> EnhancedBlender:
+	"""Get or create enhanced blender instance."""
+	global _enhanced_blender
+	if _enhanced_blender is None:
+		_enhanced_blender = EnhancedBlender(
+			method='multiband',
+			enable_color_correction=True,
+			pyramid_levels=5,
+			feather_amount=15
+		)
+	return _enhanced_blender
+
+
+def reset_temporal_smoother() -> None:
+	"""Reset temporal smoother (call at scene cuts)."""
+	global _temporal_smoother, _frame_count
+	if _temporal_smoother is not None:
+		_temporal_smoother.reset()
+	_frame_count = 0
+
+
+def cleanup_cuda_memory(aggressive: bool = False) -> None:
+	"""
+	Clean up CUDA memory to prevent OOM.
+
+	Args:
+		aggressive: If True, performs more thorough cleanup
+	"""
+	if not _torch_available:
+		return
+
+	if torch.cuda.is_available():
+		# Empty CUDA cache
+		torch.cuda.empty_cache()
+
+		if aggressive:
+			# Synchronize to ensure all operations complete
+			torch.cuda.synchronize()
+
+			# Python garbage collection
+			gc.collect()
+
+			# Empty cache again after GC
+			torch.cuda.empty_cache()
+
+
+def get_optimal_batch_size() -> int:
+	"""
+	Determine optimal batch size based on available VRAM.
+
+	Returns:
+		Recommended batch size for face swapping
+	"""
+	if not _torch_available or not torch.cuda.is_available():
+		return 1  # No batching for CPU
+
+	try:
+		device = torch.cuda.current_device()
+		props = torch.cuda.get_device_properties(device)
+		vram_gb = props.total_memory / (1024 ** 3)
+		compute_capability = props.major + (props.minor / 10)
+
+		# Base batch size on VRAM (conservative for face swapping)
+		if vram_gb >= 24:
+			base_batch = 64
+		elif vram_gb >= 16:
+			base_batch = 48
+		elif vram_gb >= 12:
+			base_batch = 32
+		elif vram_gb >= 8:
+			base_batch = 24
+		else:
+			base_batch = 16
+
+		# Adjust for compute capability
+		if compute_capability >= 8.0:  # Ampere or newer
+			batch_multiplier = 1.2
+		elif compute_capability >= 7.5:  # Turing
+			batch_multiplier = 1.1
+		else:
+			batch_multiplier = 1.0
+
+		optimal_batch = int(base_batch * batch_multiplier)
+		return max(1, optimal_batch)
+
+	except Exception:
+		return 1  # Safe fallback
+
+
 def get_model_options() -> ModelOptions:
 	model_name = get_model_name()
 	return create_static_model_set('full').get(model_name)
@@ -566,6 +687,11 @@ def post_process() -> None:
 	read_static_image.cache_clear()
 	read_static_video_frame.cache_clear()
 	video_manager.clear_video_pool()
+	reset_temporal_smoother()  # Reset temporal smoother after processing
+
+	# Aggressive CUDA memory cleanup after processing
+	cleanup_cuda_memory(aggressive=True)
+
 	if state_manager.get_item('video_memory_strategy') in [ 'strict', 'moderate' ]:
 		get_static_model_initializer.cache_clear()
 		clear_inference_pool()
@@ -577,13 +703,29 @@ def post_process() -> None:
 		face_masker.clear_inference_pool()
 		face_recognizer.clear_inference_pool()
 
+	# Final CUDA cleanup
+	cleanup_cuda_memory(aggressive=True)
+
 
 def swap_face(source_face : Face, target_face : Face, temp_vision_frame : VisionFrame) -> VisionFrame:
 	model_template = get_model_options().get('template')
 	model_size = get_model_options().get('size')
 	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
 	pixel_boost_total = pixel_boost_size[0] // model_size[0]
-	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size)
+
+	# Apply temporal smoothing to target face landmarks to reduce jitter
+	temporal_smoother = get_temporal_smoother()
+	target_landmarks_5 = target_face.landmark_set.get('5/68')
+
+	# Check for scene cuts and reset if needed
+	if temporal_smoother.should_reset(target_landmarks_5):
+		temporal_smoother.reset()
+
+	# Smooth the landmarks
+	smoothed_landmarks_5 = temporal_smoother.smooth_landmarks(target_landmarks_5)
+
+	# Use smoothed landmarks for warping
+	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, smoothed_landmarks_5, model_template, pixel_boost_size)
 	temp_vision_frames = []
 	crop_masks = []
 
@@ -604,6 +746,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 	crop_vision_frame = explode_pixel_boost(temp_vision_frames, pixel_boost_total, model_size, pixel_boost_size)
 
 	if 'area' in state_manager.get_item('face_mask_types'):
+		# Use original target landmarks for area mask (not smoothed)
 		face_landmark_68 = cv2.transform(target_face.landmark_set.get('68').reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
 		area_mask = create_area_mask(crop_vision_frame, face_landmark_68, state_manager.get_item('face_mask_areas'))
 		crop_masks.append(area_mask)
@@ -613,7 +756,67 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 		crop_masks.append(region_mask)
 
 	crop_mask = numpy.minimum.reduce(crop_masks).clip(0, 1)
+
+	# Standard paste_back for base result
 	paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix)
+
+	# Apply enhanced blending for improved quality and color consistency
+	# This addresses color warping and boundary artifacts
+	enhanced_blender = get_enhanced_blender()
+
+	# Create a blended mask from crop_mask for enhanced blending
+	# We need to warp the crop_mask back to original frame coordinates
+	mask_h, mask_w = crop_mask.shape[:2]
+	if len(crop_mask.shape) == 2:
+		mask_3ch = numpy.stack([crop_mask] * 3, axis=-1)
+	else:
+		mask_3ch = crop_mask
+
+	# For enhanced blending, we'll apply color correction to the entire pasted result
+	# This helps match colors between the swapped face and surrounding areas
+	try:
+		# Get face center for blending
+		if target_face.bounding_box is not None:
+			bbox = target_face.bounding_box
+			center_x = int((bbox[0] + bbox[2]) / 2)
+			center_y = int((bbox[1] + bbox[3]) / 2)
+			center = (center_x, center_y)
+
+			# Extract face region for enhanced blending
+			x1, y1, x2, y2 = map(int, bbox)
+			# Expand bbox slightly for better blending
+			margin = 20
+			x1 = max(0, x1 - margin)
+			y1 = max(0, y1 - margin)
+			x2 = min(temp_vision_frame.shape[1], x2 + margin)
+			y2 = min(temp_vision_frame.shape[0], y2 + margin)
+
+			# Extract regions
+			swapped_region = paste_vision_frame[y1:y2, x1:x2]
+			original_region = temp_vision_frame[y1:y2, x1:x2]
+
+			# Create mask for this region
+			region_h = y2 - y1
+			region_w = x2 - x1
+			region_mask = numpy.ones((region_h, region_w, 3), dtype=numpy.float32) * 0.8
+
+			# Apply enhanced blending to the region
+			blended_region = enhanced_blender._color_correction(
+				swapped_region,
+				original_region,
+				region_mask
+			)
+
+			# Blend the corrected region back
+			alpha = 0.7  # Blend factor
+			paste_vision_frame[y1:y2, x1:x2] = (
+				blended_region * alpha + paste_vision_frame[y1:y2, x1:x2] * (1 - alpha)
+			).astype(numpy.uint8)
+
+	except Exception:
+		# If enhanced blending fails, use standard result
+		pass
+
 	return paste_vision_frame
 
 
@@ -758,6 +961,8 @@ def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Fa
 
 
 def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
+	global _frame_count
+
 	reference_vision_frame = inputs.get('reference_vision_frame')
 	source_vision_frames = inputs.get('source_vision_frames')
 	target_vision_frame = inputs.get('target_vision_frame')
@@ -770,5 +975,17 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 		for target_face in target_faces:
 			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
 			temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
+
+	# Increment frame counter
+	_frame_count += 1
+
+	# Periodic CUDA memory cleanup to prevent OOM
+	# Clean up every N frames to maintain stable memory usage
+	if _frame_count % _batch_cleanup_interval == 0:
+		cleanup_cuda_memory(aggressive=False)
+
+	# Aggressive cleanup every 50 frames
+	if _frame_count % 50 == 0:
+		cleanup_cuda_memory(aggressive=True)
 
 	return temp_vision_frame, temp_vision_mask
