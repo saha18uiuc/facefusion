@@ -32,8 +32,8 @@ from facefusion.vision import read_static_image, read_static_images, read_static
 # CUDA Optimization Imports (Quality)
 import torch
 import gc
-from facefusion.processors.modules.temporal_smoother import TemporalSmoother
-from facefusion.processors.modules.enhanced_blending import EnhancedBlender
+from facefusion.processors.utils.temporal_smoother import TemporalSmoother
+from facefusion.processors.utils.enhanced_blending import EnhancedBlender
 
 # CUDA Optimization Imports (Performance - Batch Processing)
 try:
