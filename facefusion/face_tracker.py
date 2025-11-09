@@ -10,7 +10,7 @@ import numpy
 import math
 
 from facefusion import state_manager
-from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle, reset_affine_smoothers
+from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle
 
 try:
     from facefusion.gpu.compositor import reset_all_temporal_states  # type: ignore
@@ -98,7 +98,7 @@ class FaceTracker:
             self._filters.clear()
             self._face_to_track.clear()
             self._track_to_face_id.clear()
-            reset_affine_smoothers()
+            # reset_affine_smoothers()  # TODO: Implement affine smoothing in face_helper.py
             if reset_all_temporal_states:
                 reset_all_temporal_states()
 
