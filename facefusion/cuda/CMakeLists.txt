@@ -30,14 +30,28 @@ set_target_properties(ff_cuda_kernels PROPERTIES
     CUDA_ARCHITECTURES "75;80;86;89"
 )
 
-# CUDA compile options for deterministic operations
+# CUDA compile options for deterministic operations + performance
 target_compile_options(ff_cuda_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         --fmad=false          # Disable FMA contraction for determinism
         -Xptxas -O3           # Optimize PTX
         --use_fast_math       # Fast math for non-critical paths
         --expt-relaxed-constexpr
+        -maxrregcount=64      # Increase occupancy by limiting register usage
+        --extra-device-vectorization  # Enable device vectorization
     >
+    $<$<COMPILE_LANGUAGE:CXX>:
+        -O3                   # Maximum C++ optimization
+        -march=native         # Target native CPU architecture
+        -ffast-math           # Fast math for host code
+        -funroll-loops        # Unroll loops
+        -finline-functions    # Aggressive inlining
+    >
+)
+
+# Enable interprocedural optimization (LTO) for release builds
+set_target_properties(ff_cuda_kernels PROPERTIES
+    INTERPROCEDURAL_OPTIMIZATION TRUE
 )
 
 # Include directories
@@ -62,9 +76,21 @@ target_link_libraries(ff_cuda_ops PRIVATE
     CUDA::cudart
 )
 
-# Set output directory
+# Optimize Python bindings with C++17, LTO, and aggressive optimization
+target_compile_options(ff_cuda_ops PRIVATE
+    -O3
+    -march=native
+    -ffast-math
+    -funroll-loops
+    -finline-functions
+)
+
+# Set output directory and enable LTO
 set_target_properties(ff_cuda_ops PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    INTERPROCEDURAL_OPTIMIZATION TRUE
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
 )
 
 # Install targets
