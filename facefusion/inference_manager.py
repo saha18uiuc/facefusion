@@ -83,7 +83,7 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		return inference_session
 
 	except Exception as exception:
-		logger.warning(f"Optimized session load failed for {model_file_name}: {exception}. Falling back to default settings.", __name__)
+		logger.info(f"Optimized session load failed for {model_file_name}: {exception}. Falling back to default settings.", __name__)
 		try:
 			fallback_providers = create_inference_session_providers(execution_device_id, execution_providers)
 			inference_session = InferenceSession(model_path, providers = fallback_providers)
