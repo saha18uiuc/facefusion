@@ -22,6 +22,14 @@ template<int BLOCK_SIZE>
 __global__ void mask_edge_hysteresis_1d(
     const unsigned char*, const unsigned char*, unsigned char*, int, int, int, int, int);
 
+template<int TILE_W, int TILE_H>
+__global__ void warp_composite_rgb_mask_u8(
+    const uchar3*, int, int, int,
+    const float*, int,
+    const uchar3*, uchar3*,
+    int, int, int,
+    const float*, int, int);
+
 // Launchers
 extern "C" {
 
@@ -35,6 +43,23 @@ void launch_warp_bilinear_rgb_u8(
         src, srcW, srcH, srcStride,
         dst, dstW, dstH, dstStride,
         M, roiX, roiY
+    );
+}
+
+void launch_warp_composite_rgb_mask_u8(
+    const uchar3* src, int srcW, int srcH, int srcStride,
+    const float* mask, int maskStride,
+    const uchar3* bg, uchar3* out,
+    int dstW, int dstH, int dstStride,
+    const float* M, int bandLo, int bandHi,
+    dim3 grid, dim3 block
+) {
+    warp_composite_rgb_mask_u8<16, 16><<<grid, block>>>(
+        src, srcW, srcH, srcStride,
+        mask, maskStride,
+        bg, out,
+        dstW, dstH, dstStride,
+        M, bandLo, bandHi
     );
 }
 

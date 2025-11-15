@@ -99,18 +99,8 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
 
 
 def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_vision_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
-	paste_bounding_box, paste_matrix = calculate_paste_area(temp_vision_frame, crop_vision_frame, affine_matrix)
-	x1, y1, x2, y2 = paste_bounding_box
-	paste_width = x2 - x1
-	paste_height = y2 - y1
-	inverse_vision_mask = cv2.warpAffine(crop_vision_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1)
-	inverse_vision_mask = numpy.expand_dims(inverse_vision_mask, axis = -1)
-	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
-	temp_vision_frame = temp_vision_frame.copy()
-	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-	paste_vision_frame = paste_vision_frame * (1 - inverse_vision_mask) + inverse_vision_frame * inverse_vision_mask
-	temp_vision_frame[y1:y2, x1:x2] = paste_vision_frame.astype(temp_vision_frame.dtype)
-	return temp_vision_frame
+	from facefusion.vision_enhanced import paste_back_enhanced
+	return paste_back_enhanced(temp_vision_frame, crop_vision_frame, crop_vision_mask, affine_matrix)
 
 
 def calculate_paste_area(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, affine_matrix : Matrix) -> Tuple[BoundingBox, Matrix]:

@@ -20,6 +20,7 @@ add_library(ff_cuda_kernels STATIC
     composite.cu
     color_linear.cu
     mask_hysteresis.cu
+    warp_composite.cu
     kernel_launchers.cu
 )
 

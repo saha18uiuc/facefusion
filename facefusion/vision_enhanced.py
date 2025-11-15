@@ -5,7 +5,7 @@ Provides drop-in replacements for critical operations with improved performance 
 
 import cv2
 import numpy as np
-from typing import Tuple, Optional
+from typing import Dict, Tuple, Optional
 from facefusion.types import VisionFrame, Mask, Matrix
 
 # Try to import CUDA operations
@@ -106,40 +106,39 @@ def paste_back_enhanced(
     paste_width = x2 - x1
     paste_height = y2 - y1
 
-    # Warp mask and frame
-    inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height))
-    inverse_mask = inverse_mask.clip(0, 1)
-
-    # Convert mask to uint8 [0, 255]
-    if inverse_mask.dtype == np.float32 or inverse_mask.dtype == np.float64:
-        alpha_uint8 = (inverse_mask * 255).astype(np.uint8)
-    else:
-        alpha_uint8 = inverse_mask
-
-    inverse_frame = cv2.warpAffine(
-        crop_vision_frame, paste_matrix, (paste_width, paste_height),
-        borderMode=cv2.BORDER_REPLICATE
-    )
-
-    # Get paste region
     temp_vision_frame = temp_vision_frame.copy()
     paste_region = temp_vision_frame[y1:y2, x1:x2]
 
-    if use_cuda and CUDA_AVAILABLE and len(paste_region.shape) == 3 and paste_region.shape[2] == 3:
+    if use_cuda and CUDA_AVAILABLE and paste_width > 0 and paste_height > 0 and paste_region.shape[-1] == 3:
         try:
-            # Prepare output
-            result = np.zeros_like(paste_region)
+            mask_2d = crop_mask if crop_mask.ndim == 2 else crop_mask[..., 0]
+            mask_2d = np.ascontiguousarray(mask_2d, dtype=np.float32)
+            crop_frame = np.ascontiguousarray(crop_vision_frame, dtype=np.uint8)
+            bg_roi = np.ascontiguousarray(paste_region)
+            result = _get_cached_buffer(bg_roi.shape, bg_roi.dtype)
+            paste_flat = np.array([
+                paste_matrix[0, 0], paste_matrix[0, 1], paste_matrix[0, 2],
+                paste_matrix[1, 0], paste_matrix[1, 1], paste_matrix[1, 2]
+            ], dtype=np.float32)
 
-            # Call CUDA composite
-            ff_cuda_ops.composite_rgb(
-                inverse_frame, paste_region, alpha_uint8, result,
+            ff_cuda_ops.warp_composite_rgb(
+                crop_frame, mask_2d, bg_roi, result, paste_flat,
                 seam_band[0], seam_band[1]
             )
 
             temp_vision_frame[y1:y2, x1:x2] = result
             return temp_vision_frame
         except Exception as e:
-            print(f"CUDA composite failed, falling back to OpenCV: {e}")
+            print(f"CUDA fused paste failed, falling back to OpenCV: {e}")
+
+    # Warp mask and frame on CPU fallback
+    inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height))
+    inverse_mask = inverse_mask.clip(0, 1)
+
+    inverse_frame = cv2.warpAffine(
+        crop_vision_frame, paste_matrix, (paste_width, paste_height),
+        borderMode=cv2.BORDER_REPLICATE
+    )
 
     # Fallback: OpenCV blending
     inverse_mask_3d = np.expand_dims(inverse_mask, axis=-1)
@@ -266,6 +265,17 @@ _fhr_model = None
 _pose_filters = {}
 _eos_guards = {}
 _previous_masks = {}
+_paste_buffer_cache: Dict[Tuple[Tuple[int, ...], str], np.ndarray] = {}
+
+
+def _get_cached_buffer(shape: Tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    """Reuse scratch buffers to avoid reallocating per frame."""
+    key = (tuple(shape), np.dtype(dtype).str)
+    buf = _paste_buffer_cache.get(key)
+    if buf is None or buf.shape != tuple(shape) or buf.dtype != np.dtype(dtype):
+        buf = np.empty(shape, dtype=dtype)
+        _paste_buffer_cache[key] = buf
+    return buf
 
 
 def get_fhr_model() -> Optional['TinyFHR']:
@@ -302,11 +312,12 @@ def get_eos_guard(track_id: int) -> Optional[EOSStabilityGuard]:
 
 def reset_stability_state():
     """Reset all stability state (call at start of new video)."""
-    global _fhr_model, _pose_filters, _eos_guards, _previous_masks
+    global _fhr_model, _pose_filters, _eos_guards, _previous_masks, _paste_buffer_cache
     _fhr_model = None
     _pose_filters.clear()
     _eos_guards.clear()
     _previous_masks.clear()
+    _paste_buffer_cache.clear()
 
 
 # Configuration

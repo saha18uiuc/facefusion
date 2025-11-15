@@ -413,6 +413,147 @@ void warp_bilinear_rgb(
 }
 
 /**
+ * Fused warp + composite wrapper.
+ * Performs source warp, mask warp, and compositing in a single kernel launch.
+ */
+void warp_composite_rgb(
+    py::array_t<uint8_t> src,
+    py::array_t<float> mask,
+    py::array_t<uint8_t> bg,
+    py::array_t<uint8_t> out,
+    py::array_t<float> affine_matrix,
+    int band_lo = 0,
+    int band_hi = 0
+) {
+    auto src_buf = src.request();
+    auto mask_buf = mask.request();
+    auto bg_buf = bg.request();
+    auto out_buf = out.request();
+    auto M_buf = affine_matrix.request();
+
+    if (src_buf.ndim != 3 || src_buf.shape[2] != 3) {
+        throw std::runtime_error("Source frame must be HxWx3");
+    }
+    if (mask_buf.ndim != 2) {
+        throw std::runtime_error("Mask must be 2D float32 array");
+    }
+    if (bg_buf.ndim != 3 || out_buf.ndim != 3 || bg_buf.shape[2] != 3 || out_buf.shape[2] != 3) {
+        throw std::runtime_error("Background/output must be HxWx3");
+    }
+    if (M_buf.ndim != 1 || M_buf.shape[0] != 6) {
+        throw std::runtime_error("Affine matrix must flatten to 6 elements");
+    }
+
+    int src_h = src_buf.shape[0];
+    int src_w = src_buf.shape[1];
+    int dst_h = bg_buf.shape[0];
+    int dst_w = bg_buf.shape[1];
+    int mask_w = mask_buf.shape[1];
+
+    if (mask_buf.shape[0] != src_h || mask_buf.shape[1] != src_w) {
+        throw std::runtime_error("Mask dimensions must match source");
+    }
+    if (out_buf.shape[0] != dst_h || out_buf.shape[1] != dst_w || out_buf.shape[2] != 3) {
+        throw std::runtime_error("Output dimensions must match background");
+    }
+
+    size_t src_size = static_cast<size_t>(src_h) * src_w * sizeof(uchar3);
+    size_t mask_size = static_cast<size_t>(src_h) * src_w * sizeof(float);
+    size_t dst_size = static_cast<size_t>(dst_h) * dst_w * sizeof(uchar3);
+    size_t matrix_size = 6 * sizeof(float);
+
+    cudaStream_t stream = StreamManager::instance().get_composite_stream();
+
+    if (stream && g_perf_config.use_streams) {
+        CHECK_CUDA(cudaStreamWaitEvent(stream, StreamManager::instance().get_infer_done_event(), 0));
+    }
+
+    PooledDeviceMemory<uchar3> d_src(src_size, stream);
+    PooledDeviceMemory<float> d_mask(mask_size, stream);
+    PooledDeviceMemory<uchar3> d_bg(dst_size, stream);
+    PooledDeviceMemory<uchar3> d_out(dst_size, stream);
+    PooledDeviceMemory<float> d_M(matrix_size, stream);
+
+    auto copy_inputs = [&](bool async_mode) {
+        if (async_mode) {
+            void* pinned_src = d_src.get_pinned();
+            void* pinned_mask = d_mask.get_pinned();
+            void* pinned_bg = d_bg.get_pinned();
+            void* pinned_M = d_M.get_pinned();
+
+            if (pinned_src && pinned_mask && pinned_bg && pinned_M) {
+                memcpy(pinned_src, src_buf.ptr, src_size);
+                memcpy(pinned_mask, mask_buf.ptr, mask_size);
+                memcpy(pinned_bg, bg_buf.ptr, dst_size);
+                memcpy(pinned_M, M_buf.ptr, matrix_size);
+                CHECK_CUDA(cudaMemcpyAsync(d_src.get(), pinned_src, src_size, cudaMemcpyHostToDevice, stream));
+                CHECK_CUDA(cudaMemcpyAsync(d_mask.get(), pinned_mask, mask_size, cudaMemcpyHostToDevice, stream));
+                CHECK_CUDA(cudaMemcpyAsync(d_bg.get(), pinned_bg, dst_size, cudaMemcpyHostToDevice, stream));
+                CHECK_CUDA(cudaMemcpyAsync(d_M.get(), pinned_M, matrix_size, cudaMemcpyHostToDevice, stream));
+                return true;
+            }
+        }
+        CHECK_CUDA(cudaMemcpy(d_src.get(), src_buf.ptr, src_size, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_mask.get(), mask_buf.ptr, mask_size, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_bg.get(), bg_buf.ptr, dst_size, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_M.get(), M_buf.ptr, matrix_size, cudaMemcpyHostToDevice));
+        return false;
+    };
+
+    bool used_async = false;
+    if (g_perf_config.use_async_copies && g_perf_config.use_pinned_memory && stream) {
+        used_async = copy_inputs(true);
+    }
+    if (!used_async) {
+        copy_inputs(false);
+    }
+
+    dim3 block(16, 16);
+    dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
+
+    extern void launch_warp_composite_rgb_mask_u8(
+        const uchar3* src, int srcW, int srcH, int srcStride,
+        const float* mask, int maskStride,
+        const uchar3* bg, uchar3* out,
+        int dstW, int dstH, int dstStride,
+        const float* M, int bandLo, int bandHi,
+        dim3 grid, dim3 block
+    );
+
+    launch_warp_composite_rgb_mask_u8(
+        d_src.get(), src_w, src_h, src_w,
+        d_mask.get(), mask_w,
+        d_bg.get(), d_out.get(),
+        dst_w, dst_h, dst_w,
+        d_M.get(), band_lo, band_hi,
+        grid, block
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+
+    auto copy_output = [&](bool async_mode) {
+        if (async_mode) {
+            void* pinned_out = d_out.get_pinned();
+            if (pinned_out) {
+                CHECK_CUDA(cudaMemcpyAsync(pinned_out, d_out.get(), dst_size, cudaMemcpyDeviceToHost, stream));
+                CHECK_CUDA(cudaStreamSynchronize(stream));
+                memcpy(out_buf.ptr, pinned_out, dst_size);
+                return true;
+            }
+        }
+        if (stream) {
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+        }
+        CHECK_CUDA(cudaMemcpy(out_buf.ptr, d_out.get(), dst_size, cudaMemcpyDeviceToHost));
+        return false;
+    };
+
+    if (!(g_perf_config.use_async_copies && g_perf_config.use_pinned_memory && stream && copy_output(true))) {
+        copy_output(false);
+    }
+}
+
+/**
  * Composite RGB with alpha wrapper - OPTIMIZED with pooled memory, async copies, and streams.
  */
 void composite_rgb(
@@ -683,11 +824,17 @@ void warmup_cuda_kernels() {
 
     // Allocate minimal device buffers for warm-up
     uchar3* d_rgb;
+    uchar3* d_bg;
+    uchar3* d_out;
     unsigned char* d_mask;
+    float* d_mask_f;
     float* d_affine;
 
     CHECK_CUDA(cudaMalloc(&d_rgb, warmup_h * warmup_w * sizeof(uchar3)));
+    CHECK_CUDA(cudaMalloc(&d_bg, warmup_h * warmup_w * sizeof(uchar3)));
+    CHECK_CUDA(cudaMalloc(&d_out, warmup_h * warmup_w * sizeof(uchar3)));
     CHECK_CUDA(cudaMalloc(&d_mask, warmup_h * warmup_w * sizeof(unsigned char)));
+    CHECK_CUDA(cudaMalloc(&d_mask_f, warmup_h * warmup_w * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_affine, 6 * sizeof(float)));
 
     // Warmup warp kernel
@@ -711,6 +858,23 @@ void warmup_cuda_kernels() {
     );
     launch_composite_rgb_u8(d_rgb, d_rgb, d_mask, d_rgb, warmup_w, warmup_h, warmup_w, 0, 0, grid_4x4, block_16x16);
 
+    extern void launch_warp_composite_rgb_mask_u8(
+        const uchar3* src, int srcW, int srcH, int srcStride,
+        const float* mask, int maskStride,
+        const uchar3* bg, uchar3* out,
+        int dstW, int dstH, int dstStride,
+        const float* M, int bandLo, int bandHi,
+        dim3 grid, dim3 block
+    );
+    launch_warp_composite_rgb_mask_u8(
+        d_rgb, warmup_w, warmup_h, warmup_w,
+        d_mask_f, warmup_w,
+        d_bg, d_out,
+        warmup_w, warmup_h, warmup_w,
+        d_affine, 0, 0,
+        grid_4x4, block_16x16
+    );
+
     // Warmup color gain kernel
     extern void launch_apply_color_gain_linear_rgb(
         const uchar3* in, uchar3* out, int W, int H, int stride,
@@ -733,7 +897,10 @@ void warmup_cuda_kernels() {
 
     // Cleanup
     CHECK_CUDA(cudaFree(d_rgb));
+    CHECK_CUDA(cudaFree(d_bg));
+    CHECK_CUDA(cudaFree(d_out));
     CHECK_CUDA(cudaFree(d_mask));
+    CHECK_CUDA(cudaFree(d_mask_f));
     CHECK_CUDA(cudaFree(d_affine));
 }
 
@@ -808,6 +975,11 @@ PYBIND11_MODULE(ff_cuda_ops, m) {
           "Deterministic bilinear warp for RGB images (OPTIMIZED with pooled memory & async copies)",
           py::arg("src"), py::arg("dst"), py::arg("affine_matrix"),
           py::arg("roi_x") = 0, py::arg("roi_y") = 0);
+
+    m.def("warp_composite_rgb", &warp_composite_rgb,
+          "Fused warp + composite (eliminates extra cv2.warp + host copies)",
+          py::arg("src"), py::arg("mask"), py::arg("bg"), py::arg("out"),
+          py::arg("affine_matrix"), py::arg("band_lo") = 0, py::arg("band_hi") = 0);
 
     m.def("composite_rgb", &composite_rgb,
           "Alpha composite with seam-band feathering (OPTIMIZED with pooled memory & async copies)",
