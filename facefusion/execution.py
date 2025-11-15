@@ -7,6 +7,8 @@ from typing import List, Optional
 from onnxruntime import get_available_providers, set_default_logger_severity
 
 import facefusion.choices
+from pathlib import Path
+
 from facefusion.types import ExecutionDevice, ExecutionProvider, InferenceSessionProvider, ValueAndUnit
 
 set_default_logger_severity(3)
@@ -28,7 +30,13 @@ def get_available_execution_providers() -> List[ExecutionProvider]:
 	return available_execution_providers
 
 
-def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider]) -> List[InferenceSessionProvider]:
+def _ensure_cache_dir(*segments: str) -> str:
+	cache_path = Path('.caches').joinpath(*segments)
+	cache_path.mkdir(parents = True, exist_ok = True)
+	return str(cache_path)
+
+
+def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider], model_identifier : Optional[str] = None) -> List[InferenceSessionProvider]:
 	inference_session_providers : List[InferenceSessionProvider] = []
 
 	for execution_provider in execution_providers:
@@ -39,13 +47,14 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search()
 			}))
 		if execution_provider == 'tensorrt':
+			cache_dir = _ensure_cache_dir('tensorrt', model_identifier or 'shared', execution_device_id)
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
 				'device_id': execution_device_id,
 				'trt_engine_cache_enable': True,
-				'trt_engine_cache_path': '.caches',
+				'trt_engine_cache_path': cache_dir,
 				'trt_timing_cache_enable': True,
-				'trt_timing_cache_path': '.caches',
+				'trt_timing_cache_path': cache_dir,
 				'trt_builder_optimization_level': 5
 			}))
 		if execution_provider in [ 'directml', 'rocm' ]:
@@ -54,10 +63,11 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'device_id': execution_device_id
 			}))
 		if execution_provider == 'migraphx':
+			cache_dir = _ensure_cache_dir('migraphx', model_identifier or 'shared', execution_device_id)
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
 				'device_id': execution_device_id,
-				'migraphx_model_cache_dir': '.caches'
+				'migraphx_model_cache_dir': cache_dir
 			}))
 		if execution_provider == 'openvino':
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),

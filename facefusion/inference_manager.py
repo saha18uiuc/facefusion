@@ -1,9 +1,11 @@
 import importlib
 import random
+from pathlib import Path
 from time import sleep, time
 from typing import List
 
-from onnxruntime import InferenceSession
+import numpy as np
+from onnxruntime import GraphOptimizationLevel, InferenceSession, SessionOptions
 
 from facefusion import logger, process_manager, state_manager, translator
 from facefusion.app_context import detect_app_context
@@ -72,14 +74,66 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 	start_time = time()
 
 	try:
-		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers)
-		inference_session = InferenceSession(model_path, providers = inference_session_providers)
+		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers, model_file_name)
+		session_options = _create_session_options(model_file_name, execution_device_id)
+		inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
+		if 'tensorrt' in execution_providers:
+			_warmup_inference_session(inference_session)
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 		return inference_session
 
 	except Exception:
 		logger.error(translator.get('loading_model_failed').format(model_name = model_file_name), __name__)
 		fatal_exit(1)
+
+
+def _create_session_options(model_file_name : str, execution_device_id : str) -> SessionOptions:
+	options = SessionOptions()
+	options.enable_mem_pattern = True
+	options.enable_cpu_mem_arena = True
+	options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+	cache_dir = Path('.caches') / 'ort' / execution_device_id
+	cache_dir.mkdir(parents = True, exist_ok = True)
+	options.optimized_model_filepath = str(cache_dir / f"{model_file_name}.optimized.onnx")
+	return options
+
+
+def _warmup_inference_session(inference_session : InferenceSession) -> None:
+	try:
+		inputs = inference_session.get_inputs()
+	except Exception:
+		return
+	feeds = {}
+	accumulated = 0
+	dtype_map = {
+		'tensor(float)': np.float32,
+		'tensor(float16)': np.float16,
+		'tensor(int64)': np.int64,
+		'tensor(int32)': np.int32,
+		'tensor(uint8)': np.uint8,
+		'tensor(int8)': np.int8
+	}
+	for node in inputs:
+		shape = []
+		for dim in node.shape:
+			if isinstance(dim, str) or dim is None or (isinstance(dim, int) and dim <= 0):
+				shape.append(1)
+			else:
+				shape.append(int(dim))
+		if not shape:
+			continue
+		elems = int(np.prod(shape))
+		accumulated += elems
+		if accumulated > 1_000_000:
+			feeds = {}
+			break
+		dtype = dtype_map.get(node.type, np.float32)
+		feeds[node.name] = np.zeros(shape, dtype = dtype)
+	if feeds:
+		try:
+			inference_session.run([], feeds)
+		except Exception:
+			pass
 
 
 def get_inference_context(module_name : str, model_names : List[str], execution_device_id : str, execution_providers : List[ExecutionProvider]) -> str:

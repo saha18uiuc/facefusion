@@ -813,6 +813,66 @@ void mask_edge_hysteresis(
     // Memory automatically returned to pool by RAII destructors (no cudaFree overhead)
 }
 
+void mask_edge_hysteresis_roi_bind(
+    py::array_t<uint8_t> alpha,
+    py::array_t<uint8_t> alpha_prev,
+    py::array_t<uint8_t> alpha_out,
+    py::array_t<int32_t> indices,
+    int threshold_in = 4,
+    int threshold_out = 6
+) {
+    auto alpha_buf = alpha.request();
+    auto prev_buf = alpha_prev.request();
+    auto out_buf = alpha_out.request();
+    auto indices_buf = indices.request();
+
+    if (alpha_buf.ndim != 2 || prev_buf.ndim != 2 || out_buf.ndim != 2) {
+        throw std::runtime_error("Expected 2D arrays (masks)");
+    }
+    if (indices_buf.ndim != 1) {
+        throw std::runtime_error("Indices array must be 1D");
+    }
+
+    size_t size = alpha_buf.shape[0] * alpha_buf.shape[1] * sizeof(unsigned char);
+    int num_indices = static_cast<int>(indices_buf.shape[0]);
+
+    if (num_indices == 0) {
+        memcpy(out_buf.ptr, alpha_buf.ptr, size);
+        return;
+    }
+
+    cudaStream_t stream = StreamManager::instance().get_composite_stream();
+
+    PooledDeviceMemory<unsigned char> d_alpha(size, stream);
+    PooledDeviceMemory<unsigned char> d_prev(size, stream);
+    PooledDeviceMemory<unsigned char> d_out(size, stream);
+    PooledDeviceMemory<int> d_indices(num_indices * sizeof(int), stream);
+
+    CHECK_CUDA(cudaMemcpy(d_alpha.get(), alpha_buf.ptr, size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_prev.get(), prev_buf.ptr, size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_out.get(), out_buf.ptr, size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_indices.get(), indices_buf.ptr, num_indices * sizeof(int), cudaMemcpyHostToDevice));
+
+    int block_size = 256;
+    int grid_size = (num_indices + block_size - 1) / block_size;
+
+    extern void launch_mask_edge_hysteresis_roi(
+        const unsigned char* alpha, const unsigned char* prev, unsigned char* out,
+        const int* indices, int numIndices, int Tin, int Tout, int grid_size, int block_size
+    );
+
+    launch_mask_edge_hysteresis_roi(
+        d_alpha.get(), d_prev.get(), d_out.get(),
+        d_indices.get(), num_indices,
+        threshold_in, threshold_out,
+        grid_size, block_size
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+
+    CHECK_CUDA(cudaMemcpy(out_buf.ptr, d_out.get(), size, cudaMemcpyDeviceToHost));
+}
+
 /**
  * Kernel warm-up: pre-run all kernels with small inputs to trigger JIT compilation.
  * This eliminates first-call overhead (can save 100-500ms on first frame).
@@ -892,10 +952,20 @@ void warmup_cuda_kernels() {
     );
     launch_mask_edge_hysteresis_1d(d_mask, d_mask, d_mask, warmup_w, warmup_h, warmup_w, 4, 6, grid_size, block_size);
 
+    extern void launch_mask_edge_hysteresis_roi(
+        const unsigned char* alpha, const unsigned char* prev, unsigned char* out,
+        const int* indices, int numIndices, int Tin, int Tout, int grid_size, int block_size
+    );
+    int roi_indices = 64;
+    int* d_indices_ptr;
+    CHECK_CUDA(cudaMalloc(&d_indices_ptr, roi_indices * sizeof(int)));
+    launch_mask_edge_hysteresis_roi(d_mask, d_mask, d_mask, d_indices_ptr, roi_indices, 4, 6, (roi_indices + block_size - 1) / block_size, block_size);
+
     // Synchronize to ensure all kernels complete
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Cleanup
+    CHECK_CUDA(cudaFree(d_indices_ptr));
     CHECK_CUDA(cudaFree(d_rgb));
     CHECK_CUDA(cudaFree(d_bg));
     CHECK_CUDA(cudaFree(d_out));
@@ -994,6 +1064,11 @@ PYBIND11_MODULE(ff_cuda_ops, m) {
     m.def("mask_edge_hysteresis", &mask_edge_hysteresis,
           "Apply hysteresis to mask edges to prevent flicker (OPTIMIZED with pooled memory & async copies)",
           py::arg("alpha"), py::arg("alpha_prev"), py::arg("alpha_out"),
+          py::arg("threshold_in") = 4, py::arg("threshold_out") = 6);
+
+    m.def("mask_edge_hysteresis_roi", &mask_edge_hysteresis_roi_bind,
+          "Apply hysteresis only to seam-ring indices",
+          py::arg("alpha"), py::arg("alpha_prev"), py::arg("alpha_out"), py::arg("indices"),
           py::arg("threshold_in") = 4, py::arg("threshold_out") = 6);
 
     // Performance configuration functions

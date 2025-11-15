@@ -22,6 +22,10 @@ template<int BLOCK_SIZE>
 __global__ void mask_edge_hysteresis_1d(
     const unsigned char*, const unsigned char*, unsigned char*, int, int, int, int, int);
 
+template<int BLOCK_SIZE>
+__global__ void mask_edge_hysteresis_roi(
+    const unsigned char*, const unsigned char*, unsigned char*, const int*, int, int, int);
+
 template<int TILE_W, int TILE_H>
 __global__ void warp_composite_rgb_mask_u8(
     const uchar3*, int, int, int,
@@ -88,6 +92,15 @@ void launch_mask_edge_hysteresis_1d(
 ) {
     mask_edge_hysteresis_1d<256><<<grid_size, block_size>>>(
         alpha, prev, out, W, H, stride, Tin, Tout
+    );
+}
+
+void launch_mask_edge_hysteresis_roi(
+    const unsigned char* alpha, const unsigned char* prev, unsigned char* out,
+    const int* indices, int num_indices, int Tin, int Tout, int grid_size, int block_size
+) {
+    mask_edge_hysteresis_roi<256><<<grid_size, block_size>>>(
+        alpha, prev, out, indices, num_indices, Tin, Tout
     );
 }
 

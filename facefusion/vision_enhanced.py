@@ -111,22 +111,33 @@ def paste_back_enhanced(
 
     if use_cuda and CUDA_AVAILABLE and paste_width > 0 and paste_height > 0 and paste_region.shape[-1] == 3:
         try:
-            mask_2d = crop_mask if crop_mask.ndim == 2 else crop_mask[..., 0]
-            mask_2d = np.ascontiguousarray(mask_2d, dtype=np.float32)
-            crop_frame = np.ascontiguousarray(crop_vision_frame, dtype=np.uint8)
-            bg_roi = np.ascontiguousarray(paste_region)
-            result = _get_cached_buffer(bg_roi.shape, bg_roi.dtype)
+            mask_2d, mask_copied = _ensure_contiguous(
+                crop_mask if crop_mask.ndim == 2 else crop_mask[..., 0],
+                'mask'
+            )
+            if mask_2d.dtype != np.float32:
+                mask_buf = _get_cached_buffer(mask_2d.shape, np.float32, 'mask-f32')
+                mask_buf[...] = mask_2d.astype(np.float32)
+                mask_2d = mask_buf
+            crop_frame, crop_copied = _ensure_contiguous(crop_vision_frame, 'crop')
+            if crop_frame.dtype != np.uint8:
+                crop_buf = _get_cached_buffer(crop_frame.shape, np.uint8, 'crop-u8')
+                crop_buf[...] = crop_frame.astype(np.uint8)
+                crop_frame = crop_buf
+            bg_roi, bg_copied = _ensure_contiguous(paste_region, 'bg')
+            out_roi = bg_roi if not bg_copied else _get_cached_buffer(bg_roi.shape, bg_roi.dtype, 'bg-out')
             paste_flat = np.array([
                 paste_matrix[0, 0], paste_matrix[0, 1], paste_matrix[0, 2],
                 paste_matrix[1, 0], paste_matrix[1, 1], paste_matrix[1, 2]
             ], dtype=np.float32)
 
             ff_cuda_ops.warp_composite_rgb(
-                crop_frame, mask_2d, bg_roi, result, paste_flat,
+                crop_frame, mask_2d, bg_roi, out_roi, paste_flat,
                 seam_band[0], seam_band[1]
             )
 
-            temp_vision_frame[y1:y2, x1:x2] = result
+            if bg_copied:
+                np.copyto(paste_region, out_roi)
             return temp_vision_frame
         except Exception as e:
             print(f"CUDA fused paste failed, falling back to OpenCV: {e}")
@@ -218,7 +229,8 @@ def apply_mask_hysteresis(
     alpha_previous: Mask,
     threshold_in: int = 4,
     threshold_out: int = 6,
-    use_cuda: bool = True
+    use_cuda: bool = True,
+    seam_band: Tuple[int, int] = (30, 225)
 ) -> Mask:
     """
     Apply hysteresis to mask to prevent single-frame flicker.
@@ -239,25 +251,41 @@ def apply_mask_hysteresis(
     if alpha_previous.dtype != np.uint8:
         alpha_previous = (alpha_previous * 255).astype(np.uint8)
 
+    alpha_current_c, copied_curr = _ensure_contiguous(alpha_current, 'mask-alpha-current')
+    alpha_previous_c, copied_prev = _ensure_contiguous(alpha_previous, 'mask-alpha-prev')
+    seam_mask = (alpha_current_c >= seam_band[0]) & (alpha_current_c <= seam_band[1])
+    seam_indices = np.flatnonzero(seam_mask.reshape(-1)).astype(np.int32)
+
+    if seam_indices.size == 0:
+        return alpha_current_c.copy()
+
     if use_cuda and CUDA_AVAILABLE:
         try:
-            output = np.zeros_like(alpha_current)
-            ff_cuda_ops.mask_edge_hysteresis(
-                alpha_current, alpha_previous, output,
-                threshold_in, threshold_out
+            output = alpha_current_c.copy()
+            ff_cuda_ops.mask_edge_hysteresis_roi(
+                alpha_current_c,
+                alpha_previous_c,
+                output,
+                seam_indices,
+                threshold_in,
+                threshold_out
             )
             return output
         except Exception as e:
             print(f"CUDA mask hysteresis failed, falling back to NumPy: {e}")
 
     # Fallback: NumPy implementation
-    delta = alpha_current.astype(np.int16) - alpha_previous.astype(np.int16)
+    output = alpha_current_c.copy()
+    flat_indices = seam_indices
+    curr_flat = alpha_current_c.reshape(-1).astype(np.int16)
+    prev_flat = alpha_previous_c.reshape(-1).astype(np.int16)
+    delta = curr_flat[flat_indices] - prev_flat[flat_indices]
     moved_in = delta < -threshold_in
     moved_out = delta > threshold_out
     stable = ~(moved_in | moved_out)
-
-    output = np.where(stable, alpha_previous, alpha_current)
-    return output.astype(np.uint8)
+    result_segment = np.where(stable, prev_flat[flat_indices], curr_flat[flat_indices]).astype(np.uint8)
+    output.reshape(-1)[flat_indices] = result_segment
+    return output
 
 
 # Global state for stability features
@@ -265,17 +293,26 @@ _fhr_model = None
 _pose_filters = {}
 _eos_guards = {}
 _previous_masks = {}
-_paste_buffer_cache: Dict[Tuple[Tuple[int, ...], str], np.ndarray] = {}
+_paste_buffer_cache: Dict[Tuple[Tuple[int, ...], str, str], np.ndarray] = {}
 
 
-def _get_cached_buffer(shape: Tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+def _get_cached_buffer(shape: Tuple[int, ...], dtype: np.dtype, tag: str) -> np.ndarray:
     """Reuse scratch buffers to avoid reallocating per frame."""
-    key = (tuple(shape), np.dtype(dtype).str)
+    key = (tuple(shape), np.dtype(dtype).str, tag)
     buf = _paste_buffer_cache.get(key)
     if buf is None or buf.shape != tuple(shape) or buf.dtype != np.dtype(dtype):
         buf = np.empty(shape, dtype=dtype)
         _paste_buffer_cache[key] = buf
     return buf
+
+
+def _ensure_contiguous(array: np.ndarray, tag: str) -> Tuple[np.ndarray, bool]:
+    """Return a C-contiguous view, copying into cached buffer only if needed."""
+    if array.flags.c_contiguous:
+        return array, False
+    buf = _get_cached_buffer(array.shape, array.dtype, tag)
+    np.copyto(buf, array)
+    return buf, True
 
 
 def get_fhr_model() -> Optional['TinyFHR']:
