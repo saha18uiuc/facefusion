@@ -31,7 +31,8 @@ def get_available_execution_providers() -> List[ExecutionProvider]:
 
 
 def _ensure_cache_dir(*segments: str) -> str:
-	cache_path = Path('.caches').joinpath(*segments)
+	path_segments = [ str(segment) for segment in segments ]
+	cache_path = Path('.caches').joinpath(*path_segments)
 	cache_path.mkdir(parents = True, exist_ok = True)
 	return str(cache_path)
 
