@@ -37,9 +37,13 @@ def _ensure_cache_dir(*segments: str) -> str:
 
 
 def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider], model_identifier : Optional[str] = None) -> List[InferenceSessionProvider]:
+	requested_execution_providers = list(execution_providers)
+	if 'cuda' in requested_execution_providers and 'tensorrt' not in requested_execution_providers and has_execution_provider('tensorrt'):
+		cuda_index = requested_execution_providers.index('cuda')
+		requested_execution_providers.insert(cuda_index, 'tensorrt')
 	inference_session_providers : List[InferenceSessionProvider] = []
 
-	for execution_provider in execution_providers:
+	for execution_provider in requested_execution_providers:
 		if execution_provider == 'cuda':
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
@@ -55,6 +59,7 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'trt_engine_cache_path': cache_dir,
 				'trt_timing_cache_enable': True,
 				'trt_timing_cache_path': cache_dir,
+				'trt_fp16_enable': False,
 				'trt_builder_optimization_level': 5
 			}))
 		if execution_provider in [ 'directml', 'rocm' ]:

@@ -99,7 +99,7 @@ def _create_session_options(model_file_name : str, execution_device_id : str) ->
 	options.enable_mem_pattern = True
 	options.enable_cpu_mem_arena = True
 	options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
-	cache_dir = Path('.caches') / 'ort' / execution_device_id
+	cache_dir = Path('.caches') / 'ort' / str(execution_device_id)
 	cache_dir.mkdir(parents = True, exist_ok = True)
 	options.optimized_model_filepath = str(cache_dir / f"{model_file_name}.optimized.onnx")
 	return options

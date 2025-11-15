@@ -229,8 +229,7 @@ def apply_mask_hysteresis(
     alpha_previous: Mask,
     threshold_in: int = 4,
     threshold_out: int = 6,
-    use_cuda: bool = True,
-    seam_band: Tuple[int, int] = (30, 225)
+    use_cuda: bool = True
 ) -> Mask:
     """
     Apply hysteresis to mask to prevent single-frame flicker.
@@ -251,22 +250,13 @@ def apply_mask_hysteresis(
     if alpha_previous.dtype != np.uint8:
         alpha_previous = (alpha_previous * 255).astype(np.uint8)
 
-    alpha_current_c, copied_curr = _ensure_contiguous(alpha_current, 'mask-alpha-current')
-    alpha_previous_c, copied_prev = _ensure_contiguous(alpha_previous, 'mask-alpha-prev')
-    seam_mask = (alpha_current_c >= seam_band[0]) & (alpha_current_c <= seam_band[1])
-    seam_indices = np.flatnonzero(seam_mask.reshape(-1)).astype(np.int32)
-
-    if seam_indices.size == 0:
-        return alpha_current_c.copy()
-
     if use_cuda and CUDA_AVAILABLE:
         try:
-            output = alpha_current_c.copy()
-            ff_cuda_ops.mask_edge_hysteresis_roi(
-                alpha_current_c,
-                alpha_previous_c,
+            output = np.zeros_like(alpha_current)
+            ff_cuda_ops.mask_edge_hysteresis(
+                alpha_current,
+                alpha_previous,
                 output,
-                seam_indices,
                 threshold_in,
                 threshold_out
             )
@@ -275,17 +265,13 @@ def apply_mask_hysteresis(
             print(f"CUDA mask hysteresis failed, falling back to NumPy: {e}")
 
     # Fallback: NumPy implementation
-    output = alpha_current_c.copy()
-    flat_indices = seam_indices
-    curr_flat = alpha_current_c.reshape(-1).astype(np.int16)
-    prev_flat = alpha_previous_c.reshape(-1).astype(np.int16)
-    delta = curr_flat[flat_indices] - prev_flat[flat_indices]
+    delta = alpha_current.astype(np.int16) - alpha_previous.astype(np.int16)
     moved_in = delta < -threshold_in
     moved_out = delta > threshold_out
     stable = ~(moved_in | moved_out)
-    result_segment = np.where(stable, prev_flat[flat_indices], curr_flat[flat_indices]).astype(np.uint8)
-    output.reshape(-1)[flat_indices] = result_segment
-    return output
+
+    output = np.where(stable, alpha_previous, alpha_current)
+    return output.astype(np.uint8)
 
 
 # Global state for stability features
