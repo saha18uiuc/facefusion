@@ -82,9 +82,16 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 		return inference_session
 
-	except Exception:
-		logger.error(translator.get('loading_model_failed').format(model_name = model_file_name), __name__)
-		fatal_exit(1)
+	except Exception as exception:
+		logger.warning(f"Optimized session load failed for {model_file_name}: {exception}. Falling back to default settings.", __name__)
+		try:
+			fallback_providers = create_inference_session_providers(execution_device_id, execution_providers)
+			inference_session = InferenceSession(model_path, providers = fallback_providers)
+			logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
+			return inference_session
+		except Exception:
+			logger.error(translator.get('loading_model_failed').format(model_name = model_file_name), __name__)
+			fatal_exit(1)
 
 
 def _create_session_options(model_file_name : str, execution_device_id : str) -> SessionOptions:
