@@ -33,7 +33,12 @@ def get_available_execution_providers() -> List[ExecutionProvider]:
 
 def _ensure_cache_dir(*segments: str) -> str:
 	path_segments = [ str(segment) for segment in segments ]
-	cache_path = Path('.caches').joinpath(*path_segments)
+	# If an absolute path is provided as the first segment, honor it directly.
+	base = Path(path_segments[0])
+	if base.is_absolute():
+		cache_path = base.joinpath(*path_segments[1:])
+	else:
+		cache_path = Path('.caches').joinpath(*path_segments)
 	cache_path.mkdir(parents = True, exist_ok = True)
 	return str(cache_path)
 
@@ -42,6 +47,10 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 	# Honor the requested order. Only wire TensorRT options when explicitly allowed.
 	requested_execution_providers = list(execution_providers)
 	inference_session_providers : List[InferenceSessionProvider] = []
+
+	# Defensive: avoid empty provider lists
+	if not requested_execution_providers:
+		raise RuntimeError("No execution providers requested; cannot create inference session providers")
 
 	for execution_provider in requested_execution_providers:
 		if execution_provider == 'cuda':
