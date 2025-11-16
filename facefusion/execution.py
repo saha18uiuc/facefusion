@@ -71,9 +71,9 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'device_id': execution_device_id,
 				'trt_engine_cache_enable': True,
 				'trt_engine_cache_path': cache_dir,
-				# Disable timing cache writes to reduce init I/O; rely on engine cache
+				# Keep timing cache path valid even if disabled to satisfy ORT
 				'trt_timing_cache_enable': False,
-				'trt_timing_cache_path': '',
+				'trt_timing_cache_path': cache_dir,
 				'trt_fp16_enable': False,
 				# Opt level 3 balances build effort and runtime speed; cached engine runs at full speed
 				'trt_builder_optimization_level': 3
