@@ -24,9 +24,12 @@ def ensure_static_hyperswap(src : str,
 	try:
 		logger.info(f"[TRT] building static hyperswap ONNX at {dst_path}", __name__)
 		model = onnx.load(str(src_path))
+		# If the provided input_name is not present, fall back to the first input
+		input_names = [i.name for i in model.graph.input]
+		name = input_name if input_name in input_names else input_names[0]
 		model_opt, check = simplify(
 			model,
-			input_shapes = { input_name: list(shape) },
+			overwrite_input_shapes = { name: list(shape) },
 			dynamic_input_shape = False
 		)
 		if not check:
