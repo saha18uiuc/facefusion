@@ -51,6 +51,9 @@ def create_inference_pool(model_source_set : DownloadSet, execution_device_id : 
 		model_path = model_source_set.get(model_name).get('path')
 		if is_file(model_path):
 			inference_pool[model_name] = create_inference_session(model_path, execution_device_id, execution_providers)
+		else:
+			logger.error(translator.get('loading_model_failed').format(model_name = model_name), __name__)
+			fatal_exit(1)
 
 	return inference_pool
 
