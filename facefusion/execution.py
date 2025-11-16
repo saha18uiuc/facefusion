@@ -43,6 +43,20 @@ def _ensure_cache_dir(*segments: str) -> str:
 	return str(cache_path)
 
 
+def _stage_trt_cache(cache_root: str) -> str:
+	"""If cache is on slower storage (e.g., Drive), stage to tmpfs for faster reads."""
+	try:
+		cache_path = Path(cache_root)
+		if '/content/drive' in str(cache_path) and cache_path.exists():
+			fast_path = Path('/dev/shm/trt_cache_stage')
+			if not fast_path.exists():
+				shutil.copytree(cache_path, fast_path, dirs_exist_ok=True)
+			return str(fast_path)
+	except Exception:
+		pass
+	return cache_root
+
+
 def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider], model_identifier : Optional[str] = None, allow_tensorrt : bool = False) -> List[InferenceSessionProvider]:
 	# Honor the requested order. Only wire TensorRT options when explicitly allowed.
 	requested_execution_providers = list(execution_providers)
@@ -60,7 +74,11 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search()
 			}))
 		if execution_provider == 'tensorrt' and allow_tensorrt:
-			trt_cache_root = os.environ.get('TENSORRT_CACHE_DIR', '.caches/tensorrt')
+			env_root = os.environ.get('TENSORRT_CACHE_DIR')
+			repo_root_cache = 'trt_cache' if Path('trt_cache').exists() else None
+			default_root = '.caches/tensorrt'
+			trt_cache_root = env_root or repo_root_cache or default_root
+			trt_cache_root = _stage_trt_cache(trt_cache_root)
 			cache_dir = _ensure_cache_dir(trt_cache_root, model_identifier or 'shared', execution_device_id)
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
