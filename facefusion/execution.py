@@ -80,17 +80,20 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 			trt_cache_root = env_root or repo_root_cache or default_root
 			trt_cache_root = _stage_trt_cache(trt_cache_root)
 			cache_dir = _ensure_cache_dir(trt_cache_root, model_identifier or 'shared', execution_device_id)
-			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
-			{
+			provider_options = {
 				'device_id': execution_device_id,
 				'trt_engine_cache_enable': True,
 				'trt_engine_cache_path': cache_dir,
 				'trt_timing_cache_enable': True,
 				'trt_timing_cache_path': cache_dir,
 				'trt_fp16_enable': False,
-				# Opt level 2 builds faster; cached engine still runs at full speed
-				'trt_builder_optimization_level': 2
-			}))
+				# Opt level 1 minimizes build time; cached engine still runs at full speed
+				'trt_builder_optimization_level': 1
+			}
+			# Optional static-shape hint: when set, ask TRT to build sequentially (fewer profiles, smaller engine)
+			if os.environ.get('TRT_STATIC_SHAPES') == '1':
+				provider_options['trt_force_sequential_engine_build'] = True
+			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider), provider_options))
 		if execution_provider in [ 'directml', 'rocm' ]:
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{

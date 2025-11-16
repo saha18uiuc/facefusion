@@ -74,10 +74,32 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 	start_time = time()
 
 	try:
-		allow_trt = 'tensorrt' in [ep.lower() for ep in execution_providers]
+		name_lower = model_file_name.lower() if model_file_name else ''
+
+		# Build per-model provider list: hyperswap gets TRT if user requested it, others stay on CUDA.
+		if name_lower.startswith('hyperswap'):
+			if 'tensorrt' in execution_providers:
+				req = ['tensorrt', 'cuda', 'cpu']
+				allow_trt = True
+			elif 'cuda' in execution_providers:
+				req = ['cuda', 'cpu']
+				allow_trt = False
+			else:
+				req = ['cpu']
+				allow_trt = False
+		else:
+			# Force small/support models to CUDA only (no TRT build)
+			if 'cuda' in execution_providers:
+				req = ['cuda', 'cpu']
+			elif 'tensorrt' in execution_providers:
+				req = ['cuda', 'cpu']  # even if user passed TRT, prefer CUDA for light models
+			else:
+				req = ['cpu']
+			allow_trt = False
+
 		inference_session_providers = create_inference_session_providers(
 			execution_device_id,
-			execution_providers,
+			req,
 			model_file_name,
 			allow_tensorrt = allow_trt
 		)
@@ -89,9 +111,10 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 	except Exception as exception:
 		logger.info(f"Optimized session load failed for {model_file_name}: {exception}. Falling back to default settings.", __name__)
 		try:
+			fallback_requested = [ep for ep in req if ep != 'tensorrt'] or ['cpu']
 			fallback_providers = create_inference_session_providers(
 				execution_device_id,
-				execution_providers,
+				fallback_requested,
 				allow_tensorrt = False
 			)
 			inference_session = InferenceSession(model_path, providers = fallback_providers)
