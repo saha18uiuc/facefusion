@@ -25,11 +25,21 @@ def ensure_static_hyperswap(src : str,
 		logger.info(f"[TRT] building static hyperswap ONNX at {dst_path}", __name__)
 		model = onnx.load(str(src_path))
 		# If the provided input_name is not present, fall back to the first input
-		input_names = [i.name for i in model.graph.input]
-		name = input_name if input_name in input_names else input_names[0]
+		inputs = list(model.graph.input)
+		if not inputs:
+			raise RuntimeError('model has no inputs')
+		name = input_name if any(i.name == input_name for i in inputs) else inputs[0].name
+		# Derive shape from model if available; otherwise use user-provided shape.
+		dims = []
+		for d in next(i.type.tensor_type.shape.dim for i in inputs if i.name == name):
+			dims.append(d.dim_value if d.dim_value > 0 else None)
+		# If any dim is unknown, don't force static—return dynamic model.
+		if any(v is None for v in dims):
+			logger.info('[TRT] hyperswap input has dynamic dims; keeping dynamic ONNX', __name__)
+			return str(src_path)
 		model_opt, check = simplify(
 			model,
-			overwrite_input_shapes = { name: list(shape) },
+			overwrite_input_shapes = { name: dims or list(shape) },
 			dynamic_input_shape = False
 		)
 		if not check:
