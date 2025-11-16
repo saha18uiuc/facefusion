@@ -70,7 +70,8 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'trt_timing_cache_enable': True,
 				'trt_timing_cache_path': cache_dir,
 				'trt_fp16_enable': False,
-				'trt_builder_optimization_level': 3
+				# Opt level 2 builds faster; cached engine still runs at full speed
+				'trt_builder_optimization_level': 2
 			}))
 		if execution_provider in [ 'directml', 'rocm' ]:
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),

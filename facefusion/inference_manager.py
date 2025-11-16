@@ -113,12 +113,16 @@ def _create_session_options(model_file_name : str, execution_device_id : str) ->
 
 
 def _warmup_inference_session(inference_session : InferenceSession) -> None:
+	# Skip warmup entirely if a TRT cache is present; it will be loaded on demand.
+	cache_root = os.environ.get('TENSORRT_CACHE_DIR') or 'trt_cache'
+	if (Path(cache_root).exists()):
+		return
+	# Otherwise do a minimal warmup
 	try:
 		inputs = inference_session.get_inputs()
 	except Exception:
 		return
 	feeds = {}
-	accumulated = 0
 	dtype_map = {
 		'tensor(float)': np.float32,
 		'tensor(float16)': np.float16,
@@ -130,19 +134,12 @@ def _warmup_inference_session(inference_session : InferenceSession) -> None:
 	for node in inputs:
 		shape = []
 		for dim in node.shape:
-			if isinstance(dim, str) or dim is None or (isinstance(dim, int) and dim <= 0):
-				shape.append(1)
-			else:
-				shape.append(int(dim))
+			shape.append(1 if dim in (None,) or isinstance(dim, str) else int(dim))
 		if not shape:
 			continue
-		elems = int(np.prod(shape))
-		accumulated += elems
-		if accumulated > 1_000_000:
-			feeds = {}
-			break
 		dtype = dtype_map.get(node.type, np.float32)
 		feeds[node.name] = np.zeros(shape, dtype = dtype)
+		break  # single input warmup
 	if feeds:
 		try:
 			inference_session.run([], feeds)
