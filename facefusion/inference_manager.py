@@ -74,18 +74,26 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 	start_time = time()
 
 	try:
-		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers, model_file_name)
+		allow_trt = 'tensorrt' in [ep.lower() for ep in execution_providers]
+		inference_session_providers = create_inference_session_providers(
+			execution_device_id,
+			execution_providers,
+			model_file_name,
+			allow_tensorrt = allow_trt
+		)
 		session_options = _create_session_options(model_file_name, execution_device_id)
 		inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
-		if 'tensorrt' in execution_providers:
-			_warmup_inference_session(inference_session)
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 		return inference_session
 
 	except Exception as exception:
 		logger.info(f"Optimized session load failed for {model_file_name}: {exception}. Falling back to default settings.", __name__)
 		try:
-			fallback_providers = create_inference_session_providers(execution_device_id, execution_providers)
+			fallback_providers = create_inference_session_providers(
+				execution_device_id,
+				execution_providers,
+				allow_tensorrt = False
+			)
 			inference_session = InferenceSession(model_path, providers = fallback_providers)
 			logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 			return inference_session
@@ -96,12 +104,11 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 
 def _create_session_options(model_file_name : str, execution_device_id : str) -> SessionOptions:
 	options = SessionOptions()
+	# Keep graph opts but avoid writing optimized models to disk (slow on Colab)
 	options.enable_mem_pattern = True
 	options.enable_cpu_mem_arena = True
-	options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
-	cache_dir = Path('.caches') / 'ort' / str(execution_device_id)
-	cache_dir.mkdir(parents = True, exist_ok = True)
-	options.optimized_model_filepath = str(cache_dir / f"{model_file_name}.optimized.onnx")
+	options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+	# Do not set optimized_model_filepath to avoid filesystem overhead on ephemeral envs
 	return options
 
 

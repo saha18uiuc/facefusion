@@ -37,11 +37,9 @@ def _ensure_cache_dir(*segments: str) -> str:
 	return str(cache_path)
 
 
-def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider], model_identifier : Optional[str] = None) -> List[InferenceSessionProvider]:
+def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider], model_identifier : Optional[str] = None, allow_tensorrt : bool = False) -> List[InferenceSessionProvider]:
+	# Honor the requested order. Only wire TensorRT options when explicitly allowed.
 	requested_execution_providers = list(execution_providers)
-	if 'cuda' in requested_execution_providers and 'tensorrt' not in requested_execution_providers and has_execution_provider('tensorrt'):
-		cuda_index = requested_execution_providers.index('cuda')
-		requested_execution_providers.insert(cuda_index, 'tensorrt')
 	inference_session_providers : List[InferenceSessionProvider] = []
 
 	for execution_provider in requested_execution_providers:
@@ -51,8 +49,9 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'device_id': execution_device_id,
 				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search()
 			}))
-		if execution_provider == 'tensorrt':
-			cache_dir = _ensure_cache_dir('tensorrt', model_identifier or 'shared', execution_device_id)
+		if execution_provider == 'tensorrt' and allow_tensorrt:
+			trt_cache_root = os.environ.get('TENSORRT_CACHE_DIR', '.caches/tensorrt')
+			cache_dir = _ensure_cache_dir(trt_cache_root, model_identifier or 'shared', execution_device_id)
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
 				'device_id': execution_device_id,
@@ -61,7 +60,7 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'trt_timing_cache_enable': True,
 				'trt_timing_cache_path': cache_dir,
 				'trt_fp16_enable': False,
-				'trt_builder_optimization_level': 5
+				'trt_builder_optimization_level': 3
 			}))
 		if execution_provider in [ 'directml', 'rocm' ]:
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),

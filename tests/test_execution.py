@@ -21,4 +21,4 @@ def test_create_inference_session_providers() -> None:
 		'CPUExecutionProvider'
 	]
 
-	assert create_inference_session_providers('1', [ 'cpu', 'cuda' ]) == inference_session_providers
+	assert create_inference_session_providers('1', [ 'cpu', 'cuda' ], allow_tensorrt = False) == inference_session_providers
