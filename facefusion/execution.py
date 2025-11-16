@@ -71,12 +71,15 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'device_id': execution_device_id,
 				'trt_engine_cache_enable': True,
 				'trt_engine_cache_path': cache_dir,
-				'trt_timing_cache_enable': True,
-				'trt_timing_cache_path': cache_dir,
+				# Disable timing cache writes to reduce init I/O; rely on engine cache
+				'trt_timing_cache_enable': False,
+				'trt_timing_cache_path': '',
 				'trt_fp16_enable': False,
-				# Opt level 0 minimizes build time; cached engine still runs at full speed
+				# Opt level 3 balances build effort and runtime speed; cached engine runs at full speed
 				'trt_builder_optimization_level': 3
 			}
+			# Restrict tactics to GPU libs for deterministic speed
+			provider_options['trt_tactic_sources'] = "cublas,cublasLt,cudnn"
 			# Optional static-shape hint: when set, ask TRT to build sequentially (fewer profiles, smaller engine)
 			if os.environ.get('TRT_STATIC_SHAPES') == '1':
 				provider_options['trt_force_sequential_engine_build'] = True
