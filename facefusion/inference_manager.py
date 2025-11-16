@@ -11,6 +11,7 @@ from facefusion import logger, process_manager, state_manager, translator
 from facefusion.app_context import detect_app_context
 from facefusion.common_helper import is_windows
 from facefusion.execution import create_inference_session_providers, has_execution_provider
+from facefusion.tensorrt_utils import ensure_static_hyperswap
 from facefusion.exit_helper import fatal_exit
 from facefusion.filesystem import get_file_name, is_file
 from facefusion.time_helper import calculate_end_time
@@ -90,6 +91,10 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 			else:
 				req = ['cpu']
 				allow_trt = False
+			# If TRT is requested, prefer a static-shape ONNX for faster engine build/load.
+			if allow_trt:
+				static_path = Path(model_path).with_name(f"{Path(model_path).stem}_static.onnx")
+				model_path = ensure_static_hyperswap(model_path, static_path, input_name = 'input', shape = (1, 3, 256, 256))
 		else:
 			# Force small/support models to CUDA only (no TRT build)
 			if 'cuda' in execution_providers:
