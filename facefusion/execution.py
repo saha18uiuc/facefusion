@@ -80,9 +80,6 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 			}
 			# Restrict tactics to GPU libs for deterministic speed
 			provider_options['trt_tactic_sources'] = "cublas,cublasLt,cudnn"
-			# Optional static-shape hint: when set, ask TRT to build sequentially (fewer profiles, smaller engine)
-			if os.environ.get('TRT_STATIC_SHAPES') == '1':
-				provider_options['trt_force_sequential_engine_build'] = True
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider), provider_options))
 		if execution_provider in [ 'directml', 'rocm' ]:
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),

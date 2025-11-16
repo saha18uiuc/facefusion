@@ -143,9 +143,11 @@ def validate_hash_paths(hash_paths : List[str]) -> Tuple[List[str], List[str]]:
 def validate_source_paths(source_paths : List[str]) -> Tuple[List[str], List[str]]:
 	valid_source_paths = []
 	invalid_source_paths = []
+	# Allow custom/local models without hash when explicitly requested
+	allow_custom = os.environ.get('ALLOW_CUSTOM_MODELS') == '1'
 
 	for source_path in source_paths:
-		if validate_hash(source_path):
+		if allow_custom or validate_hash(source_path):
 			valid_source_paths.append(source_path)
 		else:
 			invalid_source_paths.append(source_path)
