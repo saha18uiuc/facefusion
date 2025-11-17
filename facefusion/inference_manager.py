@@ -87,9 +87,11 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		if has_execution_provider('cuda') and 'cuda' in execution_providers and cuda_graph_manager:
 			if cuda_graph_manager.should_enable_cuda_graphs(model_path):
 				warmup_start = time()
-				success = cuda_graph_manager.warmup_for_cuda_graphs(inference_session, model_file_name)
+				success = cuda_graph_manager.warmup_for_cuda_graphs(inference_session, model_file_name, model_path)
 				if success:
-					logger.info(f'CUDA graph capture completed for {model_file_name} in {calculate_end_time(warmup_start)} seconds', __name__)
+					warmup_time = calculate_end_time(warmup_start)
+					if warmup_time > 0.1:  # Only log if actual warmup happened (not from cache)
+						logger.info(f'CUDA graph capture completed for {model_file_name} in {warmup_time} seconds', __name__)
 				else:
 					logger.warn(f'CUDA graph warmup failed for {model_file_name}, running without graphs', __name__)
 

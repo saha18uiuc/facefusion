@@ -5,13 +5,17 @@ This module provides selective CUDA graph enablement with IO Binding,
 output validation, and automatic fallback for incompatible models.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import numpy
 
 from onnxruntime import InferenceSession
 
 from facefusion import choices, logger
 from facefusion.execution import has_execution_provider
+
+# Global cache to track which models have already been warmed up
+# This prevents redundant warmup when the same model is loaded multiple times
+_WARMED_UP_MODELS : Set[str] = set()
 
 
 def is_model_compatible_with_cuda_graphs(model_name : str) -> bool:
@@ -135,20 +139,28 @@ def create_warmup_inputs(inference_session : InferenceSession) -> Optional[Dict[
 		return None
 
 
-def warmup_for_cuda_graphs(inference_session : InferenceSession, model_name : str, iterations : int = 5) -> bool:
+def warmup_for_cuda_graphs(inference_session : InferenceSession, model_name : str, model_path : str, iterations : int = 5) -> bool:
 	"""
 	Perform warmup to trigger CUDA graph capture.
 
 	Args:
 		inference_session: The ONNX Runtime InferenceSession
 		model_name: Name of the model (for logging)
+		model_path: Full path to the model file (for caching)
 		iterations: Number of warmup iterations
 
 	Returns:
 		True if warmup succeeded, False otherwise
 	"""
+	global _WARMED_UP_MODELS
+
 	if not has_execution_provider('cuda'):
 		return False
+
+	# Check if this model has already been warmed up
+	if model_path in _WARMED_UP_MODELS:
+		logger.debug(f'Skipping warmup for {model_name} - already warmed up in this session', __name__)
+		return True
 
 	try:
 		# Create warmup inputs
@@ -170,6 +182,8 @@ def warmup_for_cuda_graphs(inference_session : InferenceSession, model_name : st
 				logger.debug(f'CUDA graph warmup iteration {i+1} failed for {model_name}: {str(iteration_error)}', __name__)
 				return False
 
+		# Mark this model as warmed up
+		_WARMED_UP_MODELS.add(model_path)
 		logger.debug(f'CUDA graph warmup succeeded for {model_name}', __name__)
 		return True
 
