@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy
 from tqdm import tqdm
@@ -165,8 +165,8 @@ def finalize_video(start_time : float) -> ErrorCode:
 
 
 def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
-	reference_vision_frame = read_static_video_frame(state_manager.get_item('target_path'), state_manager.get_item('reference_frame_number'))
-	source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
+	reference_vision_frame = _cached_reference_frame(state_manager.get_item('target_path'), state_manager.get_item('reference_frame_number'))
+	source_vision_frames = _cached_source_frames(tuple(state_manager.get_item('source_paths')))
 	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
 	temp_video_fps = restrict_video_fps(state_manager.get_item('target_path'), state_manager.get_item('output_video_fps'))
 	target_vision_frame = read_static_image(temp_frame_path, 'rgba')
@@ -181,6 +181,21 @@ def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 	if not numpy.any(source_voice_frame):
 		source_voice_frame = create_empty_audio_frame()
 
+	temp_vision_frame, temp_vision_mask = process_frame_runtime(
+		reference_vision_frame,
+		source_vision_frames,
+		target_vision_frame,
+		temp_vision_frame,
+		temp_vision_mask,
+		source_audio_frame,
+		source_voice_frame
+	)
+
+	temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
+	return write_image(temp_frame_path, temp_vision_frame)
+
+
+def process_frame_runtime(reference_vision_frame, source_vision_frames, target_vision_frame, temp_vision_frame, temp_vision_mask, source_audio_frame, source_voice_frame):
 	for processor_module in get_processors_modules(state_manager.get_item('processors')):
 		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
 		{
@@ -192,6 +207,14 @@ def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 			'temp_vision_frame': temp_vision_frame[:, :, :3],
 			'temp_vision_mask': temp_vision_mask
 		})
+	return temp_vision_frame, temp_vision_mask
 
-	temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
-	return write_image(temp_frame_path, temp_vision_frame)
+
+@lru_cache(maxsize = 1)
+def _cached_reference_frame(target_path : str, reference_frame_number : int):
+	return read_static_video_frame(target_path, reference_frame_number)
+
+
+@lru_cache(maxsize = 1)
+def _cached_source_frames(source_paths : tuple):
+	return read_static_images(list(source_paths))
