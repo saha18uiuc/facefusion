@@ -1,4 +1,5 @@
 import importlib
+import os
 import random
 from time import sleep, time
 from typing import List
@@ -132,26 +133,26 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 
-		# CUDA graphs enabled via execution.py when compatible
-		# ONNX Runtime automatically captures graphs during first few inferences
-		# No explicit warmup needed - graphs capture naturally with real data
-		if has_execution_provider('cuda') and 'cuda' in execution_providers and cuda_graph_manager:
-			if cuda_graph_manager.should_enable_cuda_graphs(model_path):
-				logger.info(f'CUDA graphs enabled for {model_file_name} - will capture automatically during inference', __name__)
+		# CUDA graphs can be unstable on some stacks; force-disable for hyperswap to avoid illegal memory access
+		if is_hyperswap:
+			os.environ['ORT_DISABLE_CUDA_GRAPHS'] = '1'
+		else:
+			if has_execution_provider('cuda') and 'cuda' in execution_providers and cuda_graph_manager:
+				if cuda_graph_manager.should_enable_cuda_graphs(model_path):
+					logger.info(f'CUDA graphs enabled for {model_file_name} - will capture automatically during inference', __name__)
 
-		# Wrap with IO Binding for optimized GPU memory management
-		if has_execution_provider('cuda') and 'cuda' in execution_providers and wrap_session_with_io_binding:
-			if 'hyperswap_1c_256' in model_path.lower():
-				logger.info(f'Attempting to enable IO Binding for {model_file_name}...', __name__)
-				try:
-					wrapped_session = wrap_session_with_io_binding(inference_session, int(execution_device_id), model_path)
-					if wrapped_session != inference_session:
-						inference_session = wrapped_session
-						logger.info(f'✓ IO Binding enabled for {model_file_name}', __name__)
-					else:
-						logger.warn(f'IO Binding returned same session - not applied', __name__)
-				except Exception as io_error:
-					logger.warn(f'IO Binding failed: {str(io_error)}, continuing without it', __name__)
+		# Wrap with IO Binding for optimized GPU memory management (skip for hyperswap to prevent cuda memcpy errors)
+		if has_execution_provider('cuda') and 'cuda' in execution_providers and wrap_session_with_io_binding and not is_hyperswap:
+			logger.info(f'Attempting to enable IO Binding for {model_file_name}...', __name__)
+			try:
+				wrapped_session = wrap_session_with_io_binding(inference_session, int(execution_device_id), model_path)
+				if wrapped_session != inference_session:
+					inference_session = wrapped_session
+					logger.info(f'✓ IO Binding enabled for {model_file_name}', __name__)
+				else:
+					logger.warn(f'IO Binding returned same session - not applied', __name__)
+			except Exception as io_error:
+				logger.warn(f'IO Binding failed: {str(io_error)}, continuing without it', __name__)
 
 		# Warm up once to trigger graph capture / kernel selection and reduce first-frame latency
 		if is_hyperswap:
