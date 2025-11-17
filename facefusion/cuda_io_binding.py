@@ -48,6 +48,7 @@ class CUDAIOBindingSession:
 			self.output_names = [out.name for out in self.output_metas]
 			self.expected_input_dtypes = self._resolve_expected_input_dtypes()
 			self.io_binding = self.session.io_binding()
+			self.outputs_bound = False
 			self._bind_outputs_once()
 			logger.debug(f'IO Binding enabled on CUDA device {device_id}', __name__)
 		else:
@@ -77,15 +78,25 @@ class CUDAIOBindingSession:
 				if input_name in input_feed:
 					input_tensor = input_feed[input_name]
 					expected_dtype = self.expected_input_dtypes.get(input_name)
+					preferred_dtype = None
 
 					# Pass-through for GPU OrtValue
 					if OrtValue and isinstance(input_tensor, OrtValue) and input_tensor.device_name().lower() == 'cuda':
 						self.io_binding.bind_ortvalue_input(input_name, input_tensor)
 						continue
 
-					# Match model input dtype to avoid Cast failures
-					if expected_dtype is not None and getattr(input_tensor, 'dtype', None) is not None and input_tensor.dtype != expected_dtype:
-						input_tensor = input_tensor.astype(expected_dtype, copy = False)
+					# Pick a preferred dtype (default to float32 if unknown)
+					if expected_dtype is not None:
+						# Prefer float32 even if model input is float16 to avoid Cast mismatches
+						if expected_dtype in (numpy.float16, numpy.float32):
+							preferred_dtype = numpy.float32
+						else:
+							preferred_dtype = expected_dtype
+					elif getattr(input_tensor, 'dtype', None) is not None and input_tensor.dtype in (numpy.float16, numpy.float32):
+						preferred_dtype = numpy.float32
+
+					if preferred_dtype is not None and getattr(input_tensor, 'dtype', None) is not None and input_tensor.dtype != preferred_dtype:
+						input_tensor = input_tensor.astype(preferred_dtype, copy = False)
 
 					# Ensure contiguous layout
 					if hasattr(input_tensor, 'flags') and not input_tensor.flags['C_CONTIGUOUS']:
@@ -155,6 +166,15 @@ class CUDAIOBindingSession:
 		for meta in getattr(self, 'input_metas', []):
 			if hasattr(meta, 'type') and meta.type in type_map:
 				result[meta.name] = type_map[meta.type]
+			elif hasattr(meta, 'type') and hasattr(meta.type, 'tensor_type'):
+				elem = getattr(meta.type.tensor_type, 'elem_type', None)
+				# Fallback: assume float32 when unsure
+				if elem:
+					result[meta.name] = numpy.float32
+				else:
+					result[meta.name] = numpy.float32
+			else:
+				result[meta.name] = numpy.float32
 		return result
 
 

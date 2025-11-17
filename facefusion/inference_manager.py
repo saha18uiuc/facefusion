@@ -150,6 +150,14 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 				except Exception as io_error:
 					logger.warn(f'IO Binding failed: {str(io_error)}, continuing without it', __name__)
 
+		# Warm up once to trigger graph capture / kernel selection and reduce first-frame latency
+		if is_hyperswap:
+			try:
+				_warmup_inference_session(inference_session)
+				logger.debug(f'Warmup inference complete for {model_file_name}', __name__)
+			except Exception as warmup_error:
+				logger.debug(f'Warmup skipped due to error: {warmup_error}', __name__)
+
 		return inference_session
 
 	except Exception as e:
@@ -169,3 +177,34 @@ def resolve_execution_providers(module_name : str) -> List[ExecutionProvider]:
 	if hasattr(module, 'resolve_execution_providers'):
 		return getattr(module, 'resolve_execution_providers')()
 	return state_manager.get_item('execution_providers')
+
+
+def _warmup_inference_session(inference_session : InferenceSession) -> None:
+	"""
+	Run a single dummy inference to trigger CUDA graph capture / kernel selection.
+	Uses minimal static shapes (1 for dynamic dims) so warmup is fast.
+	"""
+	try:
+		inputs = inference_session.get_inputs()
+	except Exception:
+		return
+
+	warmup_feed = {}
+	for meta in inputs:
+		# Build a static shape with 1s for unknown dims
+		shape = []
+		for dim in getattr(meta, 'shape', []) or []:
+			if isinstance(dim, int) and dim > 0:
+				shape.append(dim)
+			else:
+				shape.append(1)
+
+		if not shape:
+			continue
+
+		# Default to float32 warmup tensor to avoid type mismatches
+		import numpy
+		warmup_feed[meta.name] = numpy.zeros(shape, dtype = numpy.float32)
+
+	if warmup_feed:
+		inference_session.run(None, warmup_feed)
