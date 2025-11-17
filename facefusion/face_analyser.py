@@ -2,7 +2,7 @@ from typing import List, Optional
 
 import numpy
 
-from facefusion import state_manager
+from facefusion import face_tracker, state_manager
 from facefusion.common_helper import get_first
 from facefusion.face_classifier import classify_face
 from facefusion.face_detector import detect_faces, detect_faces_by_angle
@@ -94,34 +94,48 @@ def get_average_face(faces : List[Face]) -> Optional[Face]:
 
 
 def get_many_faces(vision_frames : List[VisionFrame]) -> List[Face]:
+	"""
+	Run face detection across a sequence. Uses a lightweight tracker (from revert_to_8392)
+	to avoid redundant detections on nearby frames while preserving detector/landmarker outputs.
+	"""
 	many_faces : List[Face] = []
+	tracker = face_tracker.get_tracker() if len(vision_frames) > 1 else None
 
 	for vision_frame in vision_frames:
-		if numpy.any(vision_frame):
-			static_faces = get_static_faces(vision_frame)
-			if static_faces:
-				many_faces.extend(static_faces)
-			else:
-				all_bounding_boxes = []
-				all_face_scores = []
-				all_face_landmarks_5 = []
+		if not numpy.any(vision_frame):
+			continue
+		static_faces = get_static_faces(vision_frame)
+		if static_faces:
+			many_faces.extend(static_faces)
+			continue
 
-				for face_detector_angle in state_manager.get_item('face_detector_angles'):
-					if face_detector_angle == 0:
-						bounding_boxes, face_scores, face_landmarks_5 = detect_faces(vision_frame)
-					else:
-						bounding_boxes, face_scores, face_landmarks_5 = detect_faces_by_angle(vision_frame, face_detector_angle)
-					all_bounding_boxes.extend(bounding_boxes)
-					all_face_scores.extend(face_scores)
-					all_face_landmarks_5.extend(face_landmarks_5)
+		def _detect(frame: VisionFrame) -> List[Face]:
+			return _detect_faces(frame)
 
-				if all_bounding_boxes and all_face_scores and all_face_landmarks_5 and state_manager.get_item('face_detector_score') > 0:
-					faces = create_faces(vision_frame, all_bounding_boxes, all_face_scores, all_face_landmarks_5)
-
-					if faces:
-						many_faces.extend(faces)
-						set_static_faces(vision_frame, faces)
+		faces = tracker.process_frame(vision_frame, _detect) if tracker else _detect(vision_frame)
+		if faces:
+			many_faces.extend(faces)
+			set_static_faces(vision_frame, faces)
 	return many_faces
+
+
+def _detect_faces(vision_frame: VisionFrame) -> List[Face]:
+	all_bounding_boxes = []
+	all_face_scores = []
+	all_face_landmarks_5 = []
+
+	for face_detector_angle in state_manager.get_item('face_detector_angles'):
+		if face_detector_angle == 0:
+			bounding_boxes, face_scores, face_landmarks_5 = detect_faces(vision_frame)
+		else:
+			bounding_boxes, face_scores, face_landmarks_5 = detect_faces_by_angle(vision_frame, face_detector_angle)
+		all_bounding_boxes.extend(bounding_boxes)
+		all_face_scores.extend(face_scores)
+		all_face_landmarks_5.extend(face_landmarks_5)
+
+	if all_bounding_boxes and all_face_scores and all_face_landmarks_5 and state_manager.get_item('face_detector_score') > 0:
+		return create_faces(vision_frame, all_bounding_boxes, all_face_scores, all_face_landmarks_5)
+	return []
 
 
 def scale_face(target_face : Face, target_vision_frame : VisionFrame, temp_vision_frame : VisionFrame) -> Face:

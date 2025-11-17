@@ -260,6 +260,14 @@ def estimate_face_angle(face_landmark_68 : FaceLandmark68) -> Angle:
 	return face_angle
 
 
+def reset_affine_smoothers() -> None:
+	"""
+	Compatibility hook from revert_to_8392 tracker path.
+	Current fork does not persist affine smoothers, so this is a no-op.
+	"""
+	return None
+
+
 def apply_nms(bounding_boxes : List[BoundingBox], scores : List[Score], score_threshold : float, nms_threshold : float) -> Sequence[int]:
 	bounding_boxes_norm = [ (x1, y1, x2 - x1, y2 - y1) for (x1, y1, x2, y2) in bounding_boxes ]
 	keep_indices = cv2.dnn.NMSBoxes(bounding_boxes_norm, scores, score_threshold = score_threshold, nms_threshold = nms_threshold)
