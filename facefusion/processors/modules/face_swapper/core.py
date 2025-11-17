@@ -637,7 +637,20 @@ def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame 
 			face_swapper_inputs[face_swapper_input.name] = crop_vision_frame
 
 	with conditional_thread_semaphore():
-		crop_vision_frame = face_swapper.run(None, face_swapper_inputs)[0][0]
+		try:
+			crop_vision_frame = face_swapper.run(None, face_swapper_inputs)[0][0]
+		except Exception as first_error:
+			# Retry once without IO binding if wrapper exposed a kernel/stream issue
+			logger.warn(f'Hyperswap inference failed, retrying without IO binding: {first_error}', __name__)
+			try:
+				session = getattr(face_swapper, 'session', None)
+				if session:
+					crop_vision_frame = session.run(None, face_swapper_inputs)[0][0]
+				else:
+					crop_vision_frame = face_swapper.run(None, face_swapper_inputs)[0][0]
+			except Exception as retry_error:
+				logger.error(f'Hyperswap retry failed: {retry_error}', __name__)
+				raise
 
 	return crop_vision_frame
 

@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import xml.etree.ElementTree as ElementTree
@@ -43,6 +44,10 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 				'device_id': int(execution_device_id),
 				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search()
 			}
+
+			# Hyperswap-specific: keep allocator conservative to avoid BFC/illegal access, but keep CUDA graphs on
+			if model_path and 'hyperswap_1c_256' in str(model_path).lower():
+				cuda_options['arena_extend_strategy'] = 'kSameAsRequested'
 
 			# Selectively enable CUDA graphs for compatible models
 			if model_path and cuda_graph_manager:
@@ -99,6 +104,11 @@ def resolve_cudnn_conv_algo_search() -> str:
 			return 'DEFAULT'
 
 	return 'EXHAUSTIVE'
+
+
+def is_colab() -> bool:
+	"""Best-effort Colab detection so we can keep settings conservative there."""
+	return 'COLAB_GPU' in os.environ or 'COLAB_RELEASE_TAG' in os.environ
 
 
 def resolve_openvino_device_type(execution_device_id : str) -> str:
