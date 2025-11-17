@@ -3,7 +3,7 @@ import random
 from time import sleep, time
 from typing import List
 
-from onnxruntime import InferenceSession
+from onnxruntime import InferenceSession, SessionOptions, GraphOptimizationLevel
 
 from facefusion import logger, process_manager, state_manager, translator
 from facefusion.app_context import detect_app_context
@@ -14,11 +14,16 @@ from facefusion.filesystem import get_file_name, is_file
 from facefusion.time_helper import calculate_end_time
 from facefusion.types import DownloadSet, ExecutionProvider, InferencePool, InferencePoolSet
 
-# Import CUDA graph manager
+# Import CUDA graph manager and IO Binding
 try:
 	from facefusion import cuda_graph_manager
 except:
 	cuda_graph_manager = None
+
+try:
+	from facefusion.cuda_io_binding import wrap_session_with_io_binding
+except:
+	wrap_session_with_io_binding = None
 
 INFERENCE_POOL_SET : InferencePoolSet =\
 {
@@ -78,10 +83,28 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 	start_time = time()
 
 	try:
+		# Create optimized session options
+		session_options = SessionOptions()
+
+		# Enable all graph optimizations for maximum performance
+		# This includes constant folding, layer fusion, and layout optimizations
+		session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+
+		# Enable parallel execution for independent operators
+		session_options.execution_mode = SessionOptions.ORT_PARALLEL
+
+		# Set intra-op and inter-op thread counts for optimal performance
+		session_options.intra_op_num_threads = state_manager.get_item('execution_thread_count')
+		session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
+
 		# Create inference session with selective CUDA graph support
 		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers, model_path)
-		inference_session = InferenceSession(model_path, providers = inference_session_providers)
+		inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
+
+		# Log optimization settings
+		if 'hyperswap_1c_256' in model_path.lower():
+			logger.info(f'Graph optimizations enabled for {model_file_name} (level: ALL, parallel execution, {session_options.intra_op_num_threads} intra-op threads)', __name__)
 
 		# CUDA graphs enabled via execution.py when compatible
 		# ONNX Runtime automatically captures graphs during first few inferences
@@ -89,6 +112,12 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		if has_execution_provider('cuda') and 'cuda' in execution_providers and cuda_graph_manager:
 			if cuda_graph_manager.should_enable_cuda_graphs(model_path):
 				logger.info(f'CUDA graphs enabled for {model_file_name} - will capture automatically during inference', __name__)
+
+		# Wrap with IO Binding for optimized GPU memory management
+		if has_execution_provider('cuda') and 'cuda' in execution_providers and wrap_session_with_io_binding:
+			inference_session = wrap_session_with_io_binding(inference_session, int(execution_device_id), model_path)
+			if 'hyperswap_1c_256' in model_path.lower():
+				logger.info(f'IO Binding enabled for {model_file_name} - eliminating CPU-GPU data transfers', __name__)
 
 		return inference_session
 
