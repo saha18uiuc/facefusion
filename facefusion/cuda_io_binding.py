@@ -8,7 +8,7 @@ and keep tensors resident on GPU throughout inference pipeline.
 from typing import Dict, List, Optional
 import numpy
 
-from onnxruntime import InferenceSession, OrtDevice
+from onnxruntime import InferenceSession
 
 from facefusion import logger
 from facefusion.execution import has_execution_provider
@@ -38,7 +38,7 @@ class CUDAIOBindingSession:
 		self.use_io_binding = has_execution_provider('cuda')
 
 		if self.use_io_binding:
-			self.device = OrtDevice(OrtDevice.cuda(), OrtDevice.default_memory(), device_id)
+			self.device_type = 'cuda'
 			self.input_names = [inp.name for inp in self.session.get_inputs()]
 			self.output_names = [out.name for out in self.session.get_outputs()]
 			logger.debug(f'IO Binding enabled on CUDA device {device_id}', __name__)
@@ -75,9 +75,9 @@ class CUDAIOBindingSession:
 
 					io_binding.bind_cpu_input(input_name, input_tensor)
 
-			# Bind outputs to GPU device
+			# Bind outputs to GPU device using portable API (no OrtDevice attrs)
 			for output_name in self.output_names:
-				io_binding.bind_output(output_name, self.device)
+				io_binding.bind_output(output_name, device_type = self.device_type, device_id = self.device_id)
 
 			# Run inference with IO binding
 			self.session.run_with_iobinding(io_binding)

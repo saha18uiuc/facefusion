@@ -3,7 +3,7 @@ import random
 from time import sleep, time
 from typing import List
 
-from onnxruntime import InferenceSession, SessionOptions, GraphOptimizationLevel
+from onnxruntime import ExecutionMode, GraphOptimizationLevel, InferenceSession, SessionOptions
 
 from facefusion import logger, process_manager, state_manager, translator
 from facefusion.app_context import detect_app_context
@@ -97,7 +97,11 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 				session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
 
 				# Enable parallel execution for independent operators
-				session_options.execution_mode = SessionOptions.ORT_PARALLEL
+				parallel_mode = getattr(ExecutionMode, 'ORT_PARALLEL', None)
+				if parallel_mode is not None:
+					session_options.execution_mode = parallel_mode
+				else:
+					logger.warn('ExecutionMode.ORT_PARALLEL not available in this onnxruntime build, keeping default execution mode', __name__)
 
 				# Set intra-op and inter-op thread counts for optimal performance
 				execution_thread_count = state_manager.get_item('execution_thread_count')
