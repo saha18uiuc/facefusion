@@ -7,8 +7,11 @@ and keep tensors resident on GPU throughout inference pipeline.
 
 from typing import Dict, List, Optional
 import numpy
-
 from onnxruntime import InferenceSession
+try:
+	from onnxruntime import OrtValue
+except Exception:
+	OrtValue = None
 
 from facefusion import logger
 from facefusion.execution import has_execution_provider
@@ -41,6 +44,8 @@ class CUDAIOBindingSession:
 			self.device_type = 'cuda'
 			self.input_names = [inp.name for inp in self.session.get_inputs()]
 			self.output_names = [out.name for out in self.session.get_outputs()]
+			self.io_binding = self.session.io_binding()
+			self._bind_outputs_once()
 			logger.debug(f'IO Binding enabled on CUDA device {device_id}', __name__)
 		else:
 			logger.debug('IO Binding disabled - CUDA not available', __name__)
@@ -61,29 +66,36 @@ class CUDAIOBindingSession:
 			return self.session.run(output_names, input_feed)
 
 		try:
-			# Create IO binding
-			io_binding = self.session.io_binding()
+			# Clear and re-bind inputs for this batch/frame
+			self.io_binding.clear_binding_inputs()
 
-			# Bind inputs - copy to GPU
+			# Bind inputs
 			for input_name in self.input_names:
 				if input_name in input_feed:
 					input_tensor = input_feed[input_name]
 
-					# Ensure contiguous memory layout
+					# Handle pre-GPU data if caller passes an OrtValue on CUDA
+					if OrtValue and isinstance(input_tensor, OrtValue) and input_tensor.device_name().lower() == 'cuda':
+						self.io_binding.bind_ortvalue_input(input_name, input_tensor)
+						continue
+
+					# Ensure contiguous layout and preferred dtype to reduce copies
 					if not input_tensor.flags['C_CONTIGUOUS']:
 						input_tensor = numpy.ascontiguousarray(input_tensor)
+					if input_tensor.dtype not in (numpy.float16, numpy.float32):
+						input_tensor = input_tensor.astype(numpy.float32, copy = False)
 
-					io_binding.bind_cpu_input(input_name, input_tensor)
+					self.io_binding.bind_cpu_input(input_name, input_tensor)
 
-			# Bind outputs to GPU device using portable API (no OrtDevice attrs)
-			for output_name in self.output_names:
-				io_binding.bind_output(output_name, device_type = self.device_type, device_id = self.device_id)
+			# Ensure outputs remain bound to GPU (only binds once unless session recreated)
+			if not getattr(self, 'outputs_bound', False):
+				self._bind_outputs_once()
 
 			# Run inference with IO binding
-			self.session.run_with_iobinding(io_binding)
+			self.session.run_with_iobinding(self.io_binding)
 
 			# Get outputs and copy back to CPU
-			outputs = io_binding.copy_outputs_to_cpu()
+			outputs = self.io_binding.copy_outputs_to_cpu()
 
 			return outputs
 
@@ -103,6 +115,12 @@ class CUDAIOBindingSession:
 	def set_providers(self, providers):
 		"""Set execution providers."""
 		return self.session.set_providers(providers)
+
+	def _bind_outputs_once(self) -> None:
+		"""Bind outputs to the GPU device once and reuse."""
+		for output_name in self.output_names:
+			self.io_binding.bind_output(output_name, device_type = self.device_type, device_id = self.device_id)
+		self.outputs_bound = True
 
 
 def wrap_session_with_io_binding(inference_session: InferenceSession, device_id: int = 0, model_path: str = None) -> InferenceSession:
