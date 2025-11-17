@@ -88,28 +88,37 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		is_hyperswap = 'hyperswap_1c_256' in model_path.lower()
 
 		if is_hyperswap:
-			session_options = SessionOptions()
+			try:
+				session_options = SessionOptions()
 
-			# Enable all graph optimizations for maximum performance
-			# This includes constant folding, layer fusion, and layout optimizations
-			session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+				# Enable all graph optimizations for maximum performance
+				# This includes constant folding, layer fusion, and layout optimizations
+				session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
 
-			# Enable parallel execution for independent operators
-			session_options.execution_mode = SessionOptions.ORT_PARALLEL
+				# Enable parallel execution for independent operators
+				session_options.execution_mode = SessionOptions.ORT_PARALLEL
 
-			# Set intra-op and inter-op thread counts for optimal performance
-			execution_thread_count = state_manager.get_item('execution_thread_count')
-			if execution_thread_count and execution_thread_count > 0:
-				session_options.intra_op_num_threads = execution_thread_count
-				session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
+				# Set intra-op and inter-op thread counts for optimal performance
+				execution_thread_count = state_manager.get_item('execution_thread_count')
+				if execution_thread_count and execution_thread_count > 0:
+					session_options.intra_op_num_threads = execution_thread_count
+					session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
+			except Exception as e:
+				logger.debug(f'Failed to create SessionOptions: {str(e)}, using defaults', __name__)
+				session_options = None
 
 		# Create inference session with selective CUDA graph support
 		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers, model_path)
 
-		if session_options:
-			inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
-			logger.info(f'Graph optimizations enabled for {model_file_name} (level: ALL, parallel execution)', __name__)
-		else:
+		try:
+			if session_options:
+				inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
+				logger.info(f'Graph optimizations enabled for {model_file_name} (level: ALL, parallel execution)', __name__)
+			else:
+				inference_session = InferenceSession(model_path, providers = inference_session_providers)
+		except Exception as session_error:
+			# If SessionOptions fails, try without it
+			logger.debug(f'Failed to create session with options: {str(session_error)}, retrying without options', __name__)
 			inference_session = InferenceSession(model_path, providers = inference_session_providers)
 
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
@@ -123,14 +132,19 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 
 		# Wrap with IO Binding for optimized GPU memory management
 		if has_execution_provider('cuda') and 'cuda' in execution_providers and wrap_session_with_io_binding:
-			inference_session = wrap_session_with_io_binding(inference_session, int(execution_device_id), model_path)
-			if 'hyperswap_1c_256' in model_path.lower():
-				logger.info(f'IO Binding enabled for {model_file_name} - eliminating CPU-GPU data transfers', __name__)
+			try:
+				wrapped_session = wrap_session_with_io_binding(inference_session, int(execution_device_id), model_path)
+				if 'hyperswap_1c_256' in model_path.lower() and wrapped_session != inference_session:
+					inference_session = wrapped_session
+					logger.info(f'IO Binding enabled for {model_file_name} - eliminating CPU-GPU data transfers', __name__)
+			except Exception as io_error:
+				logger.debug(f'IO Binding failed: {str(io_error)}, continuing without it', __name__)
 
 		return inference_session
 
-	except Exception:
+	except Exception as e:
 		logger.error(translator.get('loading_model_failed').format(model_name = model_file_name), __name__)
+		logger.error(f'Error details: {str(e)}', __name__)
 		fatal_exit(1)
 
 
