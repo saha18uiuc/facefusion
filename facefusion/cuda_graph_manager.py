@@ -5,7 +5,9 @@ This module provides selective CUDA graph enablement with IO Binding,
 output validation, and automatic fallback for incompatible models.
 """
 
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
+import os
+import hashlib
 import numpy
 
 from onnxruntime import InferenceSession
@@ -13,9 +15,63 @@ from onnxruntime import InferenceSession
 from facefusion import choices, logger
 from facefusion.execution import has_execution_provider
 
-# Global cache to track which models have already been warmed up
-# This prevents redundant warmup when the same model is loaded multiple times
-_WARMED_UP_MODELS : Set[str] = set()
+# Shared memory approach: Use a marker file to track warmup status
+# This works across processes and ensures warmup happens only once PER SESSION
+import atexit
+import glob
+
+# Get session-specific temp directory
+_SESSION_TEMP_DIR = None
+
+def _get_session_temp_dir() -> str:
+	"""Get or create a session-specific temp directory."""
+	global _SESSION_TEMP_DIR
+	if _SESSION_TEMP_DIR is None:
+		import tempfile
+		import time
+		session_id = f"facefusion_cuda_{os.getpid()}_{int(time.time())}"
+		base_temp = os.environ.get('TEMP', os.environ.get('TMP', '/tmp'))
+		_SESSION_TEMP_DIR = os.path.join(base_temp, session_id)
+		os.makedirs(_SESSION_TEMP_DIR, exist_ok=True)
+		# Register cleanup on exit
+		atexit.register(_cleanup_session_markers)
+	return _SESSION_TEMP_DIR
+
+def _cleanup_session_markers():
+	"""Clean up session marker files on exit."""
+	global _SESSION_TEMP_DIR
+	if _SESSION_TEMP_DIR and os.path.exists(_SESSION_TEMP_DIR):
+		try:
+			import shutil
+			shutil.rmtree(_SESSION_TEMP_DIR, ignore_errors=True)
+		except:
+			pass
+
+def _get_warmup_marker_path(model_path: str) -> str:
+	"""Get the path to the warmup marker file for a given model."""
+	# Normalize the path to get a consistent hash
+	abs_path = os.path.abspath(model_path)
+	# Create a hash of the absolute path
+	path_hash = hashlib.md5(abs_path.encode()).hexdigest()[:16]
+	# Store marker in session-specific temp directory
+	session_dir = _get_session_temp_dir()
+	marker_path = os.path.join(session_dir, f'warmup_{path_hash}.marker')
+	return marker_path
+
+def _is_already_warmed_up(model_path: str) -> bool:
+	"""Check if a model has already been warmed up in this session."""
+	marker_path = _get_warmup_marker_path(model_path)
+	return os.path.exists(marker_path)
+
+def _mark_as_warmed_up(model_path: str) -> None:
+	"""Mark a model as warmed up by creating a marker file."""
+	marker_path = _get_warmup_marker_path(model_path)
+	try:
+		with open(marker_path, 'w') as f:
+			f.write(os.path.abspath(model_path))
+		logger.debug(f'Created warmup marker: {marker_path}', __name__)
+	except Exception as e:
+		logger.debug(f'Failed to create warmup marker: {str(e)}', __name__)
 
 
 def is_model_compatible_with_cuda_graphs(model_name : str) -> bool:
@@ -152,15 +208,18 @@ def warmup_for_cuda_graphs(inference_session : InferenceSession, model_name : st
 	Returns:
 		True if warmup succeeded, False otherwise
 	"""
-	global _WARMED_UP_MODELS
-
 	if not has_execution_provider('cuda'):
 		return False
 
-	# Check if this model has already been warmed up
-	if model_path in _WARMED_UP_MODELS:
-		logger.debug(f'Skipping warmup for {model_name} - already warmed up in this session', __name__)
+	# Normalize the model path for consistent caching
+	abs_model_path = os.path.abspath(model_path)
+
+	# Check if this model has already been warmed up (using shared marker file)
+	if _is_already_warmed_up(abs_model_path):
+		logger.debug(f'Skipping warmup for {model_name} - already warmed up (marker file exists)', __name__)
 		return True
+
+	logger.info(f'Starting CUDA graph warmup for {model_name} (first time for this model)', __name__)
 
 	try:
 		# Create warmup inputs
@@ -182,9 +241,9 @@ def warmup_for_cuda_graphs(inference_session : InferenceSession, model_name : st
 				logger.debug(f'CUDA graph warmup iteration {i+1} failed for {model_name}: {str(iteration_error)}', __name__)
 				return False
 
-		# Mark this model as warmed up
-		_WARMED_UP_MODELS.add(model_path)
-		logger.debug(f'CUDA graph warmup succeeded for {model_name}', __name__)
+		# Mark this model as warmed up by creating marker file
+		_mark_as_warmed_up(abs_model_path)
+		logger.debug(f'CUDA graph warmup succeeded for {model_name}, marker file created', __name__)
 		return True
 
 	except Exception as exception:
