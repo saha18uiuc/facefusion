@@ -80,11 +80,6 @@ class CUDAIOBindingSession:
 					expected_dtype = self.expected_input_dtypes.get(input_name)
 					preferred_dtype = None
 
-					# Pass-through for GPU OrtValue
-					if OrtValue and isinstance(input_tensor, OrtValue) and input_tensor.device_name().lower() == 'cuda':
-						self.io_binding.bind_ortvalue_input(input_name, input_tensor)
-						continue
-
 					# Pick a preferred dtype (default to float32 if unknown)
 					if expected_dtype is not None:
 						# Prefer float32 even if model input is float16 to avoid Cast mismatches
@@ -102,16 +97,7 @@ class CUDAIOBindingSession:
 					if hasattr(input_tensor, 'flags') and not input_tensor.flags['C_CONTIGUOUS']:
 						input_tensor = numpy.ascontiguousarray(input_tensor)
 
-					# Optionally move CPU numpy directly to CUDA to skip later copies
-					if OrtValue and isinstance(input_tensor, numpy.ndarray):
-						try:
-							cuda_value = OrtValue.from_numpy(input_tensor, device_type = self.device_type, device_id = self.device_id)
-							self.io_binding.bind_ortvalue_input(input_name, cuda_value)
-							continue
-						except Exception:
-							# fall back to CPU binding if CUDA OrtValue creation fails
-							pass
-
+					# Bind CPU input (let ORT handle host->device copy). Avoid zero-copy path to keep dtype consistent.
 					self.io_binding.bind_cpu_input(input_name, input_tensor)
 
 			# Ensure outputs remain bound to GPU (only binds once unless session recreated)
