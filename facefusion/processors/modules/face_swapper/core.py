@@ -982,24 +982,16 @@ def _use_iobinding() -> bool:
 def _run_faceswapper_iobinding(face_swapper, face_swapper_inputs: dict) -> Optional[VisionFrame]:
 	"""
 	Run face_swapper with ONNX Runtime IOBinding on CUDA to avoid extra copies.
-	Falls back to None on any failure so caller can use the standard path.
+	We intentionally do NOT cache bindings or output buffers to avoid stale
+	device pointers that can trigger CUDA illegal memory/free errors.
 	"""
 	try:
 		if 'CUDAExecutionProvider' not in [p[0] if isinstance(p, (list, tuple)) else p for p in face_swapper.get_providers()]:
 			return None
 		device_type, device_id = current_cuda_device()
-		cache_key = id(face_swapper)
-		cache_entry = _iobinding_cache.get(cache_key)
-		if cache_entry:
-			binding = cache_entry['binding']
-			bound_inputs = cache_entry['inputs']
-			bound_outputs = cache_entry['outputs']
-		else:
-			binding = face_swapper.io_binding()
-			bound_inputs = {}
-			bound_outputs = {}
+		binding = face_swapper.io_binding()
 
-		# Prepare and bind inputs (reuse buffers when shape matches)
+		# Prepare and bind inputs every call
 		for name, arr in face_swapper_inputs.items():
 			if isinstance(arr, torch.Tensor):
 				tensor = arr
@@ -1009,62 +1001,25 @@ def _run_faceswapper_iobinding(face_swapper, face_swapper_inputs: dict) -> Optio
 				tensor = torch.from_numpy(arr).contiguous().to(torch.device(f"{device_type}:{device_id}"))
 			else:
 				return None
-			prev = bound_inputs.get(name)
-			if prev is None or tuple(prev.shape) != tuple(tensor.shape):
-				bound_inputs[name] = tensor
-				binding.bind_input(
-					name=name,
-					device_type=device_type,
-					device_id=device_id,
-					element_type=numpy.float32,
-					shape=tuple(tensor.shape),
-					buffer_ptr=tensor.data_ptr()
-				)
-			else:
-				# Update data pointer if tensor changed
-				binding.bind_input(
-					name=name,
-					device_type=device_type,
-					device_id=device_id,
-					element_type=numpy.float32,
-					shape=tuple(tensor.shape),
-					buffer_ptr=tensor.data_ptr()
-				)
 
-		# Bind outputs to CUDA; reuse buffer if shape known
+			binding.bind_input(
+				name=name,
+				device_type=device_type,
+				device_id=device_id,
+				element_type=numpy.float32,
+				shape=tuple(tensor.shape),
+				buffer_ptr=tensor.data_ptr()
+			)
+
+		# Bind outputs to CUDA fresh each time
 		outputs_cfg = face_swapper.get_outputs()
 		for out in outputs_cfg:
-			prev_out = bound_outputs.get(out.name)
-			if prev_out is None:
-				binding.bind_output(out.name, device_type, device_id)
-			else:
-				binding.bind_output(
-					name=out.name,
-					device_type=device_type,
-					device_id=device_id,
-					buffer_ptr=prev_out.data_ptr(),
-					shape=tuple(prev_out.shape),
-					element_type=numpy.float32
-				)
+			binding.bind_output(out.name, device_type, device_id)
 
 		face_swapper.run_with_iobinding(binding)
 		outputs = binding.copy_outputs_to_cpu()
 		if not outputs:
 			return None
-		# Cache outputs buffers for reuse if shapes fixed
-		try:
-			for ort_out, out_cfg in zip(outputs, outputs_cfg):
-				tensor_out = torch.from_numpy(ort_out).to(torch.float32)  # CPU tensor
-				bound_outputs[out_cfg.name] = tensor_out
-		except Exception:
-			pass
-
-		_iobinding_cache[cache_key] = {
-			'binding': binding,
-			'inputs': bound_inputs,
-			'outputs': bound_outputs,
-		}
-
 		return outputs[0][0]
 	except Exception:
 		return None
