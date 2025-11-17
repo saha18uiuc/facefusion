@@ -26,6 +26,7 @@ from facefusion.program_helper import find_argument_group
 from facefusion.thread_helper import conditional_thread_semaphore
 from facefusion.types import ApplyStateItem, Args, DownloadScope, Embedding, Face, InferencePool, ModelOptions, ModelSet, ProcessMode, VisionFrame
 from facefusion.vision import read_static_image, read_static_images, read_static_video_frame, unpack_resolution
+from facefusion.gpu import gpu_accel_enabled, gpu_compositor_enabled, current_cuda_device
 
 # Performance optimization modules
 from facefusion.processors.temporal_smoother import TemporalSmoother
@@ -42,10 +43,17 @@ try:
 	_torch_available = True
 except ImportError:
 	_torch_available = False
+try:
+	import onnxruntime as ort  # type: ignore
+	_ort_available = True
+except Exception:
+	_ort_available = False
 
 # Processing statistics
 _frame_count = 0
 _batch_cleanup_interval = 10
+_cuda_mean_std_cache = {}
+_iobinding_cache = {}
 
 
 @lru_cache()
@@ -712,6 +720,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 	model_size = get_model_options().get('size')
 	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
 	pixel_boost_total = pixel_boost_size[0] // model_size[0]
+	use_gpu_comp = gpu_compositor_enabled()
 
 	# Apply temporal smoothing to target face landmarks to reduce jitter
 	temporal_smoother = get_temporal_smoother()
@@ -739,7 +748,14 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 
 	pixel_boost_vision_frames = implode_pixel_boost(crop_vision_frame, pixel_boost_total, model_size)
 	for pixel_boost_vision_frame in pixel_boost_vision_frames:
-		pixel_boost_vision_frame = prepare_crop_frame(pixel_boost_vision_frame)
+		# Prefer CUDA preprocessing when available and safe (no pixel boost tiling).
+		prepared_gpu = None
+		if pixel_boost_total == 1:
+			prepared_gpu = prepare_crop_frame_cuda(pixel_boost_vision_frame)
+		if prepared_gpu is not None:
+			pixel_boost_vision_frame = prepared_gpu
+		else:
+			pixel_boost_vision_frame = prepare_crop_frame(pixel_boost_vision_frame)
 		pixel_boost_vision_frame = forward_swap_face(source_face, target_face, pixel_boost_vision_frame)
 		pixel_boost_vision_frame = normalize_crop_frame(pixel_boost_vision_frame)
 		temp_vision_frames.append(pixel_boost_vision_frame)
@@ -757,8 +773,16 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
 
 	crop_mask = numpy.minimum.reduce(crop_masks).clip(0, 1)
 
-	# Standard paste_back for base result
-	paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix)
+	# Standard paste_back for base result, with optional GPU compositor.
+	paste_vision_frame = None
+	if use_gpu_comp:
+		try:
+			from facefusion.gpu.compositor import paste_back_cuda
+			paste_vision_frame = paste_back_cuda(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix)
+		except Exception:
+			paste_vision_frame = None
+	if paste_vision_frame is None:
+		paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix)
 
 	# Apply enhanced blending for improved quality and color consistency
 	# This addresses color warping and boundary artifacts
@@ -837,10 +861,22 @@ def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame 
 				source_embedding = balance_source_embedding(source_embedding, target_face.embedding)
 				face_swapper_inputs[face_swapper_input.name] = source_embedding
 		if face_swapper_input.name == 'target':
-			face_swapper_inputs[face_swapper_input.name] = crop_vision_frame
+		face_swapper_inputs[face_swapper_input.name] = crop_vision_frame
 
 	with conditional_thread_semaphore():
-		crop_vision_frame = face_swapper.run(None, face_swapper_inputs)[0][0]
+		# Prefer CUDA IOBinding when available to avoid host<->device churn.
+		if _use_iobinding():
+			result = _run_faceswapper_iobinding(face_swapper, face_swapper_inputs)
+			if result is not None:
+				return result
+		# Fallback uses numpy; convert torch inputs if needed.
+		run_inputs = {}
+		for k, v in face_swapper_inputs.items():
+			if isinstance(v, torch.Tensor):
+				run_inputs[k] = v.detach().cpu().numpy()
+			else:
+				run_inputs[k] = v
+		crop_vision_frame = face_swapper.run(None, run_inputs)[0][0]
 
 	return crop_vision_frame
 
@@ -913,6 +949,114 @@ def balance_source_embedding(source_embedding : Embedding, target_embedding : Em
 	return source_embedding
 
 
+# ---------------------------------------------------------------------------
+# CUDA helpers (IOBinding + preprocessing on GPU) guarded to preserve output quality.
+# These keep math identical but move tensors to CUDA when available.
+# ---------------------------------------------------------------------------
+
+
+def _use_iobinding() -> bool:
+	if not (_ort_available and _torch_available):
+		return False
+	if not gpu_accel_enabled():
+		return False
+	try:
+		return torch.cuda.is_available()
+	except Exception:
+		return False
+
+
+def _run_faceswapper_iobinding(face_swapper, face_swapper_inputs: dict) -> Optional[VisionFrame]:
+	"""
+	Run face_swapper with ONNX Runtime IOBinding on CUDA to avoid extra copies.
+	Falls back to None on any failure so caller can use the standard path.
+	"""
+	try:
+		if 'CUDAExecutionProvider' not in [p[0] if isinstance(p, (list, tuple)) else p for p in face_swapper.get_providers()]:
+			return None
+		device_type, device_id = current_cuda_device()
+		cache_key = id(face_swapper)
+		cache_entry = _iobinding_cache.get(cache_key)
+		if cache_entry:
+			binding = cache_entry['binding']
+			bound_inputs = cache_entry['inputs']
+			bound_outputs = cache_entry['outputs']
+		else:
+			binding = face_swapper.io_binding()
+			bound_inputs = {}
+			bound_outputs = {}
+
+		# Prepare and bind inputs (reuse buffers when shape matches)
+		for name, arr in face_swapper_inputs.items():
+			if isinstance(arr, torch.Tensor):
+				tensor = arr
+				if tensor.device.type != 'cuda':
+					tensor = tensor.to(torch.device(f"{device_type}:{device_id}"))
+			elif isinstance(arr, numpy.ndarray):
+				tensor = torch.from_numpy(arr).contiguous().to(torch.device(f"{device_type}:{device_id}"))
+			else:
+				return None
+			prev = bound_inputs.get(name)
+			if prev is None or tuple(prev.shape) != tuple(tensor.shape):
+				bound_inputs[name] = tensor
+				binding.bind_input(
+					name=name,
+					device_type=device_type,
+					device_id=device_id,
+					element_type=numpy.float32,
+					shape=tuple(tensor.shape),
+					buffer_ptr=tensor.data_ptr()
+				)
+			else:
+				# Update data pointer if tensor changed
+				binding.bind_input(
+					name=name,
+					device_type=device_type,
+					device_id=device_id,
+					element_type=numpy.float32,
+					shape=tuple(tensor.shape),
+					buffer_ptr=tensor.data_ptr()
+				)
+
+		# Bind outputs to CUDA; reuse buffer if shape known
+		outputs_cfg = face_swapper.get_outputs()
+		for out in outputs_cfg:
+			prev_out = bound_outputs.get(out.name)
+			if prev_out is None:
+				binding.bind_output(out.name, device_type, device_id)
+			else:
+				binding.bind_output(
+					name=out.name,
+					device_type=device_type,
+					device_id=device_id,
+					buffer_ptr=prev_out.data_ptr(),
+					shape=tuple(prev_out.shape),
+					element_type=numpy.float32
+				)
+
+		face_swapper.run_with_iobinding(binding)
+		outputs = binding.copy_outputs_to_cpu()
+		if not outputs:
+			return None
+		# Cache outputs buffers for reuse if shapes fixed
+		try:
+			for ort_out, out_cfg in zip(outputs, outputs_cfg):
+				tensor_out = torch.from_numpy(ort_out).to(torch.float32)  # CPU tensor
+				bound_outputs[out_cfg.name] = tensor_out
+		except Exception:
+			pass
+
+		_iobinding_cache[cache_key] = {
+			'binding': binding,
+			'inputs': bound_inputs,
+			'outputs': bound_outputs,
+		}
+
+		return outputs[0][0]
+	except Exception:
+		return None
+
+
 def convert_source_embedding(source_embedding : Embedding) -> Tuple[Embedding, Embedding]:
 	source_embedding = forward_convert_embedding(source_embedding)
 	source_embedding = source_embedding.ravel()
@@ -931,19 +1075,56 @@ def prepare_crop_frame(crop_vision_frame : VisionFrame) -> VisionFrame:
 	return crop_vision_frame
 
 
+def prepare_crop_frame_cuda(crop_vision_frame : VisionFrame) -> VisionFrame | None:
+	if not gpu_accel_enabled() or not _torch_available:
+		return None
+	if not torch.cuda.is_available():
+		return None
+	try:
+		opts = get_model_options()
+		mean_key = tuple(opts.get('mean'))
+		std_key = tuple(opts.get('standard_deviation'))
+		cache_key = (mean_key, std_key)
+		mean_std = _cuda_mean_std_cache.get(cache_key)
+		if mean_std is None:
+			model_mean = torch.tensor(opts.get('mean'), device="cuda", dtype=torch.float32).view(1, 1, 1, 3)
+			model_standard_deviation = torch.tensor(opts.get('standard_deviation'), device="cuda", dtype=torch.float32).view(1, 1, 1, 3)
+			mean_std = (model_mean, model_standard_deviation)
+			_cuda_mean_std_cache[cache_key] = mean_std
+		else:
+			model_mean, model_standard_deviation = mean_std
+
+		tensor = torch.from_numpy(crop_vision_frame).to(torch.float32).to("cuda", non_blocking=True)
+		tensor = tensor.unsqueeze(0)  # 1,H,W,3
+		tensor = tensor[:, :, :, [2, 1, 0]]  # BGR->RGB
+		tensor = tensor * (1.0 / 255.0)
+		tensor = (tensor - model_mean) / model_standard_deviation
+		tensor = tensor.permute(0, 3, 1, 2).contiguous()
+		return tensor
+	except Exception:
+		return None
+
+
 def normalize_crop_frame(crop_vision_frame : VisionFrame) -> VisionFrame:
 	model_type = get_model_options().get('type')
 	model_mean = get_model_options().get('mean')
 	model_standard_deviation = get_model_options().get('standard_deviation')
 
-	crop_vision_frame = crop_vision_frame.transpose(1, 2, 0)
+	if _torch_available and isinstance(crop_vision_frame, torch.Tensor):
+		tensor = crop_vision_frame
+		if tensor.device.type == 'cuda':
+			tensor = tensor.detach().cpu()
+		tensor = tensor.permute(1, 2, 0)
+		crop_vision_frame_np = tensor.numpy()
+	else:
+		crop_vision_frame_np = crop_vision_frame.transpose(1, 2, 0)
 
 	if model_type in [ 'ghost', 'hififace', 'hyperswap', 'uniface' ]:
-		crop_vision_frame = crop_vision_frame * model_standard_deviation + model_mean
+		crop_vision_frame_np = crop_vision_frame_np * model_standard_deviation + model_mean
 
-	crop_vision_frame = crop_vision_frame.clip(0, 1)
-	crop_vision_frame = crop_vision_frame[:, :, ::-1] * 255
-	return crop_vision_frame
+	crop_vision_frame_np = crop_vision_frame_np.clip(0, 1)
+	crop_vision_frame_np = crop_vision_frame_np[:, :, ::-1] * 255
+	return crop_vision_frame_np
 
 
 def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Face]:

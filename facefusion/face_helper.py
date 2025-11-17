@@ -4,6 +4,7 @@ from typing import List, Sequence, Tuple
 import cv2
 import numpy
 from cv2.typing import Size
+from facefusion.gpu import gpu_accel_enabled
 
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
 
@@ -76,6 +77,11 @@ def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_tem
 
 def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Tuple[VisionFrame, Matrix]:
 	affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size)
+	# Optional CUDA path; kept opt-in to avoid any risk of numerical drift.
+	if gpu_accel_enabled():
+		crop_gpu = _warp_affine_cuda(temp_vision_frame, affine_matrix, crop_size)
+		if crop_gpu is not None:
+			return crop_gpu, affine_matrix
 	crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode = cv2.BORDER_REPLICATE, flags = cv2.INTER_AREA)
 	return crop_vision_frame, affine_matrix
 
@@ -96,6 +102,32 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
 	affine_matrix = numpy.array([ [ scale, 0, translation[0] ], [ 0, scale, translation[1] ] ])
 	crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size)
 	return crop_vision_frame, affine_matrix
+
+
+def _warp_affine_cuda(temp_vision_frame: VisionFrame, affine_matrix: Matrix, crop_size: Size) -> VisionFrame | None:
+	"""
+	CUDA warp using a bilinear kernel that mirrors OpenCV's INTER_LINEAR with
+	border replicate. Returns None if CUDA is unavailable or on any error,
+	so the caller can safely fall back to CPU.
+	"""
+	try:
+		import torch
+		from facefusion.gpu.kernels import warp_face as warp_face_cuda
+	except Exception:
+		return None
+
+	if not torch.cuda.is_available():
+		return None
+
+	try:
+		src = torch.from_numpy(temp_vision_frame.astype(numpy.float32)).to(torch.device("cuda"))
+		affine = torch.from_numpy(affine_matrix.astype(numpy.float32)).to(torch.device("cuda"))
+		out_w, out_h = crop_size
+		warped = warp_face_cuda(src, affine, int(out_w), int(out_h))
+		warped = warped.clamp(0.0, 255.0)
+		return warped.cpu().numpy().astype(temp_vision_frame.dtype)
+	except Exception:
+		return None
 
 
 def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_vision_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
