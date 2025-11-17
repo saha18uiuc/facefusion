@@ -36,8 +36,7 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
 				'device_id': int(execution_device_id),
-				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search(),
-				'enable_cuda_graph': True
+				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search()
 			}))
 		if execution_provider == 'tensorrt':
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
