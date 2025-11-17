@@ -88,6 +88,7 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		is_hyperswap = 'hyperswap_1c_256' in model_path.lower()
 
 		if is_hyperswap:
+			logger.info(f'Detected hyperswap_1c_256, applying advanced optimizations...', __name__)
 			try:
 				session_options = SessionOptions()
 
@@ -103,8 +104,9 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 				if execution_thread_count and execution_thread_count > 0:
 					session_options.intra_op_num_threads = execution_thread_count
 					session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
+					logger.info(f'SessionOptions configured: threads={execution_thread_count}, graph_opt=ALL', __name__)
 			except Exception as e:
-				logger.debug(f'Failed to create SessionOptions: {str(e)}, using defaults', __name__)
+				logger.warn(f'Failed to create SessionOptions: {str(e)}, using defaults', __name__)
 				session_options = None
 
 		# Create inference session with selective CUDA graph support
@@ -113,12 +115,12 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		try:
 			if session_options:
 				inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
-				logger.info(f'Graph optimizations enabled for {model_file_name} (level: ALL, parallel execution)', __name__)
+				logger.info(f'✓ ONNX graph optimizations enabled for {model_file_name}', __name__)
 			else:
 				inference_session = InferenceSession(model_path, providers = inference_session_providers)
 		except Exception as session_error:
 			# If SessionOptions fails, try without it
-			logger.debug(f'Failed to create session with options: {str(session_error)}, retrying without options', __name__)
+			logger.warn(f'Session creation with options failed: {str(session_error)}, retrying without options', __name__)
 			inference_session = InferenceSession(model_path, providers = inference_session_providers)
 
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
@@ -132,13 +134,17 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 
 		# Wrap with IO Binding for optimized GPU memory management
 		if has_execution_provider('cuda') and 'cuda' in execution_providers and wrap_session_with_io_binding:
-			try:
-				wrapped_session = wrap_session_with_io_binding(inference_session, int(execution_device_id), model_path)
-				if 'hyperswap_1c_256' in model_path.lower() and wrapped_session != inference_session:
-					inference_session = wrapped_session
-					logger.info(f'IO Binding enabled for {model_file_name} - eliminating CPU-GPU data transfers', __name__)
-			except Exception as io_error:
-				logger.debug(f'IO Binding failed: {str(io_error)}, continuing without it', __name__)
+			if 'hyperswap_1c_256' in model_path.lower():
+				logger.info(f'Attempting to enable IO Binding for {model_file_name}...', __name__)
+				try:
+					wrapped_session = wrap_session_with_io_binding(inference_session, int(execution_device_id), model_path)
+					if wrapped_session != inference_session:
+						inference_session = wrapped_session
+						logger.info(f'✓ IO Binding enabled for {model_file_name}', __name__)
+					else:
+						logger.warn(f'IO Binding returned same session - not applied', __name__)
+				except Exception as io_error:
+					logger.warn(f'IO Binding failed: {str(io_error)}, continuing without it', __name__)
 
 		return inference_session
 
