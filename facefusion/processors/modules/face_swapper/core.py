@@ -566,8 +566,8 @@ def cleanup_cuda_memory(aggressive: bool = False) -> None:
 
 	Args:
 		aggressive: If True, performs more thorough cleanup
-	"""
-	if not _torch_available:
+		"""
+	if not _torch_available or state_manager.get_item('abort_cuda'):
 		return
 
 	if torch.cuda.is_available():
@@ -575,16 +575,16 @@ def cleanup_cuda_memory(aggressive: bool = False) -> None:
 		try:
 			if aggressive:
 				try:
-					orch.cuda.synchronize()
+					torch.cuda.synchronize()
 				except Exception:
-					# Ignore sync failures when context is bad	
+					# Ignore sync failures when context is bad
 					pass
 			# Empty CUDA cache; ignore if context is invalid
-			orch.cuda.empty_cache()
+			torch.cuda.empty_cache()
 			if aggressive:
 				gc.collect()
 				try:
-					orch.cuda.empty_cache()
+					torch.cuda.empty_cache()
 				except Exception:
 					pass
 		except Exception as exc:

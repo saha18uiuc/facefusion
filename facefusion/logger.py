@@ -26,6 +26,12 @@ def warn(message : str, module_name : str) -> None:
 	get_package_logger().warning(create_message(message, module_name))
 
 
+# Alias to match standard logging API and avoid AttributeError when callers use
+# logger.warning(...) instead of logger.warn(...)
+def warning(message : str, module_name : str) -> None:
+	warn(message, module_name)
+
+
 def error(message : str, module_name : str) -> None:
 	get_package_logger().error(create_message(message, module_name))
 

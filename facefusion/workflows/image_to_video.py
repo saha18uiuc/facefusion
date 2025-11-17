@@ -141,7 +141,7 @@ def restore_audio() -> ErrorCode:
 				video_manager.clear_video_pool()
 				if is_process_stopping():
 					return 4
-				logger.warn(translator.get('replacing_audio_skipped'), __name__)
+				logger.warning(translator.get('replacing_audio_skipped'), __name__)
 				move_temp_file(state_manager.get_item('target_path'), state_manager.get_item('output_path'))
 		else:
 			if ffmpeg.restore_audio(state_manager.get_item('target_path'), state_manager.get_item('output_path'), trim_frame_start, trim_frame_end):
@@ -151,7 +151,7 @@ def restore_audio() -> ErrorCode:
 				video_manager.clear_video_pool()
 				if is_process_stopping():
 					return 4
-				logger.warn(translator.get('restoring_audio_skipped'), __name__)
+				logger.warning(translator.get('restoring_audio_skipped'), __name__)
 				move_temp_file(state_manager.get_item('target_path'), state_manager.get_item('output_path'))
 	return 0
 

@@ -100,7 +100,7 @@ def finalize_image(start_time : float) -> ErrorCode:
 	if ffmpeg.finalize_image(state_manager.get_item('target_path'), state_manager.get_item('output_path'), output_image_resolution):
 		logger.debug(translator.get('finalizing_image_succeeded'), __name__)
 	else:
-		logger.warn(translator.get('finalizing_image_skipped'), __name__)
+		logger.warning(translator.get('finalizing_image_skipped'), __name__)
 
 	logger.debug(translator.get('clearing_temp'), __name__)
 	clear_temp_directory(state_manager.get_item('target_path'))
