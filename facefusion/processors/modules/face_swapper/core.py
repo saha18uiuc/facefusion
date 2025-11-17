@@ -55,6 +55,8 @@ _batch_cleanup_interval = 10
 _cuda_mean_std_cache = {}
 _iobinding_cache = {}
 
+_swap_faulted = False
+
 
 @lru_cache()
 def create_static_model_set(download_scope : DownloadScope) -> ModelSet:
@@ -569,18 +571,24 @@ def cleanup_cuda_memory(aggressive: bool = False) -> None:
 		return
 
 	if torch.cuda.is_available():
-		# Empty CUDA cache
-		torch.cuda.empty_cache()
-
-		if aggressive:
-			# Synchronize to ensure all operations complete
-			torch.cuda.synchronize()
-
-			# Python garbage collection
-			gc.collect()
-
-			# Empty cache again after GC
-			torch.cuda.empty_cache()
+		# Guard CUDA maintenance; device may already be faulted after an illegal access
+		try:
+			if aggressive:
+				try:
+					orch.cuda.synchronize()
+				except Exception:
+					# Ignore sync failures when context is bad	
+					pass
+			# Empty CUDA cache; ignore if context is invalid
+			orch.cuda.empty_cache()
+			if aggressive:
+				gc.collect()
+				try:
+					orch.cuda.empty_cache()
+				except Exception:
+					pass
+		except Exception as exc:
+			logger.warning(f"CUDA cleanup skipped due to error: {exc}", __name__)
 
 
 def get_optimal_batch_size() -> int:
@@ -1152,6 +1160,11 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	source_face = extract_source_face(source_vision_frames)
 	target_faces = select_faces(reference_vision_frame, target_vision_frame)
 
+	# If a prior frame faulted the CUDA context, skip heavy work to avoid crashes
+	global _swap_faulted
+	if _swap_faulted:
+		return temp_vision_frame, temp_vision_mask
+
 	if source_face and target_faces:
 		for target_face in target_faces:
 			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
@@ -1159,8 +1172,13 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 				temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
 			except Exception as exc:
 				logger.error('Recovered from CUDA/ORT swap failure: ' + str(exc), __name__)
-				cleanup_cuda_memory(aggressive=True)
-				continue
+				_swap_faulted = True
+				try:
+					cleanup_cuda_memory(aggressive=True)
+				except Exception:
+					pass
+				# Bail out after a failed swap to avoid cascading GPU faults
+				break
 
 	# Increment frame counter
 	_frame_count += 1
