@@ -1155,7 +1155,12 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	if source_face and target_faces:
 		for target_face in target_faces:
 			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
-			temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
+			try:
+				temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
+			except Exception as exc:
+				logger.error('Recovered from CUDA/ORT swap failure: ' + str(exc), __name__)
+				cleanup_cuda_memory(aggressive=True)
+				continue
 
 	# Increment frame counter
 	_frame_count += 1
