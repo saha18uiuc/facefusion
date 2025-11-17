@@ -87,10 +87,10 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		session_options = None
 		is_hyperswap = 'hyperswap_1c_256' in model_path.lower()
 
-		if is_hyperswap:
-			logger.info(f'Detected hyperswap_1c_256, applying advanced optimizations...', __name__)
-			try:
-				session_options = SessionOptions()
+			if is_hyperswap:
+				logger.info(f'Detected hyperswap_1c_256, applying advanced optimizations...', __name__)
+				try:
+					session_options = SessionOptions()
 
 					# Enable all graph optimizations for maximum performance
 					# This includes constant folding, layer fusion, and layout optimizations
@@ -104,13 +104,13 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 					if parallel_mode is not None:
 						session_options.execution_mode = parallel_mode
 					else:
-					logger.warn('ExecutionMode.ORT_PARALLEL not available in this onnxruntime build, keeping default execution mode', __name__)
+						logger.warn('ExecutionMode.ORT_PARALLEL not available in this onnxruntime build, keeping default execution mode', __name__)
 
-				# Set intra-op and inter-op thread counts for optimal performance
-				execution_thread_count = state_manager.get_item('execution_thread_count')
-				if execution_thread_count and execution_thread_count > 0:
-					session_options.intra_op_num_threads = execution_thread_count
-					session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
+					# Set intra-op and inter-op thread counts for optimal performance
+					execution_thread_count = state_manager.get_item('execution_thread_count')
+					if execution_thread_count and execution_thread_count > 0:
+						session_options.intra_op_num_threads = execution_thread_count
+						session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
 					logger.info(f'SessionOptions configured: threads={execution_thread_count}, graph_opt=ALL', __name__)
 			except Exception as e:
 				logger.warn(f'Failed to create SessionOptions: {str(e)}, using defaults', __name__)
