@@ -1174,6 +1174,10 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 				logger.error('Recovered from CUDA/ORT swap failure: ' + str(exc), __name__)
 				_swap_faulted = True
 				try:
+					state_manager.set_item('abort_cuda', True)
+				except Exception:
+					pass
+				try:
 					cleanup_cuda_memory(aggressive=True)
 				except Exception:
 					pass

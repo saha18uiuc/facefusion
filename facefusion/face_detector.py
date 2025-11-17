@@ -152,6 +152,12 @@ def pre_check() -> bool:
 
 
 def detect_faces(vision_frame : VisionFrame) -> Tuple[List[BoundingBox], List[Score], List[FaceLandmark5]]:
+	# Skip CUDA inference if the swapper flagged the device as broken
+	try:
+		if state_manager.get_item('abort_cuda'):
+			return [], [], []
+	except Exception:
+		pass
 	margin_top, margin_right, margin_bottom, margin_left = prepare_margin(vision_frame)
 	margin_vision_frame = numpy.pad(vision_frame, ((margin_top, margin_bottom), (margin_left, margin_right), (0, 0)))
 	all_bounding_boxes : List[BoundingBox] = []
