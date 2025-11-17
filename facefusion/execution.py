@@ -35,14 +35,14 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 		if execution_provider == 'cuda':
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
-				'device_id': execution_device_id,
+				'device_id': int(execution_device_id),
 				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search(),
 				'enable_cuda_graph': True
 			}))
 		if execution_provider == 'tensorrt':
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
-				'device_id': execution_device_id,
+				'device_id': int(execution_device_id),
 				'trt_engine_cache_enable': True,
 				'trt_engine_cache_path': '.caches',
 				'trt_timing_cache_enable': True,
@@ -52,12 +52,12 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
 		if execution_provider in [ 'directml', 'rocm' ]:
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
-				'device_id': execution_device_id
+				'device_id': int(execution_device_id)
 			}))
 		if execution_provider == 'migraphx':
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
-				'device_id': execution_device_id,
+				'device_id': int(execution_device_id),
 				'migraphx_model_cache_dir': '.caches'
 			}))
 		if execution_provider == 'openvino':
@@ -91,9 +91,10 @@ def resolve_cudnn_conv_algo_search() -> str:
 
 
 def resolve_openvino_device_type(execution_device_id : str) -> str:
-	if execution_device_id == '0':
+	device_id_str = str(execution_device_id)
+	if device_id_str == '0':
 		return 'GPU'
-	return 'GPU.' + execution_device_id
+	return 'GPU.' + device_id_str
 
 
 def run_nvidia_smi() -> subprocess.Popen[bytes]:
