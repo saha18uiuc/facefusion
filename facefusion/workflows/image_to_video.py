@@ -78,7 +78,11 @@ def process_video() -> ErrorCode:
 		with tqdm(total = len(temp_frame_paths), desc = translator.get('processing'), unit = 'frame', ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
 			progress.set_postfix(execution_providers = state_manager.get_item('execution_providers'))
 
-			with ThreadPoolExecutor(max_workers = state_manager.get_item('execution_thread_count')) as executor:
+			# Limit CUDA pipelines to 1 worker to avoid GPU illegal access under heavy load
+			max_workers = state_manager.get_item('execution_thread_count') or 1
+			if 'cuda' in (state_manager.get_item('execution_providers') or []):
+				max_workers = 1
+			with ThreadPoolExecutor(max_workers = max_workers) as executor:
 				futures = []
 
 				for frame_number, temp_frame_path in enumerate(temp_frame_paths):
