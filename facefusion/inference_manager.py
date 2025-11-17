@@ -83,28 +83,36 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 	start_time = time()
 
 	try:
-		# Create optimized session options
-		session_options = SessionOptions()
+		# Create optimized session options only for compatible models
+		session_options = None
+		is_hyperswap = 'hyperswap_1c_256' in model_path.lower()
 
-		# Enable all graph optimizations for maximum performance
-		# This includes constant folding, layer fusion, and layout optimizations
-		session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+		if is_hyperswap:
+			session_options = SessionOptions()
 
-		# Enable parallel execution for independent operators
-		session_options.execution_mode = SessionOptions.ORT_PARALLEL
+			# Enable all graph optimizations for maximum performance
+			# This includes constant folding, layer fusion, and layout optimizations
+			session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
 
-		# Set intra-op and inter-op thread counts for optimal performance
-		session_options.intra_op_num_threads = state_manager.get_item('execution_thread_count')
-		session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
+			# Enable parallel execution for independent operators
+			session_options.execution_mode = SessionOptions.ORT_PARALLEL
+
+			# Set intra-op and inter-op thread counts for optimal performance
+			execution_thread_count = state_manager.get_item('execution_thread_count')
+			if execution_thread_count and execution_thread_count > 0:
+				session_options.intra_op_num_threads = execution_thread_count
+				session_options.inter_op_num_threads = 1  # Most models benefit from single inter-op thread
 
 		# Create inference session with selective CUDA graph support
 		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers, model_path)
-		inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
-		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 
-		# Log optimization settings
-		if 'hyperswap_1c_256' in model_path.lower():
-			logger.info(f'Graph optimizations enabled for {model_file_name} (level: ALL, parallel execution, {session_options.intra_op_num_threads} intra-op threads)', __name__)
+		if session_options:
+			inference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_session_providers)
+			logger.info(f'Graph optimizations enabled for {model_file_name} (level: ALL, parallel execution)', __name__)
+		else:
+			inference_session = InferenceSession(model_path, providers = inference_session_providers)
+
+		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 
 		# CUDA graphs enabled via execution.py when compatible
 		# ONNX Runtime automatically captures graphs during first few inferences
