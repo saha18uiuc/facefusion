@@ -83,17 +83,12 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		inference_session = InferenceSession(model_path, providers = inference_session_providers)
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 
-		# Perform warmup for CUDA graph capture on compatible models
+		# CUDA graphs enabled via execution.py when compatible
+		# ONNX Runtime automatically captures graphs during first few inferences
+		# No explicit warmup needed - graphs capture naturally with real data
 		if has_execution_provider('cuda') and 'cuda' in execution_providers and cuda_graph_manager:
 			if cuda_graph_manager.should_enable_cuda_graphs(model_path):
-				warmup_start = time()
-				success = cuda_graph_manager.warmup_for_cuda_graphs(inference_session, model_file_name, model_path)
-				if success:
-					warmup_time = calculate_end_time(warmup_start)
-					if warmup_time > 0.1:  # Only log if actual warmup happened (not from cache)
-						logger.info(f'CUDA graph capture completed for {model_file_name} in {warmup_time} seconds', __name__)
-				else:
-					logger.warn(f'CUDA graph warmup failed for {model_file_name}, running without graphs', __name__)
+				logger.info(f'CUDA graphs enabled for {model_file_name} - will capture automatically during inference', __name__)
 
 		return inference_session
 
