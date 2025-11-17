@@ -42,8 +42,11 @@ class CUDAIOBindingSession:
 
 		if self.use_io_binding:
 			self.device_type = 'cuda'
-			self.input_names = [inp.name for inp in self.session.get_inputs()]
-			self.output_names = [out.name for out in self.session.get_outputs()]
+			self.input_metas = self.session.get_inputs()
+			self.output_metas = self.session.get_outputs()
+			self.input_names = [inp.name for inp in self.input_metas]
+			self.output_names = [out.name for out in self.output_metas]
+			self.expected_input_dtypes = self._resolve_expected_input_dtypes()
 			self.io_binding = self.session.io_binding()
 			self._bind_outputs_once()
 			logger.debug(f'IO Binding enabled on CUDA device {device_id}', __name__)
@@ -73,17 +76,30 @@ class CUDAIOBindingSession:
 			for input_name in self.input_names:
 				if input_name in input_feed:
 					input_tensor = input_feed[input_name]
+					expected_dtype = self.expected_input_dtypes.get(input_name)
 
-					# Handle pre-GPU data if caller passes an OrtValue on CUDA
+					# Pass-through for GPU OrtValue
 					if OrtValue and isinstance(input_tensor, OrtValue) and input_tensor.device_name().lower() == 'cuda':
 						self.io_binding.bind_ortvalue_input(input_name, input_tensor)
 						continue
 
-					# Ensure contiguous layout and preferred dtype to reduce copies
-					if not input_tensor.flags['C_CONTIGUOUS']:
+					# Match model input dtype to avoid Cast failures
+					if expected_dtype is not None and getattr(input_tensor, 'dtype', None) is not None and input_tensor.dtype != expected_dtype:
+						input_tensor = input_tensor.astype(expected_dtype, copy = False)
+
+					# Ensure contiguous layout
+					if hasattr(input_tensor, 'flags') and not input_tensor.flags['C_CONTIGUOUS']:
 						input_tensor = numpy.ascontiguousarray(input_tensor)
-					if input_tensor.dtype not in (numpy.float16, numpy.float32):
-						input_tensor = input_tensor.astype(numpy.float32, copy = False)
+
+					# Optionally move CPU numpy directly to CUDA to skip later copies
+					if OrtValue and isinstance(input_tensor, numpy.ndarray):
+						try:
+							cuda_value = OrtValue.from_numpy(input_tensor, device_type = self.device_type, device_id = self.device_id)
+							self.io_binding.bind_ortvalue_input(input_name, cuda_value)
+							continue
+						except Exception:
+							# fall back to CPU binding if CUDA OrtValue creation fails
+							pass
 
 					self.io_binding.bind_cpu_input(input_name, input_tensor)
 
@@ -121,6 +137,25 @@ class CUDAIOBindingSession:
 		for output_name in self.output_names:
 			self.io_binding.bind_output(output_name, device_type = self.device_type, device_id = self.device_id)
 		self.outputs_bound = True
+
+	def _resolve_expected_input_dtypes(self) -> Dict[str, numpy.dtype]:
+		"""Parse model input metadata into numpy dtypes so we bind the correct type."""
+		type_map = {
+			'tensor(float)': numpy.float32,
+			'tensor(float16)': numpy.float16,
+			'tensor(float32)': numpy.float32,
+			'tensor(float64)': numpy.float64,
+			'tensor(int64)': numpy.int64,
+			'tensor(int32)': numpy.int32,
+			'tensor(int16)': numpy.int16,
+			'tensor(int8)': numpy.int8,
+			'tensor(uint8)': numpy.uint8,
+		}
+		result : Dict[str, numpy.dtype] = {}
+		for meta in getattr(self, 'input_metas', []):
+			if hasattr(meta, 'type') and meta.type in type_map:
+				result[meta.name] = type_map[meta.type]
+		return result
 
 
 def wrap_session_with_io_binding(inference_session: InferenceSession, device_id: int = 0, model_path: str = None) -> InferenceSession:
