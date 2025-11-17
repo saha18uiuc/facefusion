@@ -861,7 +861,7 @@ def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame 
 				source_embedding = balance_source_embedding(source_embedding, target_face.embedding)
 				face_swapper_inputs[face_swapper_input.name] = source_embedding
 		if face_swapper_input.name == 'target':
-		face_swapper_inputs[face_swapper_input.name] = crop_vision_frame
+			face_swapper_inputs[face_swapper_input.name] = crop_vision_frame
 
 	with conditional_thread_semaphore():
 		# Prefer CUDA IOBinding when available to avoid host<->device churn.
