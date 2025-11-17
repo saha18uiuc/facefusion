@@ -92,15 +92,18 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 			try:
 				session_options = SessionOptions()
 
-				# Enable all graph optimizations for maximum performance
-				# This includes constant folding, layer fusion, and layout optimizations
-				session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+					# Enable all graph optimizations for maximum performance
+					# This includes constant folding, layer fusion, and layout optimizations
+					session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
 
-				# Enable parallel execution for independent operators
-				parallel_mode = getattr(ExecutionMode, 'ORT_PARALLEL', None)
-				if parallel_mode is not None:
-					session_options.execution_mode = parallel_mode
-				else:
+					# Reduce allocator fragmentation risk on constrained stacks (e.g., Colab)
+					session_options.enable_mem_pattern = False
+
+					# Enable parallel execution for independent operators
+					parallel_mode = getattr(ExecutionMode, 'ORT_PARALLEL', None)
+					if parallel_mode is not None:
+						session_options.execution_mode = parallel_mode
+					else:
 					logger.warn('ExecutionMode.ORT_PARALLEL not available in this onnxruntime build, keeping default execution mode', __name__)
 
 				# Set intra-op and inter-op thread counts for optimal performance
