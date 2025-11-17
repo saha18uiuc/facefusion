@@ -14,6 +14,12 @@ from facefusion.filesystem import get_file_name, is_file
 from facefusion.time_helper import calculate_end_time
 from facefusion.types import DownloadSet, ExecutionProvider, InferencePool, InferencePoolSet
 
+# Import CUDA graph manager
+try:
+	from facefusion import cuda_graph_manager
+except:
+	cuda_graph_manager = None
+
 INFERENCE_POOL_SET : InferencePoolSet =\
 {
 	'cli': {},
@@ -72,13 +78,20 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 	start_time = time()
 
 	try:
-		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers)
+		# Create inference session with selective CUDA graph support
+		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers, model_path)
 		inference_session = InferenceSession(model_path, providers = inference_session_providers)
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 
-		# Note: CUDA graphs are enabled via 'enable_cuda_graph': True in execution.py
-		# ONNX Runtime will automatically capture graphs during the first few inferences
-		# No explicit warmup is needed - graphs are captured transparently
+		# Perform warmup for CUDA graph capture on compatible models
+		if has_execution_provider('cuda') and 'cuda' in execution_providers and cuda_graph_manager:
+			if cuda_graph_manager.should_enable_cuda_graphs(model_path):
+				warmup_start = time()
+				success = cuda_graph_manager.warmup_for_cuda_graphs(inference_session, model_file_name)
+				if success:
+					logger.info(f'CUDA graph capture completed for {model_file_name} in {calculate_end_time(warmup_start)} seconds', __name__)
+				else:
+					logger.warn(f'CUDA graph warmup failed for {model_file_name}, running without graphs', __name__)
 
 		return inference_session
 

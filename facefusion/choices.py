@@ -138,6 +138,42 @@ download_scopes : List[DownloadScope] = [ 'lite', 'full' ]
 
 video_memory_strategies : List[VideoMemoryStrategy] = [ 'strict', 'moderate', 'tolerant' ]
 
+# CUDA graph compatible models (models known to work with CUDA graph capture)
+cuda_graph_compatible_models = {
+	# Face swapper models (static shapes, generally compatible)
+	'face_swapper': True,
+	'embedding_converter': True,
+	# Face enhancer models (compatible)
+	'face_enhancer': True,
+	# Frame processors (compatible)
+	'frame_enhancer': True,
+	'frame_colorizer': True,
+	'background_remover': True,
+	# Deep swapper and age modifier (compatible)
+	'deep_swapper': True,
+	'age_modifier': True,
+	'expression_restorer': True,
+	# Lip syncer (compatible)
+	'lip_syncer': True,
+	# Face editor and debugger (compatible)
+	'face_editor': True,
+	'face_debugger': True,
+	# Models with dynamic outputs (NOT compatible - exclude from CUDA graphs)
+	'retinaface': False,
+	'scrfd': False,
+	'yolo_face': False,
+	'yunet': False,
+	'2dfan4': False,
+	'peppa_wutz': False,
+	'fan_68_5': False,
+	'content_analyser': False,
+	'nsfw_1': False,
+	'nsfw_2': False,
+	'nsfw_3': False,
+	'face_recognizer': False,
+	'face_classifier': False
+}
+
 log_level_set : LogLevelSet =\
 {
 	'error': logging.ERROR,

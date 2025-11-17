@@ -9,6 +9,12 @@ from onnxruntime import get_available_providers, set_default_logger_severity
 import facefusion.choices
 from facefusion.types import ExecutionDevice, ExecutionProvider, InferenceSessionProvider, ValueAndUnit
 
+# Import CUDA graph manager for selective graph enablement
+try:
+	from facefusion import cuda_graph_manager
+except:
+	cuda_graph_manager = None
+
 set_default_logger_severity(3)
 
 
@@ -28,16 +34,22 @@ def get_available_execution_providers() -> List[ExecutionProvider]:
 	return available_execution_providers
 
 
-def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider]) -> List[InferenceSessionProvider]:
+def create_inference_session_providers(execution_device_id : str, execution_providers : List[ExecutionProvider], model_path : str = None) -> List[InferenceSessionProvider]:
 	inference_session_providers : List[InferenceSessionProvider] = []
 
 	for execution_provider in execution_providers:
 		if execution_provider == 'cuda':
-			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
-			{
+			cuda_options = {
 				'device_id': int(execution_device_id),
 				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search()
-			}))
+			}
+
+			# Selectively enable CUDA graphs for compatible models
+			if model_path and cuda_graph_manager:
+				cuda_graph_config = cuda_graph_manager.get_cuda_graph_config(model_path)
+				cuda_options.update(cuda_graph_config)
+
+			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider), cuda_options))
 		if execution_provider == 'tensorrt':
 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
 			{
