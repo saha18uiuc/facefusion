@@ -33,6 +33,21 @@ def warmup_inference_session(inference_session : InferenceSession, warmup_iterat
 		# Get input information from the model
 		inputs_info = inference_session.get_inputs()
 
+		# Skip warmup for models with complex/dynamic shapes that might cause issues
+		# CUDA graphs will still be captured on first real inference
+		has_dynamic_shapes = False
+		for input_info in inputs_info:
+			for dim in input_info.shape:
+				if not isinstance(dim, int) or dim <= 0:
+					has_dynamic_shapes = True
+					break
+			if has_dynamic_shapes:
+				break
+
+		if has_dynamic_shapes:
+			logger.debug('Skipping warmup for model with dynamic shapes - CUDA graphs will be captured on first inference', __name__)
+			return
+
 		# Create dummy inputs with the correct shapes and types
 		dummy_inputs : Dict[str, numpy.ndarray] = {}
 
@@ -41,29 +56,32 @@ def warmup_inference_session(inference_session : InferenceSession, warmup_iterat
 			input_shape = input_info.shape
 			input_type = input_info.type
 
-			# Handle dynamic dimensions (replace None or symbolic names with concrete values)
-			concrete_shape = []
-			for dim in input_shape:
-				if isinstance(dim, int) and dim > 0:
-					concrete_shape.append(dim)
-				else:
-					# Use default batch size of 1 for dynamic dimensions
-					concrete_shape.append(1)
+			# Create concrete shape (all dims should be positive integers at this point)
+			concrete_shape = list(input_shape)
 
-			# Create dummy input based on type
+			# Create dummy input based on type with small random values
 			if 'float' in input_type:
-				dummy_inputs[input_name] = numpy.zeros(concrete_shape, dtype = numpy.float32)
+				dummy_inputs[input_name] = numpy.random.randn(*concrete_shape).astype(numpy.float32) * 0.01
 			elif 'int64' in input_type:
-				dummy_inputs[input_name] = numpy.zeros(concrete_shape, dtype = numpy.int64)
+				dummy_inputs[input_name] = numpy.ones(concrete_shape, dtype = numpy.int64)
 			elif 'int32' in input_type:
-				dummy_inputs[input_name] = numpy.zeros(concrete_shape, dtype = numpy.int32)
+				dummy_inputs[input_name] = numpy.ones(concrete_shape, dtype = numpy.int32)
 			else:
 				# Default to float32 for unknown types
-				dummy_inputs[input_name] = numpy.zeros(concrete_shape, dtype = numpy.float32)
+				dummy_inputs[input_name] = numpy.random.randn(*concrete_shape).astype(numpy.float32) * 0.01
 
 		# Run warmup iterations to trigger CUDA graph capture
-		for _ in range(warmup_iterations):
-			inference_session.run(None, dummy_inputs)
+		# Use try-except for each iteration in case warmup fails
+		for i in range(warmup_iterations):
+			try:
+				result = inference_session.run(None, dummy_inputs)
+				# Verify result is not empty
+				if not result or len(result) == 0:
+					logger.debug(f'Warmup iteration {i+1} returned empty result, skipping remaining warmup', __name__)
+					return
+			except Exception as iteration_exception:
+				logger.debug(f'Warmup iteration {i+1} failed: {str(iteration_exception)}, skipping remaining warmup', __name__)
+				return
 
 	except Exception as exception:
 		# Log warmup failure but don't crash - the model will still work without CUDA graphs

@@ -5,7 +5,7 @@ from typing import List
 
 from onnxruntime import InferenceSession
 
-from facefusion import cuda_graph_helper, logger, process_manager, state_manager, translator
+from facefusion import logger, process_manager, state_manager, translator
 from facefusion.app_context import detect_app_context
 from facefusion.common_helper import is_windows
 from facefusion.execution import create_inference_session_providers, has_execution_provider
@@ -76,11 +76,9 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		inference_session = InferenceSession(model_path, providers = inference_session_providers)
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 
-		# Warm up the model to trigger CUDA graph capture
-		if has_execution_provider('cuda') and 'cuda' in execution_providers:
-			warmup_start_time = time()
-			cuda_graph_helper.warmup_inference_session(inference_session)
-			logger.debug(f'CUDA graph warmup completed for {model_file_name} in {calculate_end_time(warmup_start_time)} seconds', __name__)
+		# Note: CUDA graphs are enabled via 'enable_cuda_graph': True in execution.py
+		# ONNX Runtime will automatically capture graphs during the first few inferences
+		# No explicit warmup is needed - graphs are captured transparently
 
 		return inference_session
 

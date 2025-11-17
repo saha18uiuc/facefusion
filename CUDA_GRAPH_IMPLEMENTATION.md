@@ -26,20 +26,22 @@ Based on typical face processing workloads, CUDA graph replay can provide:
 
 ### Architecture
 
-The CUDA graph implementation consists of three main components:
+The CUDA graph implementation consists of a simple, robust approach:
 
 1. **Execution Provider Configuration** (`facefusion/execution.py`)
    - Enables CUDA graph capture in the ONNX Runtime CUDAExecutionProvider
+   - Sets `'enable_cuda_graph': True` in provider options
    - Automatically activated when using CUDA execution provider
 
-2. **Warmup Utility** (`facefusion/cuda_graph_helper.py`)
-   - Performs model warmup to trigger CUDA graph capture
-   - Creates appropriate dummy inputs based on model specifications
-   - Runs multiple warmup iterations to ensure graph capture
+2. **Automatic Graph Capture** (ONNX Runtime built-in)
+   - ONNX Runtime automatically captures CUDA graphs during first few inferences
+   - No explicit warmup needed - graphs captured with real data
+   - More robust than dummy data warmup
 
-3. **Inference Manager Integration** (`facefusion/inference_manager.py`)
-   - Automatically warms up models after loading
-   - Seamlessly integrates with existing model management
+3. **Warmup Utility** (`facefusion/cuda_graph_helper.py`)
+   - Available but not used by default
+   - Kept for potential future use cases
+   - ONNX Runtime's automatic capture is preferred
 
 ### Modified Files
 
@@ -56,23 +58,17 @@ if execution_provider == 'cuda':
 ```
 
 #### facefusion/cuda_graph_helper.py (New File)
-New module providing:
-- `warmup_inference_session()`: Warms up ONNX Runtime sessions for graph capture
+New utility module providing:
+- `warmup_inference_session()`: Available for manual warmup if needed
 - `get_warmup_iterations()`: Returns optimal warmup iteration count
-- Automatic input shape detection and dummy data generation
+- Not currently used - ONNX Runtime auto-capture is preferred
 
 #### facefusion/inference_manager.py
 ```python
-# Added warmup call after model loading
-def create_inference_session(...):
-    ...
-    inference_session = InferenceSession(model_path, providers = inference_session_providers)
-
-    # Warm up the model to trigger CUDA graph capture
-    if has_execution_provider('cuda') and 'cuda' in execution_providers:
-        cuda_graph_helper.warmup_inference_session(inference_session)
-
-    return inference_session
+# Type fixes for proper string/int handling
+def get_inference_context(...):
+    # Ensure execution_device_id is converted to string for cache key
+    inference_context = '.'.join([module_name] + model_names + [str(execution_device_id)] + ...)
 ```
 
 ## How It Works
@@ -81,9 +77,9 @@ def create_inference_session(...):
 
 1. **Model Loading**: When a model is loaded with CUDA execution provider
 2. **Graph Enablement**: `enable_cuda_graph: True` is passed to ONNX Runtime
-3. **Warmup Execution**: The model runs 3 warmup iterations with dummy inputs
-4. **Graph Capture**: ONNX Runtime automatically captures the CUDA graph during warmup
-5. **Graph Replay**: Subsequent inferences replay the captured graph
+3. **First Inferences**: During the first few real inferences with actual data
+4. **Graph Capture**: ONNX Runtime automatically captures the CUDA graph
+5. **Graph Replay**: Subsequent inferences replay the captured graph (fast!)
 
 ### Stages Benefiting from CUDA Graphs
 

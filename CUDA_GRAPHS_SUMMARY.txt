@@ -37,10 +37,10 @@ HOW IT WORKS:
 
 1. When models are loaded with CUDA execution provider
 2. ONNX Runtime is configured with 'enable_cuda_graph': True
-3. Models are warmed up with 3 dummy inference iterations
-4. CUDA graph is automatically captured during warmup
+3. During the first few real inferences, CUDA operations are captured
+4. ONNX Runtime automatically builds and optimizes the CUDA graph
 5. All subsequent inferences replay the captured graph
-6. Result: 20-40% faster inference per model
+6. Result: 20-40% faster inference per model (after initial capture)
 
 ================================================================================
 PERFORMANCE IMPROVEMENTS:
@@ -153,11 +153,12 @@ Memory Overhead:
 - Negligible compared to model weights
 - Total overhead: <1% of GPU memory usage
 
-Warmup Iterations:
-- 3 iterations by default
-- First: JIT compilation
-- Second/Third: Graph capture
-- Subsequent: Graph replay (fast!)
+Graph Capture:
+- Automatic during first few inferences
+- No explicit warmup needed
+- ONNX Runtime captures with real data
+- More robust than dummy data warmup
+- Subsequent inferences: Graph replay (fast!)
 
 ================================================================================
 COMPATIBILITY:
