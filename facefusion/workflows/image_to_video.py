@@ -19,7 +19,7 @@ from facefusion.vision import conditional_merge_vision_mask, detect_video_resolu
 from facefusion.workflows.core import is_process_stopping
 
 
-@lru_cache(maxsize = 8)
+@lru_cache(maxsize = None)
 def _get_cached_reference_frame(target_path: str, reference_frame_number: int) -> Optional[numpy.ndarray]:
 	"""
 	Decode the reference frame once per (target_path, reference_frame_number) combo.
@@ -27,7 +27,7 @@ def _get_cached_reference_frame(target_path: str, reference_frame_number: int) -
 	return read_static_video_frame(target_path, reference_frame_number)
 
 
-@lru_cache(maxsize = 8)
+@lru_cache(maxsize = None)
 def _get_cached_source_frames(source_paths_key: Tuple[str, ...]) -> List[numpy.ndarray]:
 	"""
 	Decode source images once per tuple of paths.
@@ -99,6 +99,10 @@ def process_video() -> ErrorCode:
 	source_audio_path = get_first(filter_audio_paths(list(source_paths)))
 	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
 	temp_frame_paths = resolve_temp_frame_paths(target_path)
+
+	if reference_vision_frame is None:
+		logger.error(translator.get('temp_frames_not_found'), __name__)
+		return 1
 
 	if not temp_frame_paths:
 		logger.error(translator.get('temp_frames_not_found'), __name__)
