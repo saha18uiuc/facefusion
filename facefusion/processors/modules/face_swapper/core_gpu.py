@@ -174,9 +174,18 @@ def swap_face_gpu(
 				target_face.bounding_box,
 				device=device
 			)
-		except Exception:
+		except Exception as e:
 			# Fallback to standard result
+			import traceback
+			print(f"Enhanced blending failed: {e}")
+			traceback.print_exc()
 			pass
+
+	# Ensure output is uint8 in range [0, 255]
+	if paste_vision_frame.dtype == torch.float32:
+		paste_vision_frame = torch.clamp(paste_vision_frame, 0, 255).byte()
+	elif paste_vision_frame.dtype != torch.uint8:
+		paste_vision_frame = paste_vision_frame.byte()
 
 	return paste_vision_frame
 
@@ -260,6 +269,13 @@ def apply_enhanced_blending_gpu(
 	swapped_region = paste_vision_frame[y1:y2, x1:x2]
 	original_region = temp_vision_frame[y1:y2, x1:x2]
 
+	# Convert to float32 for blending
+	original_dtype = paste_vision_frame.dtype
+	if swapped_region.dtype == torch.uint8:
+		swapped_region = swapped_region.float()
+	if original_region.dtype == torch.uint8:
+		original_region = original_region.float()
+
 	# Create mask for this region
 	region_h = y2 - y1
 	region_w = x2 - x1
@@ -275,9 +291,18 @@ def apply_enhanced_blending_gpu(
 	# Blend the corrected region back
 	alpha = 0.7
 	paste_vision_frame = paste_vision_frame.clone()
+
+	# Convert paste_vision_frame to float32 if needed
+	if paste_vision_frame.dtype == torch.uint8:
+		paste_vision_frame = paste_vision_frame.float()
+
 	paste_vision_frame[y1:y2, x1:x2] = (
 		blended_region * alpha + paste_vision_frame[y1:y2, x1:x2] * (1 - alpha)
 	)
+
+	# Convert back to original dtype
+	if original_dtype == torch.uint8:
+		paste_vision_frame = torch.clamp(paste_vision_frame, 0, 255).byte()
 
 	return paste_vision_frame
 

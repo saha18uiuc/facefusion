@@ -31,8 +31,12 @@ def create_box_mask_cuda(
 		device: CUDA device string
 
 	Returns:
-		Box mask as CUDA tensor (H, W)
+		Box mask as CUDA tensor (H, W) in float32 [0, 1]
 	"""
+	# Ensure device is correct
+	if isinstance(crop_vision_frame, torch.Tensor):
+		device = str(crop_vision_frame.device)
+
 	# Get crop size (W, H)
 	h, w = crop_vision_frame.shape[:2]
 
@@ -40,7 +44,7 @@ def create_box_mask_cuda(
 	blur_amount = int(w * 0.5 * face_mask_blur)
 	blur_area = max(blur_amount // 2, 1)
 
-	# Create mask filled with ones
+	# Create mask filled with ones (always float32 for masks)
 	box_mask = torch.ones((h, w), dtype=torch.float32, device=device)
 
 	# Calculate padding in pixels

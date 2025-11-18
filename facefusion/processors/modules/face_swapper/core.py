@@ -978,25 +978,32 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	# Dispatch to GPU or CPU implementation
 	if gpu_available and processing_mode == 'gpu' and is_cuda_tensor(temp_vision_frame):
 		# GPU path: process with GPU tensors
-		from facefusion.processors.modules.face_swapper.core_gpu import process_frame_gpu
-		from facefusion.gpu_types import get_cuda_device
+		try:
+			from facefusion.processors.modules.face_swapper.core_gpu import process_frame_gpu
+			from facefusion.gpu_types import get_cuda_device
 
-		device_ids = state_manager.get_item('execution_device_ids') or ['0']
-		device = get_cuda_device(str(device_ids[0]))
+			device_ids = state_manager.get_item('execution_device_ids') or ['0']
+			device = get_cuda_device(str(device_ids[0]))
 
-		temp_vision_frame_cuda, temp_vision_mask_cuda = process_frame_gpu(inputs, device=device)
+			temp_vision_frame_cuda, temp_vision_mask_cuda = process_frame_gpu(inputs, device=device)
 
-		# Increment frame counter
-		_frame_count += 1
+			# Increment frame counter
+			_frame_count += 1
 
-		# Periodic CUDA memory cleanup
-		if _frame_count % _batch_cleanup_interval == 0:
-			cleanup_cuda_memory(aggressive=False)
+			# Periodic CUDA memory cleanup
+			if _frame_count % _batch_cleanup_interval == 0:
+				cleanup_cuda_memory(aggressive=False)
 
-		if _frame_count % 50 == 0:
-			cleanup_cuda_memory(aggressive=True)
+			if _frame_count % 50 == 0:
+				cleanup_cuda_memory(aggressive=True)
 
-		return temp_vision_frame_cuda, temp_vision_mask_cuda
+			return temp_vision_frame_cuda, temp_vision_mask_cuda
+		except Exception as e:
+			import traceback
+			logger.error(f"GPU processing failed, falling back to CPU: {e}", __name__)
+			traceback.print_exc()
+			# Fall through to CPU path
+			processing_mode = 'cpu'
 	else:
 		# CPU path (original implementation)
 		reference_vision_frame = inputs.get('reference_vision_frame')

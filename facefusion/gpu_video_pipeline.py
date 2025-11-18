@@ -200,61 +200,96 @@ def _process_streaming_frame(bgr_frame: numpy.ndarray,
 	processing_mode = get_processing_mode() if GPU_AVAILABLE else 'cpu'
 
 	if processing_mode == 'gpu' and device is not None:
-		# GPU path: convert to CUDA and keep on GPU throughout
-		bgr_frame_cuda = numpy_to_cuda(bgr_frame, device=device)
-		target_vision_frame = _bgr_to_rgba_cuda(bgr_frame_cuda)
-		temp_vision_frame = target_vision_frame.clone()
-		temp_vision_mask = extract_vision_mask_cuda(temp_vision_frame, device=device)
+		try:
+			# GPU path: convert to CUDA and keep on GPU throughout
+			bgr_frame_cuda = numpy_to_cuda(bgr_frame, device=device)
 
-		# Convert reference and source frames to CUDA once
-		reference_vision_frame_cuda = numpy_to_cuda(reference_vision_frame, device=device)
-		source_vision_frames_cuda = [numpy_to_cuda(frame, device=device) for frame in source_vision_frames]
+			# Ensure uint8 dtype
+			if bgr_frame_cuda.dtype != torch.uint8:
+				bgr_frame_cuda = bgr_frame_cuda.byte()
 
-		source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
+			target_vision_frame = _bgr_to_rgba_cuda(bgr_frame_cuda)
+			temp_vision_frame = target_vision_frame[:, :, :3].clone()  # BGR only for processing
+			temp_vision_mask = extract_vision_mask_cuda(target_vision_frame, device=device)
 
-		# Process with CUDA tensors directly (processors handle CPU conversion internally if needed)
-		for processor_module in processor_modules:
-			# Pass CUDA tensors directly - processor will detect and use GPU path
-			temp_vision_frame, temp_vision_mask = processor_module.process_frame(
-			{
-				'reference_vision_frame': reference_vision_frame,  # NumPy for face detection
-				'source_vision_frames': source_vision_frames,  # NumPy for face detection
-				'source_audio_frame': source_audio_frame,
-				'source_voice_frame': source_voice_frame,
-				'target_vision_frame': cuda_to_numpy(target_vision_frame[:, :, :3]),  # NumPy for face detection
-				'temp_vision_frame': temp_vision_frame[:, :, :3],  # CUDA tensor for processing
-				'temp_vision_mask': temp_vision_mask  # CUDA tensor for processing
-			})
+			source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
 
-			# Outputs should already be CUDA tensors from GPU-aware processor
-			# No need to convert unless processor falls back to CPU
+			# Process with CUDA tensors directly
+			for processor_module in processor_modules:
+				temp_vision_frame, temp_vision_mask = processor_module.process_frame(
+				{
+					'reference_vision_frame': reference_vision_frame,  # NumPy for face detection
+					'source_vision_frames': source_vision_frames,  # NumPy for face detection
+					'source_audio_frame': source_audio_frame,
+					'source_voice_frame': source_voice_frame,
+					'target_vision_frame': cuda_to_numpy(target_vision_frame[:, :, :3]),  # NumPy for face detection
+					'temp_vision_frame': temp_vision_frame,  # CUDA tensor BGR (3 channels)
+					'temp_vision_mask': temp_vision_mask  # CUDA tensor mask
+				})
 
-		temp_vision_frame = conditional_merge_vision_mask_cuda(temp_vision_frame, temp_vision_mask)
-		result_bgr = _rgba_to_bgr_cuda(temp_vision_frame)
+			# Processor returns BGR (3 channels), need to add alpha back for merging
+			if temp_vision_frame.shape[-1] == 3:
+				# Convert BGR back to RGBA by adding mask as alpha channel
+				alpha_channel = (temp_vision_mask * 255.0).byte().unsqueeze(-1) if temp_vision_mask.ndim == 2 else (temp_vision_mask * 255.0).byte()
+				temp_vision_frame = torch.cat([temp_vision_frame, alpha_channel], dim=-1)
 
-		# Convert back to NumPy only at the end for encoder
-		return cuda_to_numpy(result_bgr)
-	else:
-		# CPU path (original implementation)
-		target_vision_frame = _bgr_to_rgba(bgr_frame)
-		temp_vision_frame = target_vision_frame.copy()
-		temp_vision_mask = extract_vision_mask(temp_vision_frame)
-		source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
+			# Now merge mask (updates alpha channel)
+			temp_vision_frame = conditional_merge_vision_mask_cuda(temp_vision_frame, temp_vision_mask)
 
-		for processor_module in processor_modules:
-			temp_vision_frame, temp_vision_mask = processor_module.process_frame(
-			{
-				'reference_vision_frame': reference_vision_frame,
-				'source_vision_frames': source_vision_frames,
-				'source_audio_frame': source_audio_frame,
-				'source_voice_frame': source_voice_frame,
-				'target_vision_frame': target_vision_frame[:, :, :3],
-				'temp_vision_frame': temp_vision_frame[:, :, :3],
-				'temp_vision_mask': temp_vision_mask
-			})
+			# Extract BGR for encoder
+			result_bgr = temp_vision_frame[:, :, :3]
 
-		temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
-		return _rgba_to_bgr(temp_vision_frame)
+			# Ensure uint8 dtype
+			if result_bgr.dtype != torch.uint8:
+				result_bgr = torch.clamp(result_bgr, 0, 255).byte()
+
+			# Validate dimensions
+			if result_bgr.ndim != 3 or result_bgr.shape[-1] != 3:
+				raise ValueError(f"Invalid result dimensions: {result_bgr.shape}, expected (H, W, 3)")
+
+			# Convert back to NumPy for encoder
+			result_np = cuda_to_numpy(result_bgr)
+
+			# Final validation
+			if result_np.dtype != numpy.uint8:
+				result_np = numpy.clip(result_np, 0, 255).astype(numpy.uint8)
+
+			if result_np.shape != (bgr_frame.shape[0], bgr_frame.shape[1], 3):
+				raise ValueError(f"Result shape {result_np.shape} doesn't match input shape {bgr_frame.shape}")
+
+			return result_np
+
+		except Exception as e:
+			logger.error(f"GPU frame processing failed: {e}, falling back to CPU for this frame", __name__)
+			import traceback
+			traceback.print_exc()
+			# Fall through to CPU path
+	# CPU path (original implementation or fallback from GPU error)
+	target_vision_frame = _bgr_to_rgba(bgr_frame)
+	temp_vision_frame = target_vision_frame.copy()
+	temp_vision_mask = extract_vision_mask(temp_vision_frame)
+	source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
+
+	for processor_module in processor_modules:
+		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
+		{
+			'reference_vision_frame': reference_vision_frame,
+			'source_vision_frames': source_vision_frames,
+			'source_audio_frame': source_audio_frame,
+			'source_voice_frame': source_voice_frame,
+			'target_vision_frame': target_vision_frame[:, :, :3],
+			'temp_vision_frame': temp_vision_frame[:, :, :3],
+			'temp_vision_mask': temp_vision_mask
+		})
+
+	temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
+	result_bgr = _rgba_to_bgr(temp_vision_frame)
+
+	# Ensure correct dtype
+	if result_bgr.dtype != numpy.uint8:
+		result_bgr = numpy.clip(result_bgr, 0, 255).astype(numpy.uint8)
+
+	return result_bgr
 
 
 def run_streaming_video_job(start_time: float) -> ErrorCode:

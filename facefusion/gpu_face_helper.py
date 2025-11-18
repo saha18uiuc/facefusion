@@ -37,6 +37,11 @@ def warp_affine_cuda(
 	"""
 	device = frame.device
 	is_grayscale = frame.ndim == 2
+	original_dtype = frame.dtype
+
+	# Convert to float32 for interpolation
+	if frame.dtype == torch.uint8:
+		frame = frame.float()
 
 	# Convert affine matrix to PyTorch tensor on GPU
 	if isinstance(affine_matrix, numpy.ndarray):
@@ -76,9 +81,15 @@ def warp_affine_cuda(
 
 	# Remove batch dimension and permute back
 	if is_grayscale:
-		return output.squeeze(0).squeeze(0)
+		result = output.squeeze(0).squeeze(0)
 	else:
-		return output.squeeze(0).permute(1, 2, 0)
+		result = output.squeeze(0).permute(1, 2, 0)
+
+	# Convert back to original dtype
+	if original_dtype == torch.uint8:
+		result = torch.clamp(result, 0, 255).byte()
+
+	return result
 
 
 def _convert_affine_matrix_to_theta(
@@ -214,14 +225,24 @@ def paste_back_cuda(
 	# Clone temp frame for in-place modification
 	temp_vision_frame = temp_vision_frame.clone()
 
+	# Convert to float32 for blending if needed
+	original_dtype = temp_vision_frame.dtype
+	if temp_vision_frame.dtype == torch.uint8:
+		temp_vision_frame = temp_vision_frame.float()
+		inverse_vision_frame = inverse_vision_frame.float()
+
 	# Extract paste region
 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2, :]
 
-	# Alpha blend
+	# Alpha blend (float32 math)
 	paste_vision_frame = paste_vision_frame * (1 - inverse_vision_mask) + inverse_vision_frame * inverse_vision_mask
 
 	# Paste back
 	temp_vision_frame[y1:y2, x1:x2, :] = paste_vision_frame
+
+	# Convert back to original dtype
+	if original_dtype == torch.uint8:
+		temp_vision_frame = torch.clamp(temp_vision_frame, 0, 255).byte()
 
 	return temp_vision_frame
 
