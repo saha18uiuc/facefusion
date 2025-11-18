@@ -1,5 +1,7 @@
+import os
 import subprocess
-from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from typing import Dict, List, Optional, Tuple
 
 import numpy
 
@@ -171,25 +173,55 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 		logger.error("Failed to start streaming encoder/decoder.", __name__)
 		return 1
 
+	max_workers = state_manager.get_item('execution_thread_count') or os.cpu_count() or 4
+	in_flight : Dict[int, Future] = {}
+	next_to_write = 0
 	frame_number = 0
-	try:
-		while True:
-			raw = decoder.stdout.read(frame_size)
-			if not raw or len(raw) < frame_size:
-				break
 
-			bgr_frame = numpy.frombuffer(raw, dtype = numpy.uint8).reshape((height, width, 3))
-			processed_bgr = _process_streaming_frame(
-				bgr_frame,
-				frame_number,
-				reference_vision_frame,
-				source_vision_frames,
-				processor_modules,
-				source_audio_path,
-				temp_video_fps
-			)
-			encoder.stdin.write(processed_bgr.tobytes())
-			frame_number += 1
+	try:
+		with ThreadPoolExecutor(max_workers = max_workers) as executor:
+			while True:
+				raw = decoder.stdout.read(frame_size)
+				if not raw or len(raw) < frame_size:
+					break
+
+				# Submit frame for processing
+				bgr_frame = numpy.frombuffer(raw, dtype = numpy.uint8).reshape((height, width, 3)).copy()
+				fut = executor.submit(
+					_process_streaming_frame,
+					bgr_frame,
+					frame_number,
+					reference_vision_frame,
+					source_vision_frames,
+					processor_modules,
+					source_audio_path,
+					temp_video_fps
+				)
+				in_flight[frame_number] = fut
+				frame_number += 1
+
+				# Keep in-flight bounded
+				if len(in_flight) >= max_workers * 2:
+					for done in as_completed(list(in_flight.values())):
+						# write in order
+						break
+
+				# Write any completed frames in order
+				while next_to_write in in_flight and in_flight[next_to_write].done():
+					result = in_flight[next_to_write].result()
+					if result is None:
+						return 1
+					encoder.stdin.write(result.tobytes())
+					del in_flight[next_to_write]
+					next_to_write += 1
+
+			# Drain remaining futures
+			for idx in sorted(in_flight.keys()):
+				result = in_flight[idx].result()
+				if result is None:
+					return 1
+				encoder.stdin.write(result.tobytes())
+
 	except Exception as error:
 		logger.error(f"Streaming pipeline failed: {error}", __name__)
 		return 1
