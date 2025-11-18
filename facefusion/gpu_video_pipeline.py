@@ -54,6 +54,9 @@ def _append_trim_args(cmd: List[str], start_sec: Optional[float], end_sec: Optio
 def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: Optional[float], end_sec: Optional[float]) -> subprocess.Popen:
 	# Try CUDA hardware decode first, but don't require hwaccel_output_format
 	# This allows fallback to software decode if CUDA isn't available
+	use_hwscale = state_manager.get_item('prefer_hwscale')
+	use_hwscale = True if use_hwscale is None else bool(use_hwscale)
+
 	cmd = [
 		'ffmpeg',
 		'-hide_banner',
@@ -61,10 +64,15 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 		'-hwaccel', 'cuda',
 		'-hwaccel_device', '0',
 	]
+
+	# Prefer hardware scaling to stay on GPU; fall back to CPU scaling when disabled
+	if use_hwscale:
+		cmd += [ '-hwaccel_output_format', 'cuda' ]
+
 	_append_trim_args(cmd, start_sec, end_sec)
 	cmd += [
 		'-i', input_path,
-		'-vf', f'scale={width}:{height}:flags=lanczos',  # Use regular scale instead of scale_npp
+		'-vf', f"{'scale_npp' if use_hwscale else 'scale'}={width}:{height}:flags=lanczos",
 		'-pix_fmt', 'bgr24',
 		'-f', 'rawvideo',
 		'pipe:1'
