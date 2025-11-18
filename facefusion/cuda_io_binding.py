@@ -97,7 +97,7 @@ class CUDAIOBindingSession:
 					if hasattr(input_tensor, 'flags') and not input_tensor.flags['C_CONTIGUOUS']:
 						input_tensor = numpy.ascontiguousarray(input_tensor)
 
-					# Bind CPU input (let ORT handle host->device copy). Avoid zero-copy path to keep dtype consistent.
+					# Bind CPU input (let ORT handle host->device copy)
 					self.io_binding.bind_cpu_input(input_name, input_tensor)
 
 			# Ensure outputs remain bound to GPU (only binds once unless session recreated)

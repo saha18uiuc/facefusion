@@ -97,13 +97,14 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 				# This includes constant folding, layer fusion, and layout optimizations
 				session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
 
-				# Reduce allocator fragmentation risk on constrained stacks (e.g., Colab)
-				session_options.enable_mem_pattern = False
+					# Reduce allocator fragmentation risk while keeping graphs/IO binding on
+					session_options.enable_mem_pattern = False
+					session_options.enable_mem_reuse = False
 
-				# Enable parallel execution for independent operators
-				parallel_mode = getattr(ExecutionMode, 'ORT_PARALLEL', None)
-				if parallel_mode is not None:
-					session_options.execution_mode = parallel_mode
+					# Enable parallel execution for independent operators
+					parallel_mode = getattr(ExecutionMode, 'ORT_PARALLEL', None)
+					if parallel_mode is not None:
+						session_options.execution_mode = parallel_mode
 				else:
 					logger.warn('ExecutionMode.ORT_PARALLEL not available in this onnxruntime build, keeping default execution mode', __name__)
 
@@ -133,8 +134,7 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 
 		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
 
-		# CUDA graphs enabled via execution.py when compatible
-		# Allow disabling via env if needed, but keep enabled for hyperswap to maximize throughput
+		# CUDA graphs enabled via execution.py when compatible (keep on by default; allow explicit opt-out via env)
 		if has_execution_provider('cuda') and 'cuda' in execution_providers and cuda_graph_manager:
 			if not os.environ.get('FACEFUSION_DISABLE_CUDA_GRAPHS'):
 				if cuda_graph_manager.should_enable_cuda_graphs(model_path):
@@ -142,9 +142,9 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 			else:
 				logger.info('CUDA graphs disabled via FACEFUSION_DISABLE_CUDA_GRAPHS', __name__)
 
-		# Wrap with IO Binding for optimized GPU memory management
-		if has_execution_provider('cuda') and 'cuda' in execution_providers and wrap_session_with_io_binding:
-			if is_hyperswap and os.environ.get('FACEFUSION_DISABLE_HYPERSWAP_IOBIND') == '1':
+		# Wrap with IO Binding for optimized GPU memory management (enable for hyperswap by default, opt-out via env)
+		if is_hyperswap and has_execution_provider('cuda') and 'cuda' in execution_providers and wrap_session_with_io_binding:
+			if os.environ.get('FACEFUSION_DISABLE_HYPERSWAP_IOBIND') == '1':
 				logger.info('Skipping IO Binding for hyperswap due to FACEFUSION_DISABLE_HYPERSWAP_IOBIND', __name__)
 			else:
 				logger.info(f'Attempting to enable IO Binding for {model_file_name}...', __name__)
