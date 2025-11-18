@@ -1,4 +1,5 @@
 import subprocess
+from functools import lru_cache
 from typing import List, Optional, Tuple, Union
 
 import numpy
@@ -24,6 +25,21 @@ try:
 	GPU_AVAILABLE = True
 except ImportError:
 	GPU_AVAILABLE = False
+
+
+@lru_cache(maxsize=8)
+def _ffmpeg_supports_filter(filter_name: str) -> bool:
+	try:
+		result = subprocess.run(
+			['ffmpeg', '-hide_banner', '-v', 'quiet', '-filters'],
+			check=True,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True
+		)
+		return filter_name in result.stdout
+	except Exception:
+		return False
 
 
 def _get_streaming_video_props() -> Tuple[int, int, float, int, int]:
@@ -57,6 +73,18 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 	use_hwscale = state_manager.get_item('prefer_hwscale')
 	use_hwscale = True if use_hwscale is None else bool(use_hwscale)
 
+	# Pick best available scale filter: prefer scale_npp > scale_cuda > scale
+	if use_hwscale:
+		if _ffmpeg_supports_filter('scale_npp'):
+			scale_filter = 'scale_npp'
+		elif _ffmpeg_supports_filter('scale_cuda'):
+			scale_filter = 'scale_cuda'
+		else:
+			use_hwscale = False
+			scale_filter = 'scale'
+	else:
+		scale_filter = 'scale'
+
 	cmd = [
 		'ffmpeg',
 		'-hide_banner',
@@ -72,7 +100,7 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 	_append_trim_args(cmd, start_sec, end_sec)
 	cmd += [
 		'-i', input_path,
-		'-vf', f"{'scale_npp' if use_hwscale else 'scale'}={width}:{height}:flags=lanczos",
+		'-vf', f"{scale_filter}={width}:{height}:flags=lanczos",
 		'-pix_fmt', 'bgr24',
 		'-f', 'rawvideo',
 		'pipe:1'
