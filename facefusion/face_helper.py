@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy
@@ -68,14 +68,22 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
 }
 
 
-def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
+def reset_affine_smoothers() -> None:
+	"""
+	No-op placeholder to satisfy callers that expect a temporal smoother reset.
+	Temporal smoothing was removed to avoid extra runtime.
+	"""
+	return None
+
+
+def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token : Optional[str] = None) -> Matrix:
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
 	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
 	return affine_matrix
 
 
-def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Tuple[VisionFrame, Matrix]:
-	affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size)
+def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token : Optional[str] = None) -> Tuple[VisionFrame, Matrix]:
+	affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size, track_token)
 	crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode = cv2.BORDER_REPLICATE, flags = cv2.INTER_AREA)
 	return crop_vision_frame, affine_matrix
 
@@ -98,7 +106,7 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
 	return crop_vision_frame, affine_matrix
 
 
-def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
+def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix, track_token : Optional[object] = None) -> VisionFrame:
 	paste_bounding_box, paste_matrix = calculate_paste_area(temp_vision_frame, crop_vision_frame, affine_matrix)
 	x1, y1, x2, y2 = paste_bounding_box
 	paste_width = x2 - x1
