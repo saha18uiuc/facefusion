@@ -68,6 +68,17 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
 }
 
 
+def get_warp_template(warp_template : WarpTemplate) -> numpy.ndarray:
+	"""
+	Return the normalized warp template for a given template key.
+	Used by GPU helpers that need direct access to the landmark template.
+	"""
+	template = WARP_TEMPLATE_SET.get(warp_template)
+	if template is None:
+		raise ValueError(f"Unknown warp template: {warp_template}")
+	return template
+
+
 def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
 	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]

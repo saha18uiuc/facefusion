@@ -209,6 +209,8 @@ def _process_streaming_frame(bgr_frame: numpy.ndarray,
 				print(f"[DEBUG] GPU path activated for frame {frame_number}")
 
 			# GPU path: convert to CUDA and keep on GPU throughout
+			if not bgr_frame.flags.writeable:
+				bgr_frame = bgr_frame.copy()
 			bgr_frame_cuda = numpy_to_cuda(bgr_frame, device=device)
 
 			# Ensure uint8 dtype
@@ -243,37 +245,47 @@ def _process_streaming_frame(bgr_frame: numpy.ndarray,
 				if frame_number == 0:
 					print(f"[DEBUG] Processor {idx} returned frame shape: {temp_vision_frame.shape}, mask shape: {temp_vision_mask.shape}")
 
-			# Processor returns BGR (3 channels), need to add alpha back for merging
-			if temp_vision_frame.shape[-1] == 3:
-				# Convert BGR back to RGBA by adding mask as alpha channel
-				alpha_channel = (temp_vision_mask * 255.0).byte().unsqueeze(-1) if temp_vision_mask.ndim == 2 else (temp_vision_mask * 255.0).byte()
-				temp_vision_frame = torch.cat([temp_vision_frame, alpha_channel], dim=-1)
+				# Normalize outputs to CUDA tensors if a processor returned NumPy (happens when GPU path falls back internally)
+				if isinstance(temp_vision_frame, numpy.ndarray):
+					temp_vision_frame = numpy_to_cuda(temp_vision_frame, device=device)
+				if isinstance(temp_vision_mask, numpy.ndarray):
+					temp_vision_mask = numpy_to_cuda(temp_vision_mask, device=device).float() / 255.0
 
-			# Now merge mask (updates alpha channel)
-			temp_vision_frame = conditional_merge_vision_mask_cuda(temp_vision_frame, temp_vision_mask)
+				# Processor returns BGR (3 channels), need to add alpha back for merging
+				if temp_vision_frame.shape[-1] == 3:
+					# Convert BGR back to RGBA by adding mask as alpha channel
+					if isinstance(temp_vision_mask, torch.Tensor):
+						alpha_channel = (temp_vision_mask * 255.0).byte().unsqueeze(-1) if temp_vision_mask.ndim == 2 else (temp_vision_mask * 255.0).byte()
+					else:
+						alpha_np = (temp_vision_mask * 255.0).astype(numpy.uint8)
+						alpha_channel = numpy_to_cuda(alpha_np, device=device).unsqueeze(-1)
+					temp_vision_frame = torch.cat([temp_vision_frame, alpha_channel], dim=-1)
 
-			# Extract BGR for encoder
-			result_bgr = temp_vision_frame[:, :, :3]
+				# Now merge mask (updates alpha channel)
+				temp_vision_frame = conditional_merge_vision_mask_cuda(temp_vision_frame, temp_vision_mask if isinstance(temp_vision_mask, torch.Tensor) else numpy_to_cuda(temp_vision_mask, device=device))
 
-			# Ensure uint8 dtype
-			if result_bgr.dtype != torch.uint8:
-				result_bgr = torch.clamp(result_bgr, 0, 255).byte()
+				# Extract BGR for encoder
+				result_bgr = temp_vision_frame[:, :, :3]
 
-			# Validate dimensions
-			if result_bgr.ndim != 3 or result_bgr.shape[-1] != 3:
-				raise ValueError(f"Invalid result dimensions: {result_bgr.shape}, expected (H, W, 3)")
+				# Ensure uint8 dtype
+				if result_bgr.dtype != torch.uint8:
+					result_bgr = torch.clamp(result_bgr, 0, 255).byte()
 
-			# Convert back to NumPy for encoder
-			result_np = cuda_to_numpy(result_bgr)
+				# Validate dimensions
+				if result_bgr.ndim != 3 or result_bgr.shape[-1] != 3:
+					raise ValueError(f"Invalid result dimensions: {result_bgr.shape}, expected (H, W, 3)")
 
-			# Final validation
-			if result_np.dtype != numpy.uint8:
-				result_np = numpy.clip(result_np, 0, 255).astype(numpy.uint8)
+				# Convert back to NumPy for encoder
+				result_np = cuda_to_numpy(result_bgr)
 
-			if result_np.shape != (bgr_frame.shape[0], bgr_frame.shape[1], 3):
-				raise ValueError(f"Result shape {result_np.shape} doesn't match input shape {bgr_frame.shape}")
+				# Final validation
+				if result_np.dtype != numpy.uint8:
+					result_np = numpy.clip(result_np, 0, 255).astype(numpy.uint8)
 
-			return result_np
+				if result_np.shape != (bgr_frame.shape[0], bgr_frame.shape[1], 3):
+					raise ValueError(f"Result shape {result_np.shape} doesn't match input shape {bgr_frame.shape}")
+
+				return result_np
 
 		except Exception as e:
 			logger.error(f"GPU frame processing failed: {e}, falling back to CPU for this frame", __name__)
