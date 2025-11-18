@@ -61,7 +61,7 @@ def warp_affine_cuda(
 		input_size=(frame.shape[1], frame.shape[0]),  # (W, H)
 		output_size=output_size
 	)
-	theta = theta.unsqueeze(0)  # Add batch dimension
+	theta = theta.unsqueeze(0).to(frame_nchw.dtype)  # Add batch dimension and match dtype
 
 	# Create sampling grid
 	grid = F.affine_grid(
