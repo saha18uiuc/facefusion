@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache, partial
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple
 
 import numpy
 from tqdm import tqdm
@@ -17,11 +17,6 @@ from facefusion.time_helper import calculate_end_time
 from facefusion.types import ErrorCode
 from facefusion.vision import conditional_merge_vision_mask, detect_video_resolution, extract_vision_mask, pack_resolution, read_static_image, read_static_images, read_static_video_frame, restrict_trim_frame, restrict_video_fps, restrict_video_resolution, scale_resolution, write_image
 from facefusion.workflows.core import is_process_stopping
-
-# Runtime caches (per job)
-_RUNTIME_SOURCE_AUDIO_PATH: Optional[str] = None
-_RUNTIME_TEMP_VIDEO_FPS: Optional[float] = None
-_RUNTIME_PROCESSOR_MODULES: List[Any] = []
 
 
 @lru_cache(maxsize = 8)
@@ -93,8 +88,16 @@ def extract_frames() -> ErrorCode:
 
 
 def process_video() -> ErrorCode:
-	_prepare_runtime_cache()
 	target_path = state_manager.get_item('target_path')
+	reference_frame_number = state_manager.get_item('reference_frame_number')
+	source_paths = tuple(state_manager.get_item('source_paths') or [])
+	processors = list(get_processors_modules(state_manager.get_item('processors')))
+
+	# One-time decode per job.
+	reference_vision_frame = _get_cached_reference_frame(target_path, reference_frame_number)
+	source_vision_frames = _get_cached_source_frames(source_paths)
+	source_audio_path = get_first(filter_audio_paths(list(source_paths)))
+	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
 	temp_frame_paths = resolve_temp_frame_paths(target_path)
 
 	if not temp_frame_paths:
@@ -109,9 +112,14 @@ def process_video() -> ErrorCode:
 
 			for frame_number, temp_frame_path in enumerate(temp_frame_paths):
 				future = executor.submit(
-					process_temp_frame,
+					process_temp_frame_worker,
 					temp_frame_path,
-					frame_number
+					frame_number,
+					reference_vision_frame,
+					source_vision_frames,
+					source_audio_path,
+					temp_video_fps,
+					processors
 				)
 				futures.append(future)
 
@@ -125,7 +133,7 @@ def process_video() -> ErrorCode:
 					future.result()
 					progress.update()
 
-	for processor_module in _RUNTIME_PROCESSOR_MODULES:
+	for processor_module in processors:
 		processor_module.post_process()
 
 	if is_process_stopping():
@@ -192,16 +200,6 @@ def finalize_video(start_time : float) -> ErrorCode:
 	return 0
 
 
-def _prepare_runtime_cache() -> None:
-	global _RUNTIME_SOURCE_AUDIO_PATH, _RUNTIME_TEMP_VIDEO_FPS, _RUNTIME_PROCESSOR_MODULES
-	target_path = state_manager.get_item('target_path')
-	source_paths = state_manager.get_item('source_paths') or []
-
-	_RUNTIME_SOURCE_AUDIO_PATH = get_first(filter_audio_paths(source_paths))
-	_RUNTIME_TEMP_VIDEO_FPS = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
-	_RUNTIME_PROCESSOR_MODULES = list(get_processors_modules(state_manager.get_item('processors')))
-
-
 def _resolve_audio_frames(source_audio_path : Optional[str], temp_video_fps : float, frame_number : int) -> Tuple[numpy.ndarray, numpy.ndarray]:
 	"""
 	Load (or create empty) audio and voice frames for the current frame index.
@@ -222,7 +220,8 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
                           reference_vision_frame : numpy.ndarray,
                           source_vision_frames : List[numpy.ndarray],
                           source_audio_path : Optional[str],
-                          temp_video_fps : float) -> numpy.ndarray:
+                          temp_video_fps : float,
+                          processor_modules : List) -> numpy.ndarray:
 	"""
 	Per-frame logic that works on already-decoded inputs; returns processed frame.
 	"""
@@ -230,7 +229,6 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 	temp_vision_mask = extract_vision_mask(temp_vision_frame)
 	source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
 
-	processor_modules = _RUNTIME_PROCESSOR_MODULES or list(get_processors_modules(state_manager.get_item('processors')))
 	for processor_module in processor_modules:
 		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
 		{
@@ -246,21 +244,15 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 	return conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
 
 
-def process_temp_frame(temp_frame_path: str, frame_number: int) -> bool:
-	target_path = state_manager.get_item('target_path')
-	reference_frame_number = state_manager.get_item('reference_frame_number')
-	source_paths = tuple(state_manager.get_item('source_paths') or [])
-	source_audio_path = _RUNTIME_SOURCE_AUDIO_PATH
-	temp_video_fps = _RUNTIME_TEMP_VIDEO_FPS if _RUNTIME_TEMP_VIDEO_FPS is not None else restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
-
+def process_temp_frame_worker(temp_frame_path: str,
+                              frame_number: int,
+                              reference_vision_frame: numpy.ndarray,
+                              source_vision_frames: List[numpy.ndarray],
+                              source_audio_path: Optional[str],
+                              temp_video_fps: float,
+                              processor_modules: List[Any]) -> bool:
 	target_vision_frame = read_static_image(temp_frame_path, 'rgba')
-	if target_vision_frame is None:
-		return False
-
-	reference_vision_frame = _get_cached_reference_frame(target_path, reference_frame_number)
-	source_vision_frames = _get_cached_source_frames(source_paths)
-
-	if reference_vision_frame is None:
+	if target_vision_frame is None or reference_vision_frame is None:
 		return False
 
 	processed_frame = process_frame_runtime(
@@ -269,6 +261,7 @@ def process_temp_frame(temp_frame_path: str, frame_number: int) -> bool:
 		reference_vision_frame,
 		source_vision_frames,
 		source_audio_path,
-		temp_video_fps
+		temp_video_fps,
+		processor_modules
 	)
 	return write_image(temp_frame_path, processed_frame)
