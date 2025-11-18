@@ -1,0 +1,4364 @@
+diff --git a/facefusion/__init__.py b/facefusion/__init__.py
+index 053c17b..e69de29 100644
+--- a/facefusion/__init__.py
++++ b/facefusion/__init__.py
+@@ -1,12 +0,0 @@
+-"""FaceFusion package initialisation."""
+-from __future__ import annotations
+-
+-import os
+-
+-# Configure PyTorch CUDA allocator to reduce fragmentation stalls when many
+-# small kernels are launched (recommended in performance tuning guidance).
+-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128,expandable_segments:True')
+-
+-# Expose version metadata if needed by clients.
+-__all__ = ['__version__']
+-__version__ = '3.4.0-enhanced'
+diff --git a/facefusion/args.py b/facefusion/args.py
+index 6cf64ae..1f574c9 100644
+--- a/facefusion/args.py
++++ b/facefusion/args.py
+@@ -57,12 +57,6 @@ def apply_args(args : Args, apply_state_item : ApplyStateItem) -> None:
+ 	apply_state_item('face_detector_size', args.get('face_detector_size'))
+ 	apply_state_item('face_detector_angles', args.get('face_detector_angles'))
+ 	apply_state_item('face_detector_score', args.get('face_detector_score'))
+-	# face tracker
+-	apply_state_item('enable_face_tracking', args.get('enable_face_tracking'))
+-	apply_state_item('face_tracker_detection_interval', args.get('face_tracker_detection_interval'))
+-	apply_state_item('face_tracker_max_missed', args.get('face_tracker_max_missed'))
+-	apply_state_item('face_tracker_min_points', args.get('face_tracker_min_points'))
+-	apply_state_item('face_tracker_match_iou', args.get('face_tracker_match_iou'))
+ 	# face landmarker
+ 	apply_state_item('face_landmarker_model', args.get('face_landmarker_model'))
+ 	apply_state_item('face_landmarker_score', args.get('face_landmarker_score'))
+@@ -117,7 +111,6 @@ def apply_args(args : Args, apply_state_item : ApplyStateItem) -> None:
+ 	apply_state_item('execution_device_ids', args.get('execution_device_ids'))
+ 	apply_state_item('execution_providers', args.get('execution_providers'))
+ 	apply_state_item('execution_thread_count', args.get('execution_thread_count'))
+-	apply_state_item('enable_streaming_pipeline', args.get('enable_streaming_pipeline'))
+ 	# download
+ 	apply_state_item('download_providers', args.get('download_providers'))
+ 	apply_state_item('download_scope', args.get('download_scope'))
+@@ -130,7 +123,6 @@ def apply_args(args : Args, apply_state_item : ApplyStateItem) -> None:
+ 	apply_state_item('system_memory_limit', args.get('system_memory_limit'))
+ 	# misc
+ 	apply_state_item('log_level', args.get('log_level'))
+-	apply_state_item('skip_content_analysis', args.get('skip_content_analysis'))
+ 	apply_state_item('halt_on_error', args.get('halt_on_error'))
+ 	# jobs
+ 	apply_state_item('job_id', args.get('job_id'))
+diff --git a/facefusion/choices.py b/facefusion/choices.py
+index 578aab9..5403ce0 100755
+--- a/facefusion/choices.py
++++ b/facefusion/choices.py
+@@ -164,7 +164,3 @@ output_audio_quality_range : Sequence[int] = create_int_range(0, 100, 1)
+ output_audio_volume_range : Sequence[int] = create_int_range(0, 100, 1)
+ output_video_quality_range : Sequence[int] = create_int_range(0, 100, 1)
+ output_video_scale_range : Sequence[float] = create_float_range(0.25, 8.0, 0.25)
+-face_tracker_detection_interval_range : Sequence[int] = create_int_range(1, 30, 1)
+-face_tracker_max_missed_range : Sequence[int] = create_int_range(0, 10, 1)
+-face_tracker_min_points_range : Sequence[int] = create_int_range(5, 68, 1)
+-face_tracker_match_iou_range : Sequence[float] = create_float_range(0.1, 0.9, 0.05)
+diff --git a/facefusion/core.py b/facefusion/core.py
+index e02e001..c8cd164 100755
+--- a/facefusion/core.py
++++ b/facefusion/core.py
+@@ -2,26 +2,21 @@ import inspect
+ import itertools
+ import shutil
+ import signal
+-import subprocess
+ import sys
+-from collections import deque
+-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+-from functools import lru_cache
++from concurrent.futures import ThreadPoolExecutor, as_completed
+ from time import time
+-from typing import Callable, Deque, Iterator, List, Optional, Tuple
+ 
+-import cv2
+ import numpy
+ from tqdm import tqdm
+ 
+-from facefusion import benchmarker, cli_helper, content_analyser, face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, gpu_video_pipeline, hash_helper, logger, process_manager, state_manager, video_manager, voice_extractor, wording
++from facefusion import benchmarker, cli_helper, content_analyser, face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, hash_helper, logger, process_manager, state_manager, video_manager, voice_extractor, wording
+ from facefusion.args import apply_args, collect_job_args, reduce_job_args, reduce_step_args
+ from facefusion.audio import create_empty_audio_frame, get_audio_frame, get_voice_frame
+ from facefusion.common_helper import get_first
+ from facefusion.content_analyser import analyse_image, analyse_video
+ from facefusion.download import conditional_download_hashes, conditional_download_sources
+ from facefusion.exit_helper import hard_exit, signal_exit
+-from facefusion.ffmpeg import copy_image, extract_frames, finalize_image, merge_video, open_rawvideo_writer, replace_audio, restore_audio
++from facefusion.ffmpeg import copy_image, extract_frames, finalize_image, merge_video, replace_audio, restore_audio
+ from facefusion.filesystem import filter_audio_paths, get_file_name, is_image, is_video, resolve_file_paths, resolve_file_pattern
+ from facefusion.jobs import job_helper, job_manager, job_runner
+ from facefusion.jobs.job_list import compose_job_list
+@@ -32,7 +27,7 @@ from facefusion.program_helper import validate_args
+ from facefusion.temp_helper import clear_temp_directory, create_temp_directory, get_temp_file_path, move_temp_file, resolve_temp_frame_paths
+ from facefusion.time_helper import calculate_end_time
+ from facefusion.types import Args, ErrorCode
+-from facefusion.vision import detect_image_resolution, detect_video_resolution, pack_resolution, predict_video_frame_total, read_static_image, read_static_images, read_static_video_frame, restrict_image_resolution, restrict_trim_frame, restrict_video_fps, restrict_video_resolution, scale_resolution, write_image
++from facefusion.vision import detect_image_resolution, detect_video_resolution, pack_resolution, read_static_image, read_static_images, read_static_video_frame, restrict_image_resolution, restrict_trim_frame, restrict_video_fps, restrict_video_resolution, scale_resolution, write_image
+ 
+ 
+ def cli() -> None:
+@@ -354,7 +349,7 @@ def conditional_process() -> ErrorCode:
+ 
+ 
+ def process_image(start_time : float) -> ErrorCode:
+-	if not state_manager.get_item('skip_content_analysis') and analyse_image(state_manager.get_item('target_path')):
++	if analyse_image(state_manager.get_item('target_path')):
+ 		return 3
+ 
+ 	logger.debug(wording.get('clearing_temp'), __name__)
+@@ -384,6 +379,7 @@ def process_image(start_time : float) -> ErrorCode:
+ 
+ 	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+ 		logger.info(wording.get('processing'), processor_module.__name__)
++
+ 		temp_vision_frame = processor_module.process_frame(
+ 		{
+ 			'reference_vision_frame': reference_vision_frame,
+@@ -393,6 +389,7 @@ def process_image(start_time : float) -> ErrorCode:
+ 			'target_vision_frame': target_vision_frame,
+ 			'temp_vision_frame': temp_vision_frame
+ 		})
++
+ 		processor_module.post_process()
+ 
+ 	write_image(temp_image_path, temp_vision_frame)
+@@ -420,7 +417,7 @@ def process_image(start_time : float) -> ErrorCode:
+ 
+ def process_video(start_time : float) -> ErrorCode:
+ 	trim_frame_start, trim_frame_end = restrict_trim_frame(state_manager.get_item('target_path'), state_manager.get_item('trim_frame_start'), state_manager.get_item('trim_frame_end'))
+-	if not state_manager.get_item('skip_content_analysis') and analyse_video(state_manager.get_item('target_path'), trim_frame_start, trim_frame_end):
++	if analyse_video(state_manager.get_item('target_path'), trim_frame_start, trim_frame_end):
+ 		return 3
+ 
+ 	logger.debug(wording.get('clearing_temp'), __name__)
+@@ -432,71 +429,58 @@ def process_video(start_time : float) -> ErrorCode:
+ 	output_video_resolution = scale_resolution(detect_video_resolution(state_manager.get_item('target_path')), state_manager.get_item('output_video_scale'))
+ 	temp_video_resolution = restrict_video_resolution(state_manager.get_item('target_path'), output_video_resolution)
+ 	temp_video_fps = restrict_video_fps(state_manager.get_item('target_path'), state_manager.get_item('output_video_fps'))
+-	streaming_used = False
+-	if _can_use_streaming_pipeline():
+-		logger.info('Streaming frames directly through CUDA pipeline', __name__)
+-		streaming_used = process_video_streaming(temp_video_resolution, temp_video_fps, trim_frame_start, trim_frame_end)
+-		if streaming_used:
+-			logger.debug('Streaming pipeline completed successfully', __name__)
+-		else:
+-			logger.info('Streaming pipeline unavailable or failed; falling back to legacy extraction', __name__)
+-
+-	if not streaming_used:
+-		logger.info(wording.get('extracting_frames').format(resolution = pack_resolution(temp_video_resolution), fps = temp_video_fps), __name__)
++	logger.info(wording.get('extracting_frames').format(resolution = pack_resolution(temp_video_resolution), fps = temp_video_fps), __name__)
+ 
+-		if extract_frames(state_manager.get_item('target_path'), temp_video_resolution, temp_video_fps, trim_frame_start, trim_frame_end):
+-			logger.debug(wording.get('extracting_frames_succeeded'), __name__)
+-		else:
+-			if is_process_stopping():
+-				return 4
+-			logger.error(wording.get('extracting_frames_failed'), __name__)
+-			process_manager.end()
+-			return 1
+-
+-		temp_frame_paths = resolve_temp_frame_paths(state_manager.get_item('target_path'))
++	if extract_frames(state_manager.get_item('target_path'), temp_video_resolution, temp_video_fps, trim_frame_start, trim_frame_end):
++		logger.debug(wording.get('extracting_frames_succeeded'), __name__)
++	else:
++		if is_process_stopping():
++			return 4
++		logger.error(wording.get('extracting_frames_failed'), __name__)
++		process_manager.end()
++		return 1
+ 
+-		if temp_frame_paths:
+-			with tqdm(total = len(temp_frame_paths), desc = wording.get('processing'), unit = 'frame', ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
+-				progress.set_postfix(execution_providers = state_manager.get_item('execution_providers'))
++	temp_frame_paths = resolve_temp_frame_paths(state_manager.get_item('target_path'))
+ 
+-				with ThreadPoolExecutor(max_workers = state_manager.get_item('execution_thread_count')) as executor:
+-					futures = []
++	if temp_frame_paths:
++		with tqdm(total = len(temp_frame_paths), desc = wording.get('processing'), unit = 'frame', ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
++			progress.set_postfix(execution_providers = state_manager.get_item('execution_providers'))
+ 
+-					for frame_number, temp_frame_path in enumerate(temp_frame_paths):
+-						future = executor.submit(process_temp_frame, temp_frame_path, frame_number)
+-						futures.append(future)
++			with ThreadPoolExecutor(max_workers = state_manager.get_item('execution_thread_count')) as executor:
++				futures = []
+ 
+-					for future in as_completed(futures):
+-						if is_process_stopping():
+-							for __future__ in futures:
+-								__future__.cancel()
++				for frame_number, temp_frame_path in enumerate(temp_frame_paths):
++					future = executor.submit(process_temp_frame, temp_frame_path, frame_number)
++					futures.append(future)
+ 
+-						if not future.cancelled():
+-							future.result()
+-							progress.update()
++				for future in as_completed(futures):
++					if is_process_stopping():
++						for __future__ in futures:
++							__future__.cancel()
+ 
+-			if is_process_stopping():
+-				return 4
+-		else:
+-			logger.error(wording.get('temp_frames_not_found'), __name__)
+-			process_manager.end()
+-			return 1
++					if not future.cancelled():
++						future.result()
++						progress.update()
+ 
+-		logger.info(wording.get('merging_video').format(resolution = pack_resolution(output_video_resolution), fps = state_manager.get_item('output_video_fps')), __name__)
+-		if merge_video(state_manager.get_item('target_path'), temp_video_fps, output_video_resolution, state_manager.get_item('output_video_fps'), trim_frame_start, trim_frame_end):
+-			logger.debug(wording.get('merging_video_succeeded'), __name__)
+-		else:
+-			if is_process_stopping():
+-				return 4
+-			logger.error(wording.get('merging_video_failed'), __name__)
+-			process_manager.end()
+-			return 1
++		for processor_module in get_processors_modules(state_manager.get_item('processors')):
++			processor_module.post_process()
+ 
+-	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+-		processor_module.post_process()
++		if is_process_stopping():
++			return 4
++	else:
++		logger.error(wording.get('temp_frames_not_found'), __name__)
++		process_manager.end()
++		return 1
+ 
+-	if is_process_stopping():
+-		return 4
++	logger.info(wording.get('merging_video').format(resolution = pack_resolution(output_video_resolution), fps = state_manager.get_item('output_video_fps')), __name__)
++	if merge_video(state_manager.get_item('target_path'), temp_video_fps, output_video_resolution, state_manager.get_item('output_video_fps'), trim_frame_start, trim_frame_end):
++		logger.debug(wording.get('merging_video_succeeded'), __name__)
++	else:
++		if is_process_stopping():
++			return 4
++		logger.error(wording.get('merging_video_failed'), __name__)
++		process_manager.end()
++		return 1
+ 
+ 	if state_manager.get_item('output_audio_volume') == 0:
+ 		logger.info(wording.get('skipping_audio'), __name__)
+@@ -537,34 +521,21 @@ def process_video(start_time : float) -> ErrorCode:
+ 	return 0
+ 
+ 
+-@lru_cache(maxsize = None)
+-def _cached_reference_frame(target_path : str, reference_frame_number : int) -> numpy.ndarray:
+-	return read_static_video_frame(target_path, reference_frame_number)
+-
+-
+-@lru_cache(maxsize = None)
+-def _cached_source_frames(source_paths : Tuple[str, ...]) -> List[numpy.ndarray]:
+-	return read_static_images(list(source_paths))
+-
++def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
++	reference_vision_frame = read_static_video_frame(state_manager.get_item('target_path'), state_manager.get_item('reference_frame_number'))
++	source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
++	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
++	temp_video_fps = restrict_video_fps(state_manager.get_item('target_path'), state_manager.get_item('output_video_fps'))
++	target_vision_frame = read_static_image(temp_frame_path)
++	temp_vision_frame = target_vision_frame.copy()
+ 
+-def _resolve_audio_frames(source_audio_path : Optional[str], temp_video_fps : float, frame_number : int) -> Tuple[numpy.ndarray, numpy.ndarray]:
+-	if source_audio_path:
+-		source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number)
+-		source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number)
+-	else:
+-		source_audio_frame = create_empty_audio_frame()
+-		source_voice_frame = create_empty_audio_frame()
++	source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number)
++	source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number)
+ 
+ 	if not numpy.any(source_audio_frame):
+ 		source_audio_frame = create_empty_audio_frame()
+ 	if not numpy.any(source_voice_frame):
+ 		source_voice_frame = create_empty_audio_frame()
+-	return source_audio_frame, source_voice_frame
+-
+-
+-def process_frame_runtime(target_vision_frame : numpy.ndarray, frame_number : int, reference_vision_frame : numpy.ndarray, source_vision_frames : List[numpy.ndarray], source_audio_path : Optional[str], temp_video_fps : float) -> numpy.ndarray:
+-	temp_vision_frame = target_vision_frame.copy()
+-	source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
+ 
+ 	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+ 		temp_vision_frame = processor_module.process_frame(
+@@ -576,20 +547,8 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray, frame_number : in
+ 			'target_vision_frame': target_vision_frame,
+ 			'temp_vision_frame': temp_vision_frame
+ 		})
+-	return temp_vision_frame
+-
+ 
+-def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
+-	target_path = state_manager.get_item('target_path')
+-	reference_number = state_manager.get_item('reference_frame_number')
+-	reference_vision_frame = _cached_reference_frame(target_path, reference_number)
+-	source_paths = tuple(state_manager.get_item('source_paths') or [])
+-	source_vision_frames = _cached_source_frames(source_paths)
+-	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
+-	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
+-	target_vision_frame = read_static_image(temp_frame_path)
+-	processed_frame = process_frame_runtime(target_vision_frame, frame_number, reference_vision_frame, source_vision_frames, source_audio_path, temp_video_fps)
+-	return write_image(temp_frame_path, processed_frame)
++	return write_image(temp_frame_path, temp_vision_frame)
+ 
+ 
+ def is_process_stopping() -> bool:
+@@ -597,288 +556,3 @@ def is_process_stopping() -> bool:
+ 		process_manager.end()
+ 		logger.info(wording.get('processing_stopped'), __name__)
+ 	return process_manager.is_pending()
+-
+-
+-def _can_use_streaming_pipeline() -> bool:
+-	if not state_manager.get_item('enable_streaming_pipeline'):
+-		return False
+-	if gpu_video_pipeline.is_available():
+-		return True
+-	try:
+-		import av  # type: ignore
+-		return True
+-	except Exception:
+-		logger.debug('Streaming pipeline disabled because GPU pipeline and PyAV are unavailable', __name__)
+-		return False
+-
+-
+-def _flush_stream_future(inflight : Deque[Tuple[int, Future[numpy.ndarray]]], writer : subprocess.Popen[bytes], progress : tqdm) -> bool:
+-	frame_number, future = inflight.popleft()
+-	if future.cancelled():
+-		return False
+-	frame_data = future.result()
+-	if frame_data.dtype != numpy.uint8:
+-		frame_data = frame_data.clip(0, 255).astype(numpy.uint8)
+-	if writer.stdin:
+-		writer.stdin.write(frame_data.tobytes())
+-	progress.update()
+-	return True
+-
+-
+-def _build_stream_generator_pyav(target_path : str, temp_video_resolution : Tuple[int, int], temp_video_fps : float, trim_frame_start : int, trim_frame_end : int) -> Optional[Tuple[Iterator[Tuple[int, numpy.ndarray]], Callable[[], None]]]:
+-	try:
+-		import av  # type: ignore
+-	except Exception:
+-		return None
+-
+-	container = av.open(target_path)
+-	video_stream = next((stream for stream in container.streams if stream.type == 'video'), None)
+-	if video_stream is None:
+-		container.close()
+-		return None
+-	video_stream.thread_type = 'AUTO'
+-
+-	width, height = temp_video_resolution
+-
+-	def iterator() -> Iterator[Tuple[int, numpy.ndarray]]:
+-		frame_index = -1
+-		for frame in container.decode(video = video_stream.index):
+-			frame_index += 1
+-			if trim_frame_start and frame_index < trim_frame_start:
+-				continue
+-			if trim_frame_end and frame_index > trim_frame_end:
+-				break
+-			frame_ndarray = frame.to_ndarray(format = 'bgr24')
+-			if frame_ndarray.shape[0] != height or frame_ndarray.shape[1] != width:
+-				frame_ndarray = cv2.resize(frame_ndarray, (width, height), interpolation = cv2.INTER_AREA)
+-			yield frame_index, frame_ndarray
+-
+-	def cleanup() -> None:
+-		container.close()
+-
+-	return iterator(), cleanup
+-
+-
+-def _build_stream_generator_ffmpeg(target_path : str, temp_video_resolution : Tuple[int, int], temp_video_fps : float, trim_frame_start : int, trim_frame_end : int) -> Optional[Tuple[Iterator[Tuple[int, numpy.ndarray]], Callable[[], None]]]:
+-	ffmpeg_bin = shutil.which('ffmpeg')
+-	if not ffmpeg_bin:
+-		return None
+-	width, height = temp_video_resolution
+-	filters : List[str] = []
+-	trim_parts : List[str] = []
+-	if isinstance(trim_frame_start, int) and trim_frame_start > 0:
+-		trim_parts.append(f'start_frame={trim_frame_start}')
+-	if isinstance(trim_frame_end, int) and trim_frame_end > 0:
+-		trim_parts.append(f'end_frame={trim_frame_end}')
+-	if trim_parts:
+-		filters.append('trim=' + ':'.join(trim_parts))
+-	filters.append(f'fps={temp_video_fps}')
+-	filters.append(f'scale={width}:{height}')
+-	filter_str = ','.join(filters)
+-	command : List[str] = [
+-		ffmpeg_bin,
+-		'-loglevel', 'error',
+-		'-i', target_path,
+-		'-an',
+-		'-vsync', '0'
+-	]
+-	if filter_str:
+-		command.extend(['-vf', filter_str])
+-	command.extend(['-pix_fmt', 'bgr24', '-f', 'rawvideo', '-'])
+-
+-	process = subprocess.Popen(command, stdout = subprocess.PIPE)
+-	if process.stdout is None:
+-		process.terminate()
+-		return None
+-	frame_size = width * height * 3
+-
+-	def iterator() -> Iterator[Tuple[int, numpy.ndarray]]:
+-		frame_index = -1
+-		while True:
+-			if is_process_stopping():
+-				break
+-			buffer = process.stdout.read(frame_size)
+-			if not buffer or len(buffer) < frame_size:
+-				break
+-			frame_index += 1
+-			frame_array = numpy.frombuffer(buffer, dtype = numpy.uint8)
+-			frame_ndarray = frame_array.reshape((height, width, 3))
+-			yield frame_index, frame_ndarray
+-
+-	def cleanup() -> None:
+-		if process.stdout:
+-			try:
+-				process.stdout.close()
+-			except Exception:
+-				pass
+-		if process.poll() is None:
+-			try:
+-				process.terminate()
+-			except Exception:
+-				pass
+-		try:
+-			process.wait()
+-		except Exception:
+-			pass
+-
+-	return iterator(), cleanup
+-
+-
+-def _run_streaming_loop(
+-	frame_iterator : Iterator[Tuple[int, numpy.ndarray]],
+-	cleanup : Callable[[], None],
+-	writer : subprocess.Popen[bytes],
+-	frame_total : int,
+-	providers : List[str],
+-	pipeline_depth : int,
+-	reference_vision_frame : numpy.ndarray,
+-	source_vision_frames : List[numpy.ndarray],
+-	source_audio_path : Optional[str],
+-	temp_video_fps : float
+-) -> int:
+-	processed = 0
+-	inflight : Deque[Tuple[int, Future[numpy.ndarray]]] = deque()
+-
+-	try:
+-		with tqdm(total = frame_total, desc = wording.get('processing'), unit = 'frame', ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
+-			progress.set_postfix(execution_providers = providers)
+-			with ThreadPoolExecutor(max_workers = pipeline_depth) as executor:
+-				for frame_index, frame_ndarray in frame_iterator:
+-					if is_process_stopping():
+-						break
+-					future = executor.submit(process_frame_runtime, frame_ndarray, frame_index, reference_vision_frame, source_vision_frames, source_audio_path, temp_video_fps)
+-					inflight.append((frame_index, future))
+-					while len(inflight) >= pipeline_depth:
+-						if is_process_stopping():
+-							break
+-						if not _flush_stream_future(inflight, writer, progress):
+-							break
+-						processed += 1
+-			if not is_process_stopping():
+-				while inflight:
+-					if not _flush_stream_future(inflight, writer, progress):
+-						break
+-					processed += 1
+-	finally:
+-		for _, future in inflight:
+-			future.cancel()
+-		cleanup()
+-
+-	return processed
+-def process_video_streaming(temp_video_resolution : Tuple[int, int], temp_video_fps : float, trim_frame_start : int, trim_frame_end : int) -> bool:
+-	target_path = state_manager.get_item('target_path')
+-	temp_video_path = get_temp_file_path(target_path)
+-	if gpu_video_pipeline.is_available():
+-		try:
+-			processed = _process_video_gpu_pipeline(
+-				target_path,
+-				temp_video_path,
+-				temp_video_resolution,
+-				temp_video_fps,
+-				trim_frame_start,
+-				trim_frame_end
+-			)
+-		except Exception as exception:
+-			logger.debug(f'GPU streaming pipeline failed: {exception}', __name__)
+-			processed = 0
+-		if processed > 0:
+-			return True
+-
+-	writer = open_rawvideo_writer(temp_video_path, temp_video_resolution, temp_video_fps)
+-	if writer is None or writer.stdin is None:
+-		logger.debug('Failed to initialise ffmpeg rawvideo writer; reverting to temp-frame pipeline', __name__)
+-		return False
+-
+-	reference_number = state_manager.get_item('reference_frame_number')
+-	reference_vision_frame = _cached_reference_frame(target_path, reference_number)
+-	source_paths = tuple(state_manager.get_item('source_paths') or [])
+-	source_vision_frames = _cached_source_frames(source_paths)
+-	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
+-	frame_total = predict_video_frame_total(target_path, temp_video_fps, trim_frame_start, trim_frame_end)
+-	providers = state_manager.get_item('execution_providers')
+-	pipeline_depth = max(2, state_manager.get_item('execution_thread_count') or 1)
+-
+-	decoder = _build_stream_generator_pyav(target_path, temp_video_resolution, temp_video_fps, trim_frame_start, trim_frame_end)
+-	backend = 'pyav'
+-	if decoder is None:
+-		decoder = _build_stream_generator_ffmpeg(target_path, temp_video_resolution, temp_video_fps, trim_frame_start, trim_frame_end)
+-		backend = 'ffmpeg'
+-	if decoder is None:
+-		if writer.stdin:
+-			try:
+-				writer.stdin.close()
+-			except Exception:
+-				pass
+-		try:
+-			writer.wait()
+-		except Exception:
+-			pass
+-		logger.debug('No streaming decoder available; reverting to temp-frame pipeline', __name__)
+-		return False
+-
+-	frame_iterator, cleanup = decoder
+-	processed = _run_streaming_loop(frame_iterator, cleanup, writer, frame_total, providers, pipeline_depth, reference_vision_frame, source_vision_frames, source_audio_path, temp_video_fps)
+-
+-	if writer.stdin:
+-		try:
+-			writer.stdin.close()
+-		except Exception:
+-			pass
+-	try:
+-		writer.wait()
+-	except Exception:
+-		pass
+-
+-	if writer.returncode not in (0, None):
+-		logger.debug(f'ffmpeg writer exited with code {writer.returncode}', __name__)
+-		processed = 0
+-
+-	if processed <= 0:
+-		logger.debug(f'Streaming pipeline ({backend}) did not process any frames', __name__)
+-		return False
+-	return True
+-
+-
+-def _process_video_gpu_pipeline(
+-	target_path: str,
+-	temp_video_path: str,
+-	temp_video_resolution: Tuple[int, int],
+-	temp_video_fps: float,
+-	trim_frame_start: int,
+-	trim_frame_end: int
+-) -> int:
+-	if trim_frame_start or trim_frame_end:
+-		logger.debug('GPU pipeline trimming not yet supported, falling back', __name__)
+-		return 0
+-	width, height = temp_video_resolution
+-	config = gpu_video_pipeline.PipelineConfig(
+-		src=target_path,
+-		dst=temp_video_path,
+-		fps=temp_video_fps,
+-		width=width,
+-		height=height,
+-		device=int(get_first(state_manager.get_item('execution_device_ids')) or 0),
+-		chunk_size=1
+-	)
+-
+-	reference_number = state_manager.get_item('reference_frame_number')
+-	reference_vision_frame = _cached_reference_frame(target_path, reference_number)
+-	source_paths = tuple(state_manager.get_item('source_paths') or [])
+-	source_vision_frames = _cached_source_frames(source_paths)
+-	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
+-	providers = state_manager.get_item('execution_providers') or []
+-
+-	def process_frame_callback(frame_index: int, frame_bgr_cpu: numpy.ndarray) -> numpy.ndarray:
+-		processed_cpu = process_frame_runtime(
+-			frame_bgr_cpu,
+-			trim_frame_start + frame_index,
+-			reference_vision_frame,
+-			source_vision_frames,
+-			source_audio_path,
+-			temp_video_fps
+-		)
+-		return numpy.ascontiguousarray(processed_cpu)
+-
+-	logger.debug(f'Launching GPU streaming pipeline on providers: {providers}', __name__)
+-	processed = gpu_video_pipeline.run_pipeline(config, process_frame_callback)
+-	return processed
+diff --git a/facefusion/execution.py b/facefusion/execution.py
+index 0a476e9..d39be91 100644
+--- a/facefusion/execution.py
++++ b/facefusion/execution.py
+@@ -46,8 +46,7 @@ def create_inference_session_providers(execution_device_id : str, execution_prov
+ 				'trt_engine_cache_path': '.caches',
+ 				'trt_timing_cache_enable': True,
+ 				'trt_timing_cache_path': '.caches',
+-				'trt_builder_optimization_level': 5,
+-				'trt_fp16_enable': True
++				'trt_builder_optimization_level': 5
+ 			}))
+ 		if execution_provider in [ 'directml', 'rocm' ]:
+ 			inference_session_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
+diff --git a/facefusion/face_analyser.py b/facefusion/face_analyser.py
+index e70e278..855ebd7 100644
+--- a/facefusion/face_analyser.py
++++ b/facefusion/face_analyser.py
+@@ -2,7 +2,7 @@ from typing import List, Optional
+ 
+ import numpy
+ 
+-from facefusion import face_tracker, state_manager
++from facefusion import state_manager
+ from facefusion.common_helper import get_first
+ from facefusion.face_classifier import classify_face
+ from facefusion.face_detector import detect_faces, detect_faces_by_angle
+@@ -93,62 +93,37 @@ def get_average_face(faces : List[Face]) -> Optional[Face]:
+ 	return None
+ 
+ 
+-def detect_faces_in_frame(vision_frame : VisionFrame, cache_result : bool = False) -> List[Face]:
+-	"""Run full detection pipeline on a single frame."""
+-	if not numpy.any(vision_frame):
+-		return []
+-	if cache_result:
+-		static_faces = get_static_faces(vision_frame)
+-		if static_faces:
+-			return list(static_faces)
+-	faces = _run_face_detection(vision_frame)
+-	if cache_result and faces:
+-		set_static_faces(vision_frame, faces)
+-	return faces
+-
+-
+-def _run_face_detection(vision_frame : VisionFrame) -> List[Face]:
+-	all_bounding_boxes : List[BoundingBox] = []
+-	all_face_scores : List[Score] = []
+-	all_face_landmarks_5 : List[FaceLandmark5] = []
+-
+-	for face_detector_angle in state_manager.get_item('face_detector_angles'):
+-		if face_detector_angle == 0:
+-			bounding_boxes, face_scores, face_landmarks_5 = detect_faces(vision_frame)
+-		else:
+-			bounding_boxes, face_scores, face_landmarks_5 = detect_faces_by_angle(vision_frame, face_detector_angle)
+-		all_bounding_boxes.extend(bounding_boxes)
+-		all_face_scores.extend(face_scores)
+-		all_face_landmarks_5.extend(face_landmarks_5)
+-
+-	if all_bounding_boxes and all_face_scores and all_face_landmarks_5 and state_manager.get_item('face_detector_score') > 0:
+-		faces = create_faces(vision_frame, all_bounding_boxes, all_face_scores, all_face_landmarks_5)
+-		return faces
+-	return []
+-
+-
+-def get_many_faces(vision_frames : List[VisionFrame], use_tracking : bool = True) -> List[Face]:
++def get_many_faces(vision_frames : List[VisionFrame]) -> List[Face]:
+ 	many_faces : List[Face] = []
+-	tracking_enabled = use_tracking and face_tracker.is_enabled() and len(vision_frames) == 1
+-	tracker = face_tracker.get_tracker() if tracking_enabled else None
+ 
+ 	for vision_frame in vision_frames:
+-		if not numpy.any(vision_frame):
+-			continue
+-		if tracker:
+-			faces = tracker.process_frame(vision_frame, _detect_for_tracking)
+-		else:
+-			faces = detect_faces_in_frame(vision_frame, cache_result = not use_tracking)
+-		if faces:
+-			many_faces.extend(faces)
++		if numpy.any(vision_frame):
++			static_faces = get_static_faces(vision_frame)
++			if static_faces:
++				many_faces.extend(static_faces)
++			else:
++				all_bounding_boxes = []
++				all_face_scores = []
++				all_face_landmarks_5 = []
++
++				for face_detector_angle in state_manager.get_item('face_detector_angles'):
++					if face_detector_angle == 0:
++						bounding_boxes, face_scores, face_landmarks_5 = detect_faces(vision_frame)
++					else:
++						bounding_boxes, face_scores, face_landmarks_5 = detect_faces_by_angle(vision_frame, face_detector_angle)
++					all_bounding_boxes.extend(bounding_boxes)
++					all_face_scores.extend(face_scores)
++					all_face_landmarks_5.extend(face_landmarks_5)
++
++				if all_bounding_boxes and all_face_scores and all_face_landmarks_5 and state_manager.get_item('face_detector_score') > 0:
++					faces = create_faces(vision_frame, all_bounding_boxes, all_face_scores, all_face_landmarks_5)
++
++					if faces:
++						many_faces.extend(faces)
++						set_static_faces(vision_frame, faces)
+ 	return many_faces
+ 
+ 
+-
+-def _detect_for_tracking(vision_frame : VisionFrame) -> List[Face]:
+-	return detect_faces_in_frame(vision_frame, cache_result = False)
+-
+-
+ def scale_face(target_face : Face, target_vision_frame : VisionFrame, temp_vision_frame : VisionFrame) -> Face:
+ 	scale_x = temp_vision_frame.shape[1] / target_vision_frame.shape[1]
+ 	scale_y = temp_vision_frame.shape[0] / target_vision_frame.shape[0]
+diff --git a/facefusion/face_helper.py b/facefusion/face_helper.py
+index 6c545c2..8ca47f8 100644
+--- a/facefusion/face_helper.py
++++ b/facefusion/face_helper.py
+@@ -1,43 +1,11 @@
+ from functools import lru_cache
+-from typing import Dict, List, Optional, Sequence, Tuple
++from typing import List, Sequence, Tuple
+ 
+ import cv2
+ import numpy
+ from cv2.typing import Size
+ 
+-try:
+-    import torch  # type: ignore
+-except Exception:  # pragma: no cover - optional dependency
+-    torch = None  # type: ignore
+-
+-try:
+-    from facefusion.gpu.compositor import get_composer  # type: ignore
+-except Exception:  # pragma: no cover - optional dependency
+-    get_composer = None  # type: ignore
+-
+-try:
+-    from cv2 import ximgproc  # type: ignore[attr-defined]
+-    _HAS_XIMGPROC = True
+-except Exception:  # pragma: no cover - optional dependency
+-    ximgproc = None  # type: ignore
+-    _HAS_XIMGPROC = False
+-
+-try:
+-    from facefusion import temporal_filters  # type: ignore
+-    _HAS_TEMPORAL_FILTERS = True
+-except Exception:
+-    temporal_filters = None  # type: ignore
+-    _HAS_TEMPORAL_FILTERS = False
+-
+ from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
+-from facefusion import state_manager
+-
+-# Detect CUDA support in OpenCV if available
+-def _has_cv2_cuda() -> bool:
+-    try:
+-        return hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0
+-    except Exception:
+-        return False
+ 
+ WARP_TEMPLATE_SET : WarpTemplateSet =\
+ {
+@@ -100,100 +68,16 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
+ }
+ 
+ 
+-def _smooth_affine_matrix(track_token: Optional[str], matrix: Matrix) -> Matrix:
+-	"""Smooth affine matrix using robust SG-based similarity transform filter."""
+-	if track_token is None:
+-		return matrix
+-	if not _HAS_TEMPORAL_FILTERS:
+-		return matrix
+-	key = temporal_filters.resolve_filter_key(str(track_token))
+-	return temporal_filters.filter_affine(matrix, key)
+-
+-
+-def reset_affine_smoothers() -> None:
+-	"""Reset all temporal filters."""
+-	if _HAS_TEMPORAL_FILTERS:
+-		temporal_filters.reset_all_filters()
+-	_LANDMARK_SMOOTHERS.clear()
+-	_AFFINE_MATRIX_CACHE.clear()
+-
+-
+-# Landmark temporal smoothing to reduce jitter
+-_LANDMARK_SMOOTHERS: Dict[str, numpy.ndarray] = {}
+-_LANDMARK_ALPHA = 0.2  # EMA smoothing factor: REDUCED from 0.65 to 0.2 for more stable tracking (higher = responsive, lower = smooth)
+-
+-# Affine matrix caching for deterministic warps (reduces micro-jitter)
+-_AFFINE_MATRIX_CACHE: Dict[str, Matrix] = {}
+-_AFFINE_CACHE_ALPHA = 0.2  # Smoothing factor for affine matrix blending
+-
+-
+-def _smooth_landmarks(track_token: Optional[str], landmarks: FaceLandmark5) -> FaceLandmark5:
+-	"""Apply exponential moving average smoothing to face landmarks."""
+-	if track_token is None:
+-		return landmarks
+-
+-	key = str(track_token)
+-	prev_landmarks = _LANDMARK_SMOOTHERS.get(key)
+-
+-	if prev_landmarks is None:
+-		# First observation - store and return
+-		_LANDMARK_SMOOTHERS[key] = landmarks.copy()
+-		return landmarks
+-
+-	# EMA: smoothed = alpha * current + (1 - alpha) * previous
+-	# Lower alpha = more smoothing = less jitter
+-	smoothed = _LANDMARK_ALPHA * landmarks + (1.0 - _LANDMARK_ALPHA) * prev_landmarks
+-	_LANDMARK_SMOOTHERS[key] = smoothed
+-	return smoothed
+-
+-
+-def _cache_and_smooth_affine(track_token: Optional[str], affine_matrix: Matrix) -> Matrix:
+-	"""Cache and smooth affine matrix to prevent micro-jitter in warping."""
+-	if track_token is None:
+-		return affine_matrix
+-
+-	key = str(track_token)
+-	prev_matrix = _AFFINE_MATRIX_CACHE.get(key)
+-
+-	if prev_matrix is None:
+-		# First observation - cache and return
+-		_AFFINE_MATRIX_CACHE[key] = affine_matrix.copy()
+-		return affine_matrix
+-
+-	# Blend new matrix with cached matrix for stability
+-	# This prevents 0.2-0.5px jumps that cause visible jitter
+-	smoothed = _AFFINE_CACHE_ALPHA * affine_matrix + (1.0 - _AFFINE_CACHE_ALPHA) * prev_matrix
+-	_AFFINE_MATRIX_CACHE[key] = smoothed
+-	return smoothed
+-
+-
+-def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token: Optional[str] = None) -> Matrix:
+-	# Apply temporal smoothing to landmarks before computing affine matrix
+-	smoothed_landmarks = _smooth_landmarks(track_token, face_landmark_5)
++def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
+ 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
+-	affine_matrix = cv2.estimateAffinePartial2D(smoothed_landmarks, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
+-	# Cache and smooth the affine matrix itself to prevent micro-jitter
+-	affine_matrix = _cache_and_smooth_affine(track_token, affine_matrix)
++	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
+ 	return affine_matrix
+ 
+ 
+-def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token: Optional[str] = None) -> Tuple[VisionFrame, Matrix]:
+-    affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size, track_token)
+-    # Force consistent interpolation: INTER_LINEAR for stability (INTER_AREA can have slight rounding differences)
+-    # Use BORDER_REPLICATE to match baseline behavior exactly
+-    if _has_cv2_cuda():
+-        try:
+-            gpu_img = cv2.cuda_GpuMat()
+-            gpu_img.upload(temp_vision_frame)
+-            # Use INTER_LINEAR for consistency across GPU/CPU paths
+-            crop_gpu = cv2.cuda.warpAffine(gpu_img, affine_matrix, crop_size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+-            crop_vision_frame = crop_gpu.download()
+-            return crop_vision_frame, affine_matrix
+-        except Exception:
+-            pass
+-    # CPU fallback: use same flags for consistency
+-    crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_LINEAR)
+-    return crop_vision_frame, affine_matrix
++def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Tuple[VisionFrame, Matrix]:
++	affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size)
++	crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode = cv2.BORDER_REPLICATE, flags = cv2.INTER_AREA)
++	return crop_vision_frame, affine_matrix
+ 
+ 
+ def warp_face_by_bounding_box(temp_vision_frame : VisionFrame, bounding_box : BoundingBox, crop_size : Size) -> Tuple[VisionFrame, Matrix]:
+@@ -214,170 +98,21 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
+ 	return crop_vision_frame, affine_matrix
+ 
+ 
+-def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix, track_token: Optional[object] = None) -> VisionFrame:
+-	track_key = str(track_token) if track_token is not None else None
+-	if track_key is not None:
+-		affine_matrix = _smooth_affine_matrix(track_key, affine_matrix)
++def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
+ 	paste_bounding_box, paste_matrix = calculate_paste_area(temp_vision_frame, crop_vision_frame, affine_matrix)
+ 	x1, y1, x2, y2 = paste_bounding_box
+ 	paste_width = x2 - x1
+ 	paste_height = y2 - y1
+-
+-	crop_mask = _refine_mask_with_guided_filter(crop_vision_frame, crop_mask)
+-	sdf_map = _compute_signed_distance(crop_mask)
+-
+-	if paste_width <= 0 or paste_height <= 0:
+-		return temp_vision_frame
+-
+-	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1).astype(numpy.float32)
+-	if not numpy.any(inverse_mask):
+-		return temp_vision_frame
+-
+-	gpu_result = _paste_back_cuda(temp_vision_frame, crop_vision_frame, inverse_mask, paste_matrix, paste_bounding_box, track_key, sdf_map)
+-	if gpu_result is not None:
+-		return gpu_result
+-
+-	if _has_cv2_cuda():
+-		try:
+-			# Warp on GPU with consistent INTER_LINEAR, blend on CPU in fp32 for stability
+-			gpu_mask = cv2.cuda_GpuMat()
+-			gpu_mask.upload(crop_mask.astype(numpy.float32))
+-			inv_mask_gpu = cv2.cuda.warpAffine(gpu_mask, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR)
+-			mask_roi = inv_mask_gpu.download().clip(0, 1)
+-			mask_roi = numpy.expand_dims(mask_roi, axis = -1)
+-
+-			gpu_crop = cv2.cuda_GpuMat()
+-			gpu_crop.upload(crop_vision_frame)
+-			inv_frame_gpu = cv2.cuda.warpAffine(gpu_crop, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+-			inverse_vision_frame = inv_frame_gpu.download()
+-
+-			# Blend in fp32 for numerical stability
+-			temp_vision_frame = temp_vision_frame.copy()
+-			paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
+-			paste_f32 = paste_vision_frame.astype(numpy.float32)
+-			inv_f32 = inverse_vision_frame.astype(numpy.float32)
+-			mask3 = numpy.repeat(mask_roi, 3, axis=-1)
+-			blended = paste_f32 * (1.0 - mask3) + inv_f32 * mask3
+-			temp_vision_frame[y1:y2, x1:x2] = numpy.clip(blended, 0, 255).astype(temp_vision_frame.dtype)
+-			return temp_vision_frame
+-		except Exception:
+-			pass
+-
+-	# CPU fallback: use INTER_LINEAR for consistency and blend in fp32
+-	inverse_mask_expanded = numpy.expand_dims(inverse_mask, axis = -1)
+-	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
++	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1)
++	inverse_mask = numpy.expand_dims(inverse_mask, axis = -1)
++	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
+ 	temp_vision_frame = temp_vision_frame.copy()
+ 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
+-	# Convert to float32 for stable blending - prevents rounding artifacts
+-	paste_f32 = paste_vision_frame.astype(numpy.float32)
+-	inv_frame_f32 = inverse_vision_frame.astype(numpy.float32)
+-	# Expand mask to 3 channels via OpenCV
+-	mask3 = cv2.merge([ inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0] ])
+-	one_minus = 1.0 - mask3
+-	part_a = cv2.multiply(paste_f32, one_minus)
+-	part_b = cv2.multiply(inv_frame_f32, mask3)
+-	blend = cv2.add(part_a, part_b)
+-	temp_vision_frame[y1:y2, x1:x2] = numpy.clip(blend, 0, 255).astype(temp_vision_frame.dtype)
++	paste_vision_frame = paste_vision_frame * (1 - inverse_mask) + inverse_vision_frame * inverse_mask
++	temp_vision_frame[y1:y2, x1:x2] = paste_vision_frame.astype(temp_vision_frame.dtype)
+ 	return temp_vision_frame
+ 
+ 
+-_GPU_WARP_AVAILABLE: Optional[bool] = None
+-
+-
+-def _should_use_cuda_warp(area: int) -> bool:
+-	global _GPU_WARP_AVAILABLE
+-	if torch is None or not torch.cuda.is_available():
+-		return False
+-	if _GPU_WARP_AVAILABLE is False:
+-		return False
+-	if area < 65_536:  # Skip very small regions to avoid kernel launch overhead
+-		return False
+-	try:
+-		from facefusion import state_manager
+-		providers = state_manager.get_item('execution_providers') or []
+-		if not any(str(provider).lower() in ('cuda', 'tensorrt') for provider in providers):
+-			return False
+-	except Exception:
+-		pass
+-	return True
+-
+-
+-def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox, track_token: Optional[str], sdf_map: Optional[Mask]) -> Optional[VisionFrame]:
+-	global _GPU_WARP_AVAILABLE
+-	if torch is None or get_composer is None:
+-		return None
+-	x1, y1, x2, y2 = map(int, paste_box)
+-	width = x2 - x1
+-	height = y2 - y1
+-	area = width * height
+-	if width <= 0 or height <= 0 or not _should_use_cuda_warp(area):
+-		return None
+-	device = torch.device('cuda')
+-	try:
+-		bg_roi = temp_frame[y1:y2, x1:x2]
+-		if bg_roi.shape[0] != height or bg_roi.shape[1] != width:
+-			return None
+-
+-		composer = get_composer(device, height, width)
+-		crop_contig = numpy.ascontiguousarray(crop_frame)
+-		mask_contig = numpy.ascontiguousarray(roi_mask)
+-		bg_contig = numpy.ascontiguousarray(bg_roi)
+-		src_tensor = torch.from_numpy(crop_contig).to(device, non_blocking=True)
+-		mask_tensor = torch.from_numpy(mask_contig).to(device, non_blocking=True)
+-		bg_tensor = torch.from_numpy(bg_contig).to(device, non_blocking=True)
+-		affine_tensor = torch.from_numpy(paste_matrix.astype(numpy.float32)).to(device, non_blocking=True)
+-		extra_payload = { 'bg_reference': bg_contig }
+-		if sdf_map is not None:
+-			sdf_tensor = torch.from_numpy(numpy.ascontiguousarray(sdf_map)).to(device, non_blocking=True)
+-			extra_payload['sdf'] = sdf_tensor
+-
+-		result = composer.compose(
+-			src_tensor,
+-			mask_tensor,
+-			bg_tensor,
+-			affine_tensor,
+-			track_token=track_token,
+-			extras=extra_payload
+-		)
+-		out_np = result.frame_bgr.contiguous().cpu().numpy()
+-		_GPU_WARP_AVAILABLE = True
+-		temp_out = temp_frame.copy()
+-		temp_out[y1:y2, x1:x2] = out_np
+-		return temp_out
+-	except Exception:
+-		_GPU_WARP_AVAILABLE = False
+-		return None
+-
+-
+-def _refine_mask_with_guided_filter(crop_frame: VisionFrame, mask: Mask) -> Mask:
+-	if mask.size == 0:
+-		return mask
+-	mask_f = mask.astype(numpy.float32)
+-	mask_f = numpy.clip(mask_f, 0.0, 1.0)
+-	if _HAS_XIMGPROC:
+-		try:
+-			guide = cv2.cvtColor(crop_frame, cv2.COLOR_BGR2GRAY)
+-			radius = 8
+-			eps = 1e-4
+-			refined = ximgproc.guidedFilter(guide, mask_f, radius, eps)
+-			return numpy.clip(refined, 0.0, 1.0)
+-		except Exception:
+-			pass
+-	# lightweight fallback: gentle gaussian smooth
+-	return cv2.GaussianBlur(mask_f, (0, 0), 1.2)
+-
+-
+-def _compute_signed_distance(mask: Mask) -> Mask:
+-	if mask.size == 0:
+-		return numpy.zeros_like(mask, dtype = numpy.float32)
+-	mask_binary = (mask >= 0.5).astype(numpy.uint8)
+-	if not mask_binary.any():
+-		return numpy.zeros_like(mask, dtype = numpy.float32)
+-	inside = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 3)
+-	out = cv2.distanceTransform(1 - mask_binary, cv2.DIST_L2, 3)
+-	return (inside - out).astype(numpy.float32)
+-
+-
+ def calculate_paste_area(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, affine_matrix : Matrix) -> Tuple[BoundingBox, Matrix]:
+ 	temp_height, temp_width = temp_vision_frame.shape[:2]
+ 	crop_height, crop_width = crop_vision_frame.shape[:2]
+diff --git a/facefusion/face_landmarker.py b/facefusion/face_landmarker.py
+index 09bed0c..6edbd84 100644
+--- a/facefusion/face_landmarker.py
++++ b/facefusion/face_landmarker.py
+@@ -195,7 +195,7 @@ def forward_with_2dfan4(crop_vision_frame : VisionFrame) -> Tuple[Prediction, Pr
+ 			'input': [ crop_vision_frame ]
+ 		})
+ 
+-		return prediction
++	return prediction
+ 
+ 
+ def forward_with_peppa_wutz(crop_vision_frame : VisionFrame) -> Prediction:
+@@ -207,7 +207,7 @@ def forward_with_peppa_wutz(crop_vision_frame : VisionFrame) -> Prediction:
+ 			'input': crop_vision_frame
+ 		})[0]
+ 
+-		return prediction
++	return prediction
+ 
+ 
+ def forward_fan_68_5(face_landmark_5 : FaceLandmark5) -> FaceLandmark68:
+@@ -219,4 +219,4 @@ def forward_fan_68_5(face_landmark_5 : FaceLandmark5) -> FaceLandmark68:
+ 			'input': [ face_landmark_5 ]
+ 		})[0][0]
+ 
+-		return face_landmark_68_5
++	return face_landmark_68_5
+diff --git a/facefusion/face_recognizer.py b/facefusion/face_recognizer.py
+index f6cb1f0..258d8c9 100644
+--- a/facefusion/face_recognizer.py
++++ b/facefusion/face_recognizer.py
+@@ -77,11 +77,11 @@ def calculate_face_embedding(temp_vision_frame : VisionFrame, face_landmark_5 :
+ 
+ def forward(crop_vision_frame : VisionFrame) -> Embedding:
+ 	face_recognizer = get_inference_pool().get('face_recognizer')
+-	
++
+ 	with conditional_thread_semaphore():
+ 		face_embedding = face_recognizer.run(None,
+-        {
+-            'input': crop_vision_frame
+-        })[0]
++		{
++			'input': crop_vision_frame
++		})[0]
+ 
+ 	return face_embedding
+diff --git a/facefusion/face_selector.py b/facefusion/face_selector.py
+index 40716b1..00459e9 100644
+--- a/facefusion/face_selector.py
++++ b/facefusion/face_selector.py
+@@ -19,7 +19,7 @@ def select_faces(reference_vision_frame : VisionFrame, target_vision_frame : Vis
+ 			return [ target_face ]
+ 
+ 	if state_manager.get_item('face_selector_mode') == 'reference':
+-		reference_faces = get_many_faces([ reference_vision_frame ], use_tracking = False)
++		reference_faces = get_many_faces([ reference_vision_frame ])
+ 		reference_faces = sort_and_filter_faces(reference_faces)
+ 		reference_face = get_one_face(reference_faces, state_manager.get_item('reference_face_position'))
+ 		if reference_face:
+diff --git a/facefusion/face_store.py b/facefusion/face_store.py
+index 43378e9..bd14caa 100644
+--- a/facefusion/face_store.py
++++ b/facefusion/face_store.py
+@@ -1,6 +1,5 @@
+ from typing import List, Optional
+ 
+-from facefusion import face_tracker
+ from facefusion.hash_helper import create_hash
+ from facefusion.types import Face, FaceStore, VisionFrame
+ 
+@@ -27,4 +26,3 @@ def set_static_faces(vision_frame : VisionFrame, faces : List[Face]) -> None:
+ 
+ def clear_static_faces() -> None:
+ 	FACE_STORE['static_faces'].clear()
+-	face_tracker.reset_tracker()
+diff --git a/facefusion/face_tracker.py b/facefusion/face_tracker.py
+deleted file mode 100644
+index 13349ac..0000000
+--- a/facefusion/face_tracker.py
++++ /dev/null
+@@ -1,429 +0,0 @@
+-"""Lightweight landmark tracker to reduce expensive per-frame face detection."""
+-from __future__ import annotations
+-
+-from dataclasses import dataclass
+-from threading import Lock
+-from typing import Callable, Dict, List, Optional
+-
+-import cv2
+-import numpy
+-import math
+-
+-from facefusion import state_manager
+-from facefusion.face_helper import convert_to_face_landmark_5, estimate_face_angle, reset_affine_smoothers
+-
+-try:
+-    from facefusion.gpu.compositor import reset_all_temporal_states  # type: ignore
+-except Exception:  # pragma: no cover - optional dependency
+-    reset_all_temporal_states = None  # type: ignore
+-from facefusion.types import Face, VisionFrame
+-
+-
+-@dataclass
+-class _TrackedFace:
+-    track_id: int
+-    face: Face
+-    points_68: numpy.ndarray
+-    misses: int = 0
+-    last_detection_frame: int = 0
+-    confidence_history: List[float] = None  # Rolling window of detection confidence scores
+-
+-    def __post_init__(self):
+-        if self.confidence_history is None:
+-            self.confidence_history = []
+-
+-
+-class _OneEuroFilter:
+-    def __init__(self, fps: float = 30.0, min_cutoff: float = 1.2, beta: float = 0.05, dcut: float = 1.0) -> None:
+-        self._te = 1.0 / max(1e-3, fps)
+-        self._min_cutoff = float(min_cutoff)
+-        self._beta = float(beta)
+-        self._dcut = float(dcut)
+-        self._x_prev: Optional[float] = None
+-        self._dx_prev: float = 0.0
+-
+-    def _alpha(self, cutoff: float) -> float:
+-        tau = 1.0 / (2.0 * math.pi * cutoff)
+-        return 1.0 / (1.0 + tau / self._te)
+-
+-    def reset(self, value: float) -> None:
+-        self._x_prev = value
+-        self._dx_prev = 0.0
+-
+-    def filter(self, value: float) -> float:
+-        if self._x_prev is None:
+-            self.reset(value)
+-            return value
+-        dx = (value - self._x_prev) / self._te
+-        alpha_d = self._alpha(self._dcut)
+-        self._dx_prev = alpha_d * dx + (1.0 - alpha_d) * self._dx_prev
+-        cutoff = self._min_cutoff + self._beta * abs(self._dx_prev)
+-        alpha = self._alpha(cutoff)
+-        filtered = alpha * value + (1.0 - alpha) * self._x_prev
+-        self._x_prev = filtered
+-        return filtered
+-
+-
+-class FaceTracker:
+-    def __init__(self) -> None:
+-        self._tracks: Dict[int, _TrackedFace] = {}
+-        self._next_track_id = 0
+-        self._prev_gray: Optional[numpy.ndarray] = None
+-        self._frame_index: int = 0
+-        self._lock = Lock()
+-        # Config defaults
+-        self._detection_interval = 6
+-        self._max_missed = 2
+-        self._min_points = 10
+-        self._match_iou = 0.3
+-        self._config_signature: Optional[tuple[int, int, int, float]] = None
+-        self._filters: Dict[int, List[_OneEuroFilter]] = {}
+-        self._face_to_track: Dict[int, int] = {}
+-        self._track_to_face_id: Dict[int, int] = {}
+-        fps = state_manager.get_item('output_video_fps')
+-        try:
+-            self._fps = float(fps) if fps else 30.0
+-        except Exception:
+-            self._fps = 30.0
+-        # Confidence gating parameters
+-        self._confidence_window_size = 10  # Rolling window for median calculation
+-        self._confidence_drop_threshold = 0.15  # If confidence drops > this below median, skip frame
+-
+-    def reset(self) -> None:
+-        with self._lock:
+-            self._tracks.clear()
+-            self._next_track_id = 0
+-            self._prev_gray = None
+-            self._frame_index = 0
+-            self._filters.clear()
+-            self._face_to_track.clear()
+-            self._track_to_face_id.clear()
+-            reset_affine_smoothers()
+-            if reset_all_temporal_states:
+-                reset_all_temporal_states()
+-
+-    def process_frame(self, vision_frame: VisionFrame, detect_fn: Callable[[VisionFrame], List[Face]]) -> List[Face]:
+-        with self._lock:
+-            return self._process_frame_locked(vision_frame, detect_fn)
+-
+-    # Internal helpers -----------------------------------------------------
+-    def _process_frame_locked(self, vision_frame: VisionFrame, detect_fn: Callable[[VisionFrame], List[Face]]) -> List[Face]:
+-        self._refresh_config()
+-        gray = cv2.cvtColor(vision_frame, cv2.COLOR_BGR2GRAY)
+-        self._frame_index += 1
+-
+-        need_detection = (self._prev_gray is None or not self._tracks or
+-                          (self._detection_interval > 0 and (self._frame_index % self._detection_interval == 0)))
+-
+-        faces: List[Face]
+-        if need_detection:
+-            faces = detect_fn(vision_frame)
+-            faces = self._assign_detections(faces)
+-        else:
+-            faces = self._track_existing(gray)
+-            # If tracking failed for all faces, fall back to detection immediately
+-            if not faces:
+-                faces = detect_fn(vision_frame)
+-                faces = self._assign_detections(faces)
+-
+-        self._prev_gray = gray
+-        if faces:
+-            faces = sorted(faces, key=lambda f: f.bounding_box[0])
+-        return faces
+-
+-    def _refresh_config(self) -> None:
+-        interval = state_manager.get_item('face_tracker_detection_interval')
+-        max_missed = state_manager.get_item('face_tracker_max_missed')
+-        min_points = state_manager.get_item('face_tracker_min_points')
+-        match_iou = state_manager.get_item('face_tracker_match_iou')
+-
+-        interval_val = int(interval) if isinstance(interval, int) else 6
+-        max_missed_val = int(max_missed) if isinstance(max_missed, int) else 2
+-        min_points_val = int(min_points) if isinstance(min_points, int) else 10
+-        match_iou_val = float(match_iou) if isinstance(match_iou, (int, float)) else 0.3
+-
+-        interval_val = max(1, interval_val)
+-        max_missed_val = max(0, max_missed_val)
+-        min_points_val = max(5, min_points_val)
+-        match_iou_val = min(0.9, max(0.1, match_iou_val))
+-
+-        signature = (interval_val, max_missed_val, min_points_val, match_iou_val)
+-        if signature != self._config_signature:
+-            self._detection_interval = interval_val
+-            self._max_missed = max_missed_val
+-            self._min_points = min_points_val
+-            self._match_iou = match_iou_val
+-            self._config_signature = signature
+-
+-    def _assign_detections(self, faces: List[Face]) -> List[Face]:
+-        assigned: List[Face] = []
+-        unmatched_track_ids = set(self._tracks.keys())
+-
+-        for face in faces:
+-            matched_id = self._match_track(face, unmatched_track_ids)
+-            if matched_id is not None:
+-                track = self._tracks[matched_id]
+-                track.face = face
+-                track.points_68 = face.landmark_set.get('68').astype(numpy.float32)
+-                track.misses = 0
+-                track.last_detection_frame = self._frame_index
+-                self._reset_filters(matched_id, track.points_68)
+-                self._update_face_index(matched_id, track.face)
+-                # Record confidence score
+-                confidence = float(getattr(face, 'score', 0.9))  # Default to 0.9 if no score
+-                track.confidence_history.append(confidence)
+-                if len(track.confidence_history) > self._confidence_window_size:
+-                    track.confidence_history = track.confidence_history[-self._confidence_window_size:]
+-                unmatched_track_ids.discard(matched_id)
+-                assigned.append(track.face)
+-            else:
+-                assigned.append(self._create_track(face))
+-
+-        for track_id in list(unmatched_track_ids):
+-            track = self._tracks.get(track_id)
+-            if track is None:
+-                continue
+-            track.misses += 1
+-            if track.misses > self._max_missed:
+-                del self._tracks[track_id]
+-                self._filters.pop(track_id, None)
+-
+-        return assigned
+-
+-    def _match_track(self, face: Face, candidates: set[int]) -> Optional[int]:
+-        if not candidates:
+-            return None
+-        face_box = face.bounding_box.astype(numpy.float32)
+-        best_id: Optional[int] = None
+-        best_iou = 0.0
+-        for track_id in list(candidates):
+-            track = self._tracks[track_id]
+-            iou = _compute_iou(face_box, track.face.bounding_box.astype(numpy.float32))
+-            if iou >= self._match_iou and iou > best_iou:
+-                best_iou = iou
+-                best_id = track_id
+-        return best_id
+-
+-    def _create_track(self, face: Face) -> Face:
+-        landmarks = face.landmark_set.get('68')
+-        if landmarks is None:
+-            return face
+-        track = _TrackedFace(
+-            track_id=self._next_track_id,
+-            face=face,
+-            points_68=landmarks.astype(numpy.float32).copy(),
+-            last_detection_frame=self._frame_index,
+-        )
+-        # Initialize confidence history
+-        confidence = float(getattr(face, 'score', 0.9))
+-        track.confidence_history = [confidence]
+-        self._tracks[self._next_track_id] = track
+-        self._filters[self._next_track_id] = self._build_filters(track.points_68)
+-        self._update_face_index(self._next_track_id, track.face)
+-        self._next_track_id += 1
+-        return track.face
+-
+-    def _track_existing(self, gray: numpy.ndarray) -> List[Face]:
+-        if self._prev_gray is None or not self._tracks:
+-            return []
+-
+-        tracked_faces: List[Face] = []
+-        remove_ids: List[int] = []
+-        h, w = gray.shape
+-
+-        for track_id, track in list(self._tracks.items()):
+-            prev_points = track.points_68.reshape(-1, 1, 2).astype(numpy.float32)
+-            try:
+-                next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+-                    self._prev_gray, gray, prev_points, None,
+-                    winSize=(21, 21), maxLevel=3,
+-                    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+-                )
+-            except cv2.error:
+-                track.misses += 1
+-                if track.misses > self._max_missed:
+-                    remove_ids.append(track_id)
+-                continue
+-
+-            if next_points is None or status is None:
+-                track.misses += 1
+-                if track.misses > self._max_missed:
+-                    remove_ids.append(track_id)
+-                continue
+-
+-            status_mask = status.reshape(-1).astype(bool)
+-            valid_count = int(status_mask.sum())
+-
+-            if valid_count < self._min_points:
+-                track.misses += 1
+-                if track.misses > self._max_missed:
+-                    remove_ids.append(track_id)
+-                continue
+-
+-            updated = track.points_68.copy()
+-            updated[status_mask] = next_points.reshape(-1, 2)[status_mask]
+-            filters = self._filters.get(track_id)
+-            if filters is None:
+-                filters = self._build_filters(updated)
+-                self._filters[track_id] = filters
+-            flat = updated.reshape(-1)
+-            for idx in range(flat.shape[0]):
+-                flat[idx] = filters[idx].filter(float(flat[idx]))
+-            track.points_68 = flat.reshape(updated.shape)
+-
+-            min_xy = updated.min(axis=0)
+-            max_xy = updated.max(axis=0)
+-
+-            min_x = float(numpy.clip(min_xy[0], 0, w - 1))
+-            min_y = float(numpy.clip(min_xy[1], 0, h - 1))
+-            max_x = float(numpy.clip(max_xy[0], 0, w - 1))
+-            max_y = float(numpy.clip(max_xy[1], 0, h - 1))
+-
+-            if max_x - min_x < 1 or max_y - min_y < 1:
+-                track.misses += 1
+-                if track.misses > self._max_missed:
+-                    remove_ids.append(track_id)
+-                continue
+-
+-            landmark_68 = updated.astype(numpy.float32)
+-            landmark_5 = convert_to_face_landmark_5(landmark_68)
+-            landmark_set = {
+-                '5': landmark_5,
+-                '5/68': landmark_5,
+-                '68': landmark_68,
+-                '68/5': landmark_68
+-            }
+-            bounding_box = numpy.array([min_x, min_y, max_x, max_y], dtype=numpy.float32)
+-            angle = estimate_face_angle(landmark_68)
+-            track.face = track.face._replace(
+-                bounding_box=bounding_box,
+-                landmark_set=landmark_set,
+-                angle=angle
+-            )
+-            track.misses = 0
+-            self._update_face_index(track_id, track.face)
+-            tracked_faces.append(track.face)
+-
+-        for track_id in remove_ids:
+-            self._tracks.pop(track_id, None)
+-            self._filters.pop(track_id, None)
+-            face_id = self._track_to_face_id.pop(track_id, None)
+-            if face_id is not None:
+-                self._face_to_track.pop(face_id, None)
+-
+-        return tracked_faces
+-
+-    def _build_filters(self, points: numpy.ndarray) -> List[_OneEuroFilter]:
+-        total = int(points.size)
+-        filters = [_OneEuroFilter(fps=self._fps) for _ in range(total)]
+-        flat = points.reshape(-1)
+-        for idx, value in enumerate(flat):
+-            filters[idx].reset(float(value))
+-        return filters
+-
+-    def _reset_filters(self, track_id: int, points: numpy.ndarray) -> None:
+-        filters = self._filters.get(track_id)
+-        if filters is None or len(filters) != points.size:
+-            self._filters[track_id] = self._build_filters(points)
+-            return
+-        flat = points.reshape(-1)
+-        for idx, value in enumerate(flat):
+-            filters[idx].reset(float(value))
+-
+-    def _update_face_index(self, track_id: int, face: Face) -> None:
+-        face_id = id(face)
+-        previous_face_id = self._track_to_face_id.get(track_id)
+-        if previous_face_id is not None and previous_face_id != face_id:
+-            self._face_to_track.pop(previous_face_id, None)
+-        self._track_to_face_id[track_id] = face_id
+-        self._face_to_track[face_id] = track_id
+-
+-    def get_track_token(self, face: Face) -> Optional[int]:
+-        with self._lock:
+-            return self._face_to_track.get(id(face))
+-
+-    def update_confidence(self, face: Face, confidence: float) -> None:
+-        """Update confidence score for a tracked face."""
+-        with self._lock:
+-            track_id = self._face_to_track.get(id(face))
+-            if track_id is None:
+-                return
+-            track = self._tracks.get(track_id)
+-            if track is None:
+-                return
+-
+-            # Add confidence to rolling window
+-            track.confidence_history.append(confidence)
+-            # Keep only last N samples
+-            if len(track.confidence_history) > self._confidence_window_size:
+-                track.confidence_history = track.confidence_history[-self._confidence_window_size:]
+-
+-    def should_use_face(self, face: Face) -> bool:
+-        """Check if face confidence is acceptable. Returns False if confidence dropped significantly."""
+-        with self._lock:
+-            track_id = self._face_to_track.get(id(face))
+-            if track_id is None:
+-                return True  # No tracking info, allow by default
+-
+-            track = self._tracks.get(track_id)
+-            if track is None or not track.confidence_history:
+-                return True  # No history, allow by default
+-
+-            if len(track.confidence_history) < 3:
+-                return True  # Not enough history to judge
+-
+-            # Get current confidence
+-            current_conf = track.confidence_history[-1]
+-
+-            # Compute median of history (excluding current)
+-            history = track.confidence_history[:-1]
+-            median_conf = float(numpy.median(history))
+-
+-            # Check if current confidence dropped significantly below median
+-            drop = median_conf - current_conf
+-
+-            if drop > self._confidence_drop_threshold:
+-                # Confidence dropped significantly - this frame is likely bad
+-                return False
+-
+-            return True
+-
+-
+-def _compute_iou(box_a: numpy.ndarray, box_b: numpy.ndarray) -> float:
+-    x1 = max(float(box_a[0]), float(box_b[0]))
+-    y1 = max(float(box_a[1]), float(box_b[1]))
+-    x2 = min(float(box_a[2]), float(box_b[2]))
+-    y2 = min(float(box_a[3]), float(box_b[3]))
+-    inter_w = max(0.0, x2 - x1)
+-    inter_h = max(0.0, y2 - y1)
+-    inter_area = inter_w * inter_h
+-    if inter_area <= 0:
+-        return 0.0
+-    area_a = max(0.0, float(box_a[2] - box_a[0])) * max(0.0, float(box_a[3] - box_a[1]))
+-    area_b = max(0.0, float(box_b[2] - box_b[0])) * max(0.0, float(box_b[3] - box_b[1]))
+-    denom = area_a + area_b - inter_area
+-    if denom <= 0:
+-        return 0.0
+-    return inter_area / denom
+-
+-
+-_GLOBAL_TRACKER: Optional[FaceTracker] = None
+-
+-
+-def get_tracker() -> FaceTracker:
+-    global _GLOBAL_TRACKER
+-    if _GLOBAL_TRACKER is None:
+-        _GLOBAL_TRACKER = FaceTracker()
+-    return _GLOBAL_TRACKER
+-
+-
+-def reset_tracker() -> None:
+-    tracker = get_tracker()
+-    tracker.reset()
+-
+-
+-def is_enabled() -> bool:
+-    enabled = state_manager.get_item('enable_face_tracking')
+-    if enabled is None:
+-        return True
+-    return bool(enabled)
+diff --git a/facefusion/ffmpeg.py b/facefusion/ffmpeg.py
+index 0ad1253..009abd3 100644
+--- a/facefusion/ffmpeg.py
++++ b/facefusion/ffmpeg.py
+@@ -1,5 +1,4 @@
+ import os
+-import shutil
+ import subprocess
+ import tempfile
+ from functools import partial
+@@ -285,29 +284,3 @@ def fix_video_encoder(video_format : VideoFormat, video_encoder : VideoEncoder)
+ 	if video_format == 'webm':
+ 		return 'libvpx-vp9'
+ 	return video_encoder
+-
+-def open_rawvideo_writer(output_path : str, video_resolution : Resolution, video_fps : Fps) -> Optional[subprocess.Popen[bytes]]:
+-	ffmpeg_bin = shutil.which('ffmpeg')
+-	if not ffmpeg_bin:
+-		return None
+-	width, height = video_resolution
+-	output_video_encoder = state_manager.get_item('output_video_encoder')
+-	output_video_quality = state_manager.get_item('output_video_quality')
+-	output_video_preset = state_manager.get_item('output_video_preset')
+-	commands : List[str] = [
+-		ffmpeg_bin,
+-		'-y',
+-		'-loglevel', 'error',
+-		'-f', 'rawvideo',
+-		'-pix_fmt', 'bgr24',
+-		'-s', f'{width}x{height}',
+-		'-r', str(video_fps),
+-		'-i', '-',
+-		'-an'
+-	]
+-	commands += ffmpeg_builder.set_video_encoder(output_video_encoder)
+-	commands += ffmpeg_builder.set_video_quality(output_video_encoder, output_video_quality)
+-	commands += ffmpeg_builder.set_video_preset(output_video_encoder, output_video_preset)
+-	commands += ffmpeg_builder.set_pixel_format(output_video_encoder)
+-	commands += [ '-vsync', '0', output_path ]
+-	return subprocess.Popen(commands, stdin = subprocess.PIPE)
+diff --git a/facefusion/gpu/__init__.py b/facefusion/gpu/__init__.py
+deleted file mode 100644
+index eeb415d..0000000
+--- a/facefusion/gpu/__init__.py
++++ /dev/null
+@@ -1,22 +0,0 @@
+-"""CUDA-accelerated helpers for FaceFusion."""
+-from __future__ import annotations
+-
+-from typing import Optional
+-
+-import torch
+-
+-_try_cuda_graphs = False
+-
+-
+-def is_cuda_available() -> bool:
+-    return torch.cuda.is_available()
+-
+-
+-def use_cuda_graphs() -> bool:
+-    global _try_cuda_graphs
+-    return _try_cuda_graphs
+-
+-
+-def enable_cuda_graphs(enable: bool) -> None:
+-    global _try_cuda_graphs
+-    _try_cuda_graphs = bool(enable)
+diff --git a/facefusion/gpu/compositor.py b/facefusion/gpu/compositor.py
+deleted file mode 100644
+index 99ebbd2..0000000
+--- a/facefusion/gpu/compositor.py
++++ /dev/null
+@@ -1,769 +0,0 @@
+-"""High-quality GPU ROI compositor with multi-band blending."""
+-from __future__ import annotations
+-
+-from dataclasses import dataclass
+-from typing import Dict, Optional, Tuple
+-
+-import cv2
+-import numpy
+-import torch
+-import torch.nn.functional as F
+-
+-from facefusion.gpu.kernels import warp_face
+-
+-
+-_HAS_OFA = bool(hasattr(cv2, 'cuda') and hasattr(cv2.cuda, 'NvidiaOpticalFlow_2_0'))
+-
+-
+-@dataclass
+-class CompositeResult:
+-    """Container for ROI composition outputs."""
+-    frame_bgr: torch.Tensor
+-    warped_srgb: torch.Tensor
+-    mask: torch.Tensor
+-    blended_linear: torch.Tensor
+-    source_linear: torch.Tensor
+-
+-
+-@dataclass
+-class _ColorState:
+-    src_mean: numpy.ndarray
+-    src_std: numpy.ndarray
+-    tgt_mean: numpy.ndarray
+-    tgt_std: numpy.ndarray
+-    # Linear-space gain/bias for stable relighting
+-    gain_rgb: Optional[torch.Tensor] = None  # Per-channel multiplicative gain
+-    bias_rgb: Optional[torch.Tensor] = None  # Per-channel additive bias
+-
+-
+-@dataclass
+-class _SeamBandState:
+-    """Cache for temporal seam band reuse to eliminate edge flicker."""
+-    prev_seam_bgr: Optional[torch.Tensor] = None
+-    prev_seam_mask: Optional[torch.Tensor] = None
+-    prev_center_x: float = 0.0
+-    prev_center_y: float = 0.0
+-    seam_width: int = 12  # Width of seam band in pixels
+-
+-
+-class _TemporalState:
+-    def __init__(self, width: int, height: int) -> None:
+-        self.width = int(width)
+-        self.height = int(height)
+-        self.prev_bg_gray: Optional[numpy.ndarray] = None
+-        self.prev_comp_bgr: Optional[numpy.ndarray] = None
+-        self.prev_mask: Optional[numpy.ndarray] = None
+-        self._pending_gray: Optional[numpy.ndarray] = None
+-        # Optical flow-guided fusion state
+-        self.prev_face_patch: Optional[torch.Tensor] = None  # Previous swapped face in linear space
+-        if not _HAS_OFA:
+-            raise RuntimeError('OFA unavailable')
+-        self._flow = cv2.cuda_NvidiaOpticalFlow_2_0.create(
+-            (self.width, self.height),
+-            perfPreset=cv2.cuda.NVIDIA_OF_PERF_LEVEL_FAST,
+-            outputGridSize=cv2.cuda.NVIDIA_OF_OUTPUT_VECTOR_GRID_SIZE_4,
+-            hintGridSize=cv2.cuda.NVIDIA_OF_HINT_VECTOR_GRID_SIZE_4,
+-            enableTemporalHints=True
+-        )
+-        x_coords = numpy.tile(numpy.arange(self.width, dtype=numpy.float32), (self.height, 1))
+-        y_coords = numpy.repeat(numpy.arange(self.height, dtype=numpy.float32)[:, None], self.width, axis=1)
+-        self._grid_x = cv2.cuda_GpuMat()
+-        self._grid_y = cv2.cuda_GpuMat()
+-        self._grid_x.upload(x_coords)
+-        self._grid_y.upload(y_coords)
+-
+-    def calc_flow(self, prev_gray: numpy.ndarray, curr_gray: numpy.ndarray) -> Tuple['cv2.cuda.GpuMat', 'cv2.cuda.GpuMat']:
+-        prev_gpu = cv2.cuda_GpuMat()
+-        curr_gpu = cv2.cuda_GpuMat()
+-        prev_gpu.upload(prev_gray)
+-        curr_gpu.upload(curr_gray)
+-        flow_gpu = self._flow.calc(prev_gpu, curr_gpu, None)
+-        cost_gpu = self._flow.getFlowConfidence()
+-        return flow_gpu, cost_gpu
+-
+-    def prepare_flow(self, curr_gray: numpy.ndarray) -> Optional[Tuple['cv2.cuda.GpuMat', 'cv2.cuda.GpuMat']]:
+-        self._pending_gray = curr_gray
+-        if self.prev_bg_gray is None:
+-            return None
+-        return self.calc_flow(self.prev_bg_gray, curr_gray)
+-
+-    def warp_previous(
+-        self,
+-        prev_comp_bgr: numpy.ndarray,
+-        flow_gpu: 'cv2.cuda.GpuMat',
+-        cost_gpu: 'cv2.cuda.GpuMat',
+-        threshold: float
+-    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+-        planes = cv2.cuda.split(flow_gpu)
+-        map_x = cv2.cuda.add(self._grid_x, planes[0])
+-        map_y = cv2.cuda.add(self._grid_y, planes[1])
+-        src_gpu = cv2.cuda_GpuMat()
+-        src_gpu.upload(prev_comp_bgr)
+-        warped_gpu = cv2.cuda.remap(src_gpu, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+-        warped = warped_gpu.download()
+-        mask_gpu = cv2.cuda.compare(cost_gpu, threshold, cv2.CMP_LT)
+-        mask_gpu = mask_gpu.convertTo(cv2.CV_32F, 1.0 / 255.0)
+-        mask_gpu = cv2.cuda.blur(mask_gpu, (5, 5))
+-        reliable = mask_gpu.download()
+-        return warped, reliable
+-
+-    def warp_mask(
+-        self,
+-        prev_mask: numpy.ndarray,
+-        flow_gpu: 'cv2.cuda.GpuMat',
+-        cost_gpu: 'cv2.cuda.GpuMat',
+-        threshold: float
+-    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+-        planes = cv2.cuda.split(flow_gpu)
+-        map_x = cv2.cuda.add(self._grid_x, planes[0])
+-        map_y = cv2.cuda.add(self._grid_y, planes[1])
+-        src_gpu = cv2.cuda_GpuMat()
+-        src_gpu.upload(prev_mask)
+-        warped_gpu = cv2.cuda.remap(src_gpu, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+-        warped = warped_gpu.download()
+-        mask_gpu = cv2.cuda.compare(cost_gpu, threshold, cv2.CMP_LT)
+-        mask_gpu = mask_gpu.convertTo(cv2.CV_32F, 1.0 / 255.0)
+-        mask_gpu = cv2.cuda.blur(mask_gpu, (5, 5))
+-        reliable = mask_gpu.download()
+-        return warped, reliable
+-
+-    def reset(self) -> None:
+-        self.prev_bg_gray = None
+-        self.prev_comp_bgr = None
+-        self.prev_mask = None
+-        self._pending_gray = None
+-        self.prev_face_patch = None
+-
+-    def warp_face_patch(
+-        self,
+-        prev_patch_linear: torch.Tensor,
+-        flow_gpu: 'cv2.cuda.GpuMat',
+-        cost_gpu: 'cv2.cuda.GpuMat',
+-        threshold: float
+-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+-        """Warp previous face patch forward using optical flow. Returns (warped_patch, reliability_mask)."""
+-        try:
+-            # Convert to numpy for cv2 warping
+-            prev_np = (prev_patch_linear.detach().cpu().numpy() * 255.0).astype(numpy.uint8)
+-
+-            planes = cv2.cuda.split(flow_gpu)
+-            map_x = cv2.cuda.add(self._grid_x, planes[0])
+-            map_y = cv2.cuda.add(self._grid_y, planes[1])
+-
+-            src_gpu = cv2.cuda_GpuMat()
+-            src_gpu.upload(prev_np)
+-            warped_gpu = cv2.cuda.remap(src_gpu, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+-            warped = warped_gpu.download()
+-
+-            # Reliability mask
+-            mask_gpu = cv2.cuda.compare(cost_gpu, threshold, cv2.CMP_LT)
+-            mask_gpu = mask_gpu.convertTo(cv2.CV_32F, 1.0 / 255.0)
+-            mask_gpu = cv2.cuda.blur(mask_gpu, (5, 5))
+-            reliable = mask_gpu.download()
+-
+-            # Convert back to tensor
+-            warped_tensor = torch.from_numpy(warped.astype(numpy.float32) / 255.0).to(prev_patch_linear.device)
+-            reliable_tensor = torch.from_numpy(reliable).to(prev_patch_linear.device)
+-
+-            return warped_tensor, reliable_tensor
+-        except Exception:
+-            return None
+-
+-class GpuRoiComposer:
+-    """Compose warped face crops back into a frame ROI on the GPU."""
+-
+-    def __init__(self, device: torch.device, roi_size: Tuple[int, int], levels: int = 3) -> None:
+-        self.device = torch.device(device)
+-        self.roi_height, self.roi_width = roi_size
+-        self.levels = max(1, levels)
+-        self._gaussian_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+-        self._temporal_states: Dict[str, _TemporalState] = {}
+-        self._color_states: Dict[str, _ColorState] = {}
+-        self._seam_states: Dict[str, _SeamBandState] = {}
+-        self.temporal_alpha = 0.2
+-        self.temporal_tau = 0.35
+-        self.color_momentum = 0.1
+-        self._sdf_half_width = 1.5
+-        # Temporal snap: if face patch is similar to previous frame, reduce movement
+-        self._prev_warped: Dict[str, torch.Tensor] = {}
+-        self.snap_threshold = 0.95  # SSIM threshold for temporal snapping (higher = more aggressive)
+-        # Seam band temporal reuse parameters
+-        self.seam_motion_threshold = 3.0  # pixels - reuse seam if movement < this
+-        # Anomaly detection parameters
+-        self._prev_quality: Dict[str, float] = {}  # Track quality per face
+-        self.anomaly_threshold = 0.70  # If quality drops below this, trigger aggressive smoothing
+-
+-    # ------------------------------------------------------------------
+-    def compose(
+-        self,
+-        src_bgr: torch.Tensor,
+-        mask: torch.Tensor,
+-        bg_bgr: torch.Tensor,
+-        affine: torch.Tensor,
+-        track_token: Optional[str] = None,
+-        extras: Optional[dict] = None,
+-    ) -> CompositeResult:
+-        if extras is None:
+-            extras = {}
+-        track_key = str(track_token) if track_token is not None else None
+-        bg_reference = extras.get('bg_reference') if extras else None
+-
+-        src_bgr = self._prepare_color_tensor(src_bgr)
+-        bg_bgr = self._prepare_color_tensor(bg_bgr, roi=True)
+-        mask = self._prepare_mask_tensor(mask)
+-        affine = affine.to(self.device, dtype=torch.float32).contiguous().view(-1)
+-
+-        src_h, src_w, _ = src_bgr.shape
+-        roi_h, roi_w = bg_bgr.shape
+-        src_rgba = torch.ones((src_h, src_w, 4), device=self.device, dtype=torch.float32)
+-        src_rgba[..., :3] = src_bgr
+-        if 'sdf' in extras:
+-            sdf = extras['sdf'].to(self.device, dtype=torch.float32)
+-            if sdf.shape != src_bgr[..., 0].shape:
+-                raise ValueError('SDF tensor must match source crop spatial size.')
+-            src_rgba[..., 3] = sdf
+-
+-        warped = warp_face(src_rgba, affine, roi_w, roi_h)
+-        warped_rgb = torch.clamp(warped[..., :3], 0.0, 1.0)
+-        warped_sdf = warped[..., 3] if warped.size(-1) > 3 else None
+-
+-        if warped_sdf is not None:
+-            sdf_alpha = self._compute_sdf_alpha(warped_sdf)
+-            mask = torch.clamp(mask * sdf_alpha, 0.0, 1.0)
+-
+-        # Apply temporal snap BEFORE color transfer to reduce warping micro-jitter
+-        if track_key is not None:
+-            warped_rgb = self._apply_temporal_snap(track_key, warped_rgb)
+-
+-        state: Optional[_TemporalState] = None
+-        curr_gray: Optional[numpy.ndarray] = None
+-        flow_bundle: Optional[Tuple['cv2.cuda.GpuMat', 'cv2.cuda.GpuMat']] = None
+-        mask_np = mask.detach().cpu().numpy().astype(numpy.float32)
+-
+-        if _HAS_OFA and track_key is not None and isinstance(bg_reference, numpy.ndarray):
+-            state = self._ensure_temporal_state(track_key)
+-            if state is not None:
+-                try:
+-                    curr_gray = cv2.cvtColor(bg_reference, cv2.COLOR_BGR2GRAY)
+-                    flow_bundle = state.prepare_flow(curr_gray)
+-                    mask, mask_np = self._stabilize_mask(state, mask, mask_np, flow_bundle)
+-                except Exception:
+-                    state.reset()
+-                    curr_gray = None
+-                    flow_bundle = None
+-                    mask_np = mask.detach().cpu().numpy().astype(numpy.float32)
+-
+-        if track_key is not None and isinstance(bg_reference, numpy.ndarray):
+-            try:
+-                warped_rgb = self._apply_color_transfer(track_key, warped_rgb, mask, bg_reference)
+-            except Exception:
+-                pass
+-
+-        warped_rgb_t = warped_rgb.permute(2, 0, 1).unsqueeze(0)
+-        bg_rgb_t = bg_bgr.permute(2, 0, 1).unsqueeze(0)
+-        mask_t = mask.unsqueeze(0).unsqueeze(0)
+-
+-        src_lin = self._srgb_to_linear(warped_rgb_t)
+-        bg_lin = self._srgb_to_linear(bg_rgb_t)
+-
+-        # Optical flow-guided temporal fusion: conditionally blend with warped-previous
+-        # AND anomaly detection: if quality drops significantly, use more aggressive smoothing
+-        is_anomaly = False
+-        if state is not None and flow_bundle is not None and state.prev_face_patch is not None:
+-            try:
+-                flow_gpu, cost_gpu = flow_bundle
+-                warp_result = state.warp_face_patch(state.prev_face_patch, flow_gpu, cost_gpu, float(self.temporal_tau))
+-                if warp_result is not None:
+-                    warped_prev_linear, flow_reliable = warp_result
+-                    # Compute similarity between current and warped-previous in linear space
+-                    # Use just the face region (where mask > 0.1)
+-                    similarity = self._compute_similarity(src_lin.squeeze(0).permute(1, 2, 0), warped_prev_linear)
+-
+-                    # Anomaly detection: track quality per frame
+-                    prev_quality = self._prev_quality.get(track_key, 1.0) if track_key else 1.0
+-                    current_quality = similarity
+-
+-                    # If quality dropped significantly from previous frame, mark as anomaly
+-                    if current_quality < self.anomaly_threshold and (prev_quality - current_quality) > 0.15:
+-                        is_anomaly = True
+-                        # VERY aggressive smoothing for anomaly frames to prevent catastrophic dips
+-                        src_lin_permuted = src_lin.squeeze(0).permute(1, 2, 0)
+-                        fused = 0.1 * src_lin_permuted + 0.9 * warped_prev_linear  # 90% previous!
+-                        src_lin = fused.unsqueeze(0).permute(0, 3, 1, 2)
+-                    elif similarity > 0.85:
+-                        # Normal high similarity: blend 70% toward stabilized warped-previous
+-                        src_lin_permuted = src_lin.squeeze(0).permute(1, 2, 0)
+-                        fused = 0.3 * src_lin_permuted + 0.7 * warped_prev_linear
+-                        src_lin = fused.unsqueeze(0).permute(0, 3, 1, 2)
+-
+-                    # Update quality history
+-                    if track_key:
+-                        self._prev_quality[track_key] = current_quality
+-            except Exception:
+-                pass  # Fall back to using current frame
+-
+-        blended_lin = self._multi_band_blend(src_lin, bg_lin, mask_t)
+-
+-        # Cache current face patch in linear space for next frame's optical flow fusion
+-        if state is not None:
+-            state.prev_face_patch = src_lin.squeeze(0).permute(1, 2, 0).detach().clone()
+-
+-        out_srgb = self._linear_to_srgb(blended_lin)
+-        out_srgb = self._apply_dither(out_srgb)
+-        out_srgb = torch.clamp(out_srgb, 0.0, 1.0)
+-
+-        out_uint8 = torch.clamp(out_srgb * 255.0 + 0.5, 0.0, 255.0).to(torch.uint8)
+-        frame_bgr = out_uint8.squeeze(0).permute(1, 2, 0).contiguous()
+-
+-        if state is not None and curr_gray is not None:
+-            try:
+-                frame_bgr, blended_lin = self._apply_temporal(state, curr_gray, flow_bundle, frame_bgr, blended_lin, mask_np)
+-            except Exception:
+-                state.reset()
+-
+-        # Apply seam band blending with temporal reuse (after temporal smoothing) to eliminate edge flicker
+-        if track_key is not None:
+-            frame_bgr_float = frame_bgr.float() / 255.0
+-            frame_bgr_float = self._apply_seam_band_blending(track_key, frame_bgr_float, mask)
+-            frame_bgr = torch.clamp(frame_bgr_float * 255.0 + 0.5, 0.0, 255.0).to(torch.uint8)
+-
+-        return CompositeResult(
+-            frame_bgr=frame_bgr,
+-            warped_srgb=warped_rgb_t.squeeze(0),
+-            mask=mask_t.squeeze(0),
+-            blended_linear=blended_lin.squeeze(0),
+-            source_linear=src_lin.squeeze(0)
+-        )
+-
+-    # ------------------------------------------------------------------
+-    def _prepare_color_tensor(self, tensor: torch.Tensor, roi: bool = False) -> torch.Tensor:
+-        tensor = tensor.to(self.device)
+-        if tensor.dtype != torch.float32:
+-            tensor = tensor.to(torch.float32)
+-        if tensor.max() > 1.5:
+-            tensor = tensor * (1.0 / 255.0)
+-        if tensor.dim() == 3:
+-            h, w, c = tensor.shape
+-            if c != 3:
+-                raise ValueError('Color tensor must have 3 channels.')
+-        elif tensor.dim() == 4:
+-            tensor = tensor.squeeze(0)
+-        else:
+-            raise ValueError('Unexpected color tensor shape.')
+-        if roi:
+-            if tensor.shape[0] != self.roi_height or tensor.shape[1] != self.roi_width:
+-                raise ValueError('Background ROI shape mismatch.')
+-        return tensor.contiguous()
+-
+-    def _prepare_mask_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+-        tensor = tensor.to(self.device)
+-        if tensor.dtype != torch.float32:
+-            tensor = tensor.to(torch.float32)
+-        if tensor.dim() == 3:
+-            tensor = tensor.squeeze(0)
+-        if tensor.dim() != 2:
+-            raise ValueError('Mask tensor must be 2D.')
+-        tensor = torch.clamp(tensor, 0.0, 1.0)
+-        if tensor.shape != (self.roi_height, self.roi_width):
+-            tensor = F.interpolate(
+-                tensor.unsqueeze(0).unsqueeze(0),
+-                size=(self.roi_height, self.roi_width),
+-                mode='bilinear',
+-                align_corners=False
+-            ).squeeze(0).squeeze(0)
+-        return tensor.contiguous()
+-
+-    def _get_gaussian_kernels(self, channels: int) -> Tuple[torch.Tensor, torch.Tensor]:
+-        cached = self._gaussian_cache.get(channels)
+-        if cached is not None:
+-            return cached
+-        base = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], device=self.device, dtype=torch.float32)
+-        base = (base / base.sum()).view(1, 1, 1, 5)
+-        kernel_h = base.repeat(channels, 1, 1, 1)
+-        kernel_v = base.view(1, 1, 5, 1).repeat(channels, 1, 1, 1)
+-        self._gaussian_cache[channels] = (kernel_v, kernel_h)
+-        return kernel_v, kernel_h
+-
+-    def _gaussian_blur(self, tensor: torch.Tensor) -> torch.Tensor:
+-        channels = tensor.shape[1]
+-        kernel_v, kernel_h = self._get_gaussian_kernels(channels)
+-        padding = (2, 2)
+-        tmp = F.conv2d(tensor, kernel_h, padding=(0, padding[1]), groups=channels)
+-        blurred = F.conv2d(tmp, kernel_v, padding=(padding[0], 0), groups=channels)
+-        return blurred
+-
+-    def _downsample(self, tensor: torch.Tensor) -> torch.Tensor:
+-        h, w = tensor.shape[-2:]
+-        new_h = max(1, h // 2)
+-        new_w = max(1, w // 2)
+-        return F.interpolate(tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
+-
+-    def _upsample(self, tensor: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
+-        return F.interpolate(tensor, size=size, mode='bilinear', align_corners=False)
+-
+-    def _multi_band_blend(self, src_lin: torch.Tensor, dst_lin: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+-        if self.levels == 1:
+-            return src_lin * mask + dst_lin * (1.0 - mask)
+-
+-        lap_src = []
+-        lap_dst = []
+-        mask_levels = []
+-
+-        curr_src = src_lin
+-        curr_dst = dst_lin
+-        curr_mask = mask
+-        gauss_src = [curr_src]
+-        gauss_dst = [curr_dst]
+-        gauss_mask = [curr_mask]
+-
+-        for _ in range(self.levels - 1):
+-            blurred_src = self._gaussian_blur(curr_src)
+-            blurred_dst = self._gaussian_blur(curr_dst)
+-            blurred_mask = self._gaussian_blur(curr_mask)
+-
+-            lap_src.append(curr_src - blurred_src)
+-            lap_dst.append(curr_dst - blurred_dst)
+-            mask_levels.append(torch.clamp(blurred_mask, 0.0, 1.0))
+-
+-            curr_src = self._downsample(blurred_src)
+-            curr_dst = self._downsample(blurred_dst)
+-            curr_mask = self._downsample(blurred_mask)
+-
+-            gauss_src.append(curr_src)
+-            gauss_dst.append(curr_dst)
+-            gauss_mask.append(curr_mask)
+-
+-        base_mask = torch.clamp(gauss_mask[-1], 0.0, 1.0)
+-        blended = gauss_src[-1] * base_mask + gauss_dst[-1] * (1.0 - base_mask)
+-
+-        for level in reversed(range(self.levels - 1)):
+-            blended = self._upsample(blended, gauss_src[level].shape[-2:])
+-            lap_blend = lap_src[level] * mask_levels[level] + lap_dst[level] * (1.0 - mask_levels[level])
+-            blended = blended + lap_blend
+-
+-        return blended
+-
+-    def _ensure_temporal_state(self, track_token: str) -> Optional[_TemporalState]:
+-        state = self._temporal_states.get(track_token)
+-        if state is None:
+-            try:
+-                state = _TemporalState(self.roi_width, self.roi_height)
+-            except Exception:
+-                return None
+-            self._temporal_states[track_token] = state
+-        return state
+-
+-    def _stabilize_mask(
+-        self,
+-        state: _TemporalState,
+-        mask_tensor: torch.Tensor,
+-        mask_numpy: numpy.ndarray,
+-        flow_bundle: Optional[Tuple['cv2.cuda.GpuMat', 'cv2.cuda.GpuMat']]
+-    ) -> Tuple[torch.Tensor, numpy.ndarray]:
+-        if state.prev_mask is None or flow_bundle is None:
+-            state.prev_mask = mask_numpy.copy()
+-            return mask_tensor, mask_numpy
+-
+-        flow_gpu, cost_gpu = flow_bundle
+-        warped_mask, reliable = state.warp_mask(state.prev_mask, flow_gpu, cost_gpu, float(self.temporal_tau))
+-        reliable_t = torch.from_numpy(reliable).to(self.device, dtype=torch.float32)
+-        warped_t = torch.from_numpy(warped_mask).to(self.device, dtype=torch.float32)
+-        mask_tensor = torch.clamp(mask_tensor * (1.0 - reliable_t) + warped_t * reliable_t, 0.0, 1.0)
+-        mask_numpy = mask_tensor.detach().cpu().numpy().astype(numpy.float32)
+-        return mask_tensor, mask_numpy
+-
+-    def _apply_temporal(
+-        self,
+-        state: _TemporalState,
+-        curr_gray: numpy.ndarray,
+-        flow_bundle: Optional[Tuple['cv2.cuda.GpuMat', 'cv2.cuda.GpuMat']],
+-        frame_bgr: torch.Tensor,
+-        blended_lin: torch.Tensor,
+-        mask_numpy: numpy.ndarray
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        if state.prev_bg_gray is None or state.prev_comp_bgr is None:
+-            state.prev_bg_gray = curr_gray
+-            state.prev_comp_bgr = frame_bgr.cpu().numpy()
+-            state.prev_mask = mask_numpy.copy()
+-            return frame_bgr, blended_lin
+-
+-        try:
+-            if flow_bundle is None:
+-                flow_bundle = state.calc_flow(state.prev_bg_gray, curr_gray)
+-            if flow_bundle is None:
+-                state.prev_bg_gray = curr_gray
+-                state.prev_comp_bgr = frame_bgr.cpu().numpy()
+-                state.prev_mask = mask_numpy.copy()
+-                return frame_bgr, blended_lin
+-            flow_gpu, cost_gpu = flow_bundle
+-            warped_prev, reliable = state.warp_previous(state.prev_comp_bgr, flow_gpu, cost_gpu, float(self.temporal_tau))
+-        except Exception:
+-            state.reset()
+-            state.prev_bg_gray = curr_gray
+-            state.prev_comp_bgr = frame_bgr.cpu().numpy()
+-            state.prev_mask = mask_numpy.copy()
+-            return frame_bgr, blended_lin
+-
+-        prev_tensor = torch.from_numpy(warped_prev).to(self.device, dtype=torch.float32) * (1.0 / 255.0)
+-        curr_tensor = frame_bgr.to(torch.float32) * (1.0 / 255.0)
+-
+-        prev_lin = self._srgb_to_linear(prev_tensor.permute(2, 0, 1).unsqueeze(0))
+-        curr_lin = self._srgb_to_linear(curr_tensor.permute(2, 0, 1).unsqueeze(0))
+-
+-        reliable_tensor = torch.from_numpy(reliable).to(self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+-        reliable_tensor = torch.clamp(reliable_tensor, 0.0, 1.0)
+-
+-        temp_lin = prev_lin * self.temporal_alpha + curr_lin * (1.0 - self.temporal_alpha)
+-        blended_lin = curr_lin * (1.0 - reliable_tensor) + temp_lin * reliable_tensor
+-
+-        out_srgb = self._linear_to_srgb(blended_lin)
+-        out_uint8 = torch.clamp(out_srgb * 255.0 + 0.5, 0.0, 255.0).to(torch.uint8)
+-        frame_bgr = out_uint8.squeeze(0).permute(1, 2, 0).contiguous()
+-
+-        state.prev_bg_gray = curr_gray
+-        state.prev_comp_bgr = frame_bgr.cpu().numpy()
+-        state.prev_mask = mask_numpy.copy()
+-
+-        return frame_bgr, blended_lin
+-
+-    def _apply_color_transfer(
+-        self,
+-        track_token: str,
+-        warped_rgb: torch.Tensor,
+-        mask: torch.Tensor,
+-        bg_reference: numpy.ndarray
+-    ) -> torch.Tensor:
+-        """Apply color transfer in LINEAR light space with quantized, lowpass gain/bias."""
+-        mask_cpu = mask.detach().cpu().numpy()
+-        region = mask_cpu > 0.1
+-        if region.sum() < 16:
+-            return warped_rgb
+-
+-        # Convert to linear space for perceptually uniform color matching
+-        warped_linear = self._srgb_to_linear(warped_rgb.unsqueeze(0).permute(0, 3, 1, 2)).squeeze(0).permute(1, 2, 0)
+-        bg_float = torch.from_numpy(bg_reference.astype(numpy.float32) / 255.0).to(self.device)
+-        bg_linear = self._srgb_to_linear(bg_float.unsqueeze(0).permute(0, 3, 1, 2)).squeeze(0).permute(1, 2, 0)
+-
+-        # Get masked regions
+-        mask_3d = mask.unsqueeze(-1).expand_as(warped_linear)
+-        region_tensor = mask > 0.1
+-
+-        warped_masked = warped_linear[region_tensor.unsqueeze(-1).expand_as(warped_linear)].view(-1, 3)
+-        bg_masked = bg_linear[region_tensor.unsqueeze(-1).expand_as(bg_linear)].view(-1, 3)
+-
+-        if warped_masked.shape[0] < 16:
+-            return warped_rgb
+-
+-        # Compute per-channel statistics in linear space
+-        src_mean_now = warped_masked.mean(dim=0)
+-        src_std_now = warped_masked.std(dim=0) + 1e-6
+-        tgt_mean_now = bg_masked.mean(dim=0)
+-        tgt_std_now = bg_masked.std(dim=0) + 1e-6
+-
+-        # Compute raw gain and bias
+-        raw_gain = tgt_std_now / src_std_now
+-        raw_bias = tgt_mean_now - raw_gain * src_mean_now
+-
+-        # Quantize to prevent micro-pumping (round to nearest 1/256)
+-        quantize_steps = 256.0
+-        raw_gain = torch.round(raw_gain * quantize_steps) / quantize_steps
+-        raw_bias = torch.round(raw_bias * quantize_steps) / quantize_steps
+-
+-        # Get or create state
+-        state = self._color_states.get(track_token)
+-        if state is None:
+-            # First frame - initialize with quantized values
+-            state = _ColorState(
+-                src_mean=src_mean_now.detach().cpu().numpy(),
+-                src_std=src_std_now.detach().cpu().numpy(),
+-                tgt_mean=tgt_mean_now.detach().cpu().numpy(),
+-                tgt_std=tgt_std_now.detach().cpu().numpy(),
+-                gain_rgb=raw_gain.detach().clone(),
+-                bias_rgb=raw_bias.detach().clone()
+-            )
+-            self._color_states[track_token] = state
+-        else:
+-            # Lowpass filter gain/bias to prevent frame-to-frame pumping
+-            momentum = self.color_momentum
+-            state.gain_rgb = (1.0 - momentum) * state.gain_rgb + momentum * raw_gain
+-            state.bias_rgb = (1.0 - momentum) * state.bias_rgb + momentum * raw_bias
+-            # Quantize filtered values too
+-            state.gain_rgb = torch.round(state.gain_rgb * quantize_steps) / quantize_steps
+-            state.bias_rgb = torch.round(state.bias_rgb * quantize_steps) / quantize_steps
+-
+-        # Apply color correction in linear space
+-        adjusted_linear = warped_linear * state.gain_rgb + state.bias_rgb
+-        adjusted_linear = torch.clamp(adjusted_linear, 0.0, 1.0)
+-
+-        # Convert back to sRGB
+-        adjusted_srgb = self._linear_to_srgb(adjusted_linear.unsqueeze(0).permute(0, 3, 1, 2)).squeeze(0).permute(1, 2, 0)
+-        return torch.clamp(adjusted_srgb, 0.0, 1.0)
+-
+-    @staticmethod
+-    def _reinhard_transfer(
+-        lab_image: numpy.ndarray,
+-        src_mean: numpy.ndarray,
+-        src_std: numpy.ndarray,
+-        tgt_mean: numpy.ndarray,
+-        tgt_std: numpy.ndarray
+-    ) -> numpy.ndarray:
+-        adjusted = lab_image.copy()
+-        ratios = tgt_std / src_std
+-        for idx in range(3):
+-            adjusted[..., idx] = (adjusted[..., idx] - src_mean[idx]) * ratios[idx] + tgt_mean[idx]
+-        adjusted[..., 0] = numpy.clip(adjusted[..., 0], 0.0, 100.0)
+-        adjusted[..., 1] = numpy.clip(adjusted[..., 1], -128.0, 127.0)
+-        adjusted[..., 2] = numpy.clip(adjusted[..., 2], -128.0, 127.0)
+-        return adjusted
+-
+-    @staticmethod
+-    def _srgb_to_linear(tensor: torch.Tensor) -> torch.Tensor:
+-        tensor = torch.clamp(tensor, 0.0, 1.0)
+-        return torch.where(
+-            tensor <= 0.04045,
+-            tensor / 12.92,
+-            torch.pow(torch.clamp((tensor + 0.055) / 1.055, min=0.0), 2.4)
+-        )
+-
+-    @staticmethod
+-    def _linear_to_srgb(tensor: torch.Tensor) -> torch.Tensor:
+-        tensor = torch.clamp(tensor, 0.0, 1.0)
+-        return torch.where(
+-            tensor <= 0.0031308,
+-            tensor * 12.92,
+-            1.055 * torch.pow(torch.clamp(tensor, min=0.0), 1.0 / 2.4) - 0.055
+-        )
+-
+-    def _apply_dither(self, tensor: torch.Tensor) -> torch.Tensor:
+-        h, w = tensor.shape[-2:]
+-        y = torch.arange(h, device=self.device, dtype=torch.float32).view(1, 1, h, 1)
+-        x = torch.arange(w, device=self.device, dtype=torch.float32).view(1, 1, 1, w)
+-        noise = torch.sin((x * 12.9898 + y * 78.233) * 43758.5453)
+-        noise = torch.frac(noise) - 0.5
+-        noise = noise.repeat(1, tensor.shape[1], 1, 1)
+-        return tensor + noise * (1.0 / 512.0)
+-
+-    def _compute_sdf_alpha(self, sdf: torch.Tensor) -> torch.Tensor:
+-        width = float(self._sdf_half_width)
+-        t = torch.clamp((sdf + width) / (2.0 * width), 0.0, 1.0)
+-        return t * t * (3.0 - 2.0 * t)
+-
+-    def _compute_similarity(self, img1: torch.Tensor, img2: torch.Tensor) -> float:
+-        """Fast approximate SSIM using mean squared difference."""
+-        if img1.shape != img2.shape:
+-            return 0.0
+-        # Simple MSE-based similarity (faster than full SSIM)
+-        mse = torch.mean((img1 - img2) ** 2).item()
+-        # Convert MSE to similarity score (0-1 range, 1 = identical)
+-        # Assuming images are in [0, 1] range, MSE of 0.01 is ~90% similar
+-        similarity = max(0.0, 1.0 - (mse * 50.0))  # Scale MSE to similarity
+-        return similarity
+-
+-    def _apply_temporal_snap(self, track_token: Optional[str], warped_rgb: torch.Tensor) -> torch.Tensor:
+-        """Apply temporal snapping: if current face is very similar to previous, blend toward previous."""
+-        if track_token is None:
+-            return warped_rgb
+-
+-        prev_warped = self._prev_warped.get(track_token)
+-        if prev_warped is None:
+-            # First frame for this track, just cache and return
+-            self._prev_warped[track_token] = warped_rgb.detach().clone()
+-            return warped_rgb
+-
+-        # Check similarity
+-        similarity = self._compute_similarity(warped_rgb, prev_warped)
+-
+-        if similarity >= self.snap_threshold:
+-            # Very similar to previous frame - blend heavily toward previous to reduce jitter
+-            # Use 0.3 weight for current, 0.7 for previous (aggressive smoothing)
+-            snapped = 0.3 * warped_rgb + 0.7 * prev_warped
+-            self._prev_warped[track_token] = snapped.detach().clone()
+-            return snapped
+-        else:
+-            # Different enough - use current frame but cache it
+-            self._prev_warped[track_token] = warped_rgb.detach().clone()
+-            return warped_rgb
+-
+-    def _apply_seam_band_blending(
+-        self,
+-        track_token: Optional[str],
+-        blended_bgr: torch.Tensor,
+-        mask: torch.Tensor
+-    ) -> torch.Tensor:
+-        """Apply multiband blending on seam edge with temporal reuse to eliminate edge flicker."""
+-        if track_token is None:
+-            return blended_bgr
+-
+-        # Get or create seam state
+-        seam_state = self._seam_states.get(track_token)
+-        if seam_state is None:
+-            seam_state = _SeamBandState()
+-            self._seam_states[track_token] = seam_state
+-
+-        # Compute mask center for motion tracking
+-        mask_binary = (mask > 0.5).float()
+-        if mask_binary.sum() < 10:
+-            return blended_bgr  # No valid mask
+-
+-        ys, xs = torch.where(mask_binary > 0)
+-        center_x = xs.float().mean().item()
+-        center_y = ys.float().mean().item()
+-
+-        # Check if we should reuse previous seam (low motion)
+-        if seam_state.prev_seam_bgr is not None:
+-            motion = ((center_x - seam_state.prev_center_x) ** 2 +
+-                     (center_y - seam_state.prev_center_y) ** 2) ** 0.5
+-
+-            if motion < self.seam_motion_threshold:
+-                # Low motion - reuse previous seam band
+-                # Extract seam band region (dilated - original)
+-                kernel_size = seam_state.seam_width
+-                # Use max pooling as dilation
+-                mask_4d = mask.unsqueeze(0).unsqueeze(0)
+-                dilated = F.max_pool2d(mask_4d, kernel_size=kernel_size*2+1, stride=1, padding=kernel_size)
+-                dilated = dilated.squeeze(0).squeeze(0)
+-
+-                # Seam band = dilated - original
+-                seam_band = torch.clamp(dilated - mask, 0.0, 1.0)
+-
+-                # Blend previous seam into current frame at seam band
+-                seam_band_3d = seam_band.unsqueeze(-1)
+-                blended_bgr = blended_bgr * (1.0 - seam_band_3d) + seam_state.prev_seam_bgr * seam_band_3d
+-
+-        # Update state with current frame
+-        seam_state.prev_seam_bgr = blended_bgr.detach().clone()
+-        seam_state.prev_center_x = center_x
+-        seam_state.prev_center_y = center_y
+-
+-        return blended_bgr
+-
+-    def reset_temporal_state(self) -> None:
+-        for state in self._temporal_states.values():
+-            state.reset()
+-        self._temporal_states.clear()
+-        self._color_states.clear()
+-        self._prev_warped.clear()
+-        self._seam_states.clear()
+-        self._prev_quality.clear()
+-
+-
+-_COMPOSER_CACHE: Dict[Tuple[int, int, int], GpuRoiComposer] = {}
+-
+-
+-def get_composer(device: torch.device, height: int, width: int) -> GpuRoiComposer:
+-    """Return a cached composer for ``device`` and ROI size."""
+-    device = torch.device(device)
+-    index = device.index
+-    if index is None:
+-        index = torch.cuda.current_device()
+-    key = (index, height, width)
+-    composer = _COMPOSER_CACHE.get(key)
+-    if composer is None:
+-        composer = GpuRoiComposer(device, (height, width))
+-        _COMPOSER_CACHE[key] = composer
+-    return composer
+-
+-
+-def reset_all_temporal_states() -> None:
+-	for composer in _COMPOSER_CACHE.values():
+-		composer.reset_temporal_state()
+diff --git a/facefusion/gpu/kernels.py b/facefusion/gpu/kernels.py
+deleted file mode 100644
+index 2f96f5a..0000000
+--- a/facefusion/gpu/kernels.py
++++ /dev/null
+@@ -1,187 +0,0 @@
+-"""CUDA kernels compiled at runtime for GPU-accelerated ROI warping."""
+-from __future__ import annotations
+-
+-import functools
+-
+-import torch
+-from torch.utils.cpp_extension import load_inline
+-
+-
+-@functools.lru_cache(maxsize=1)
+-def _load_module() -> object:
+-    cuda_src = r"""
+-    #include <cuda_runtime.h>
+-    #include <torch/extension.h>
+-    #include <ATen/cuda/CUDAContext.h>
+-    #include <ATen/cuda/CUDAUtils.h>
+-    #include <math.h>
+-
+-    __device__ __forceinline__ float catmull_rom(float p0, float p1, float p2, float p3, float t) {
+-        float a0 = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
+-        float a1 = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
+-        float a2 = -0.5f * p0 + 0.5f * p2;
+-        return ((a0 * t + a1) * t + a2) * t + p1;
+-    }
+-
+-    __device__ __forceinline__ float4 sample_catmull_rom(cudaTextureObject_t tex, float sx, float sy) {
+-        float fx = floorf(sx);
+-        float fy = floorf(sy);
+-        float tx = sx - fx;
+-        float ty = sy - fy;
+-
+-        int ix = static_cast<int>(fx);
+-        int iy = static_cast<int>(fy);
+-
+-        float4 rows[4];
+-        for (int j = -1; j <= 2; ++j) {
+-            float4 p0 = tex2D<float4>(tex, static_cast<float>(ix - 1) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+-            float4 p1 = tex2D<float4>(tex, static_cast<float>(ix) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+-            float4 p2 = tex2D<float4>(tex, static_cast<float>(ix + 1) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+-            float4 p3 = tex2D<float4>(tex, static_cast<float>(ix + 2) + 0.5f, static_cast<float>(iy + j) + 0.5f);
+-
+-            rows[j + 1].x = catmull_rom(p0.x, p1.x, p2.x, p3.x, tx);
+-            rows[j + 1].y = catmull_rom(p0.y, p1.y, p2.y, p3.y, tx);
+-            rows[j + 1].z = catmull_rom(p0.z, p1.z, p2.z, p3.z, tx);
+-            rows[j + 1].w = catmull_rom(p0.w, p1.w, p2.w, p3.w, tx);
+-        }
+-
+-        float4 result;
+-        result.x = catmull_rom(rows[0].x, rows[1].x, rows[2].x, rows[3].x, ty);
+-        result.y = catmull_rom(rows[0].y, rows[1].y, rows[2].y, rows[3].y, ty);
+-        result.z = catmull_rom(rows[0].z, rows[1].z, rows[2].z, rows[3].z, ty);
+-        result.w = catmull_rom(rows[0].w, rows[1].w, rows[2].w, rows[3].w, ty);
+-        return result;
+-    }
+-
+-    __global__ void warp_catmull_kernel(
+-        cudaTextureObject_t src_tex,
+-        float* __restrict__ out,
+-        const float* __restrict__ affine,
+-        int width,
+-        int height,
+-        int channels,
+-        size_t out_stride_bytes
+-    ) {
+-        int x = blockIdx.x * blockDim.x + threadIdx.x;
+-        int y = blockIdx.y * blockDim.y + threadIdx.y;
+-        if (x >= width || y >= height) {
+-            return;
+-        }
+-
+-        float sx = affine[0] * static_cast<float>(x) + affine[1] * static_cast<float>(y) + affine[2];
+-        float sy = affine[3] * static_cast<float>(x) + affine[4] * static_cast<float>(y) + affine[5];
+-
+-        float4 sample = sample_catmull_rom(src_tex, sx, sy);
+-
+-        char* base = reinterpret_cast<char*>(out);
+-        float* row_ptr = reinterpret_cast<float*>(base + static_cast<size_t>(y) * out_stride_bytes);
+-        float* pixel_ptr = row_ptr + static_cast<size_t>(x) * channels;
+-
+-        if (channels >= 1) {
+-            pixel_ptr[0] = sample.x;
+-        }
+-        if (channels >= 2) {
+-            pixel_ptr[1] = sample.y;
+-        }
+-        if (channels >= 3) {
+-            pixel_ptr[2] = sample.z;
+-        }
+-        if (channels >= 4) {
+-            pixel_ptr[3] = sample.w;
+-        }
+-    }
+-
+-    static cudaTextureObject_t create_texture(const torch::Tensor& src) {
+-        cudaTextureObject_t tex = 0;
+-        cudaResourceDesc res_desc{};
+-        cudaTextureDesc tex_desc{};
+-
+-        TORCH_CHECK(src.dim() == 3, "src tensor must be HxWxC");
+-        auto sizes = src.sizes();
+-        int height = static_cast<int>(sizes[0]);
+-        int width = static_cast<int>(sizes[1]);
+-        int channels = static_cast<int>(sizes[2]);
+-        TORCH_CHECK(channels == 4, "src tensor expects 4 channels (B, G, R, extra)");
+-
+-        res_desc.resType = cudaResourceTypePitch2D;
+-        res_desc.res.pitch2D.devPtr = const_cast<void*>(src.data_ptr());
+-        res_desc.res.pitch2D.desc = cudaCreateChannelDesc<float4>();
+-        res_desc.res.pitch2D.width = width;
+-        res_desc.res.pitch2D.height = height;
+-        res_desc.res.pitch2D.pitchInBytes = width * sizeof(float4);
+-
+-        tex_desc.addressMode[0] = cudaAddressModeClamp;
+-        tex_desc.addressMode[1] = cudaAddressModeClamp;
+-        tex_desc.filterMode = cudaFilterModePoint;
+-        tex_desc.readMode = cudaReadModeElementType;
+-        tex_desc.normalizedCoords = 0;
+-
+-        TORCH_CHECK(cudaCreateTextureObject(&tex, &res_desc, &tex_desc, nullptr) == cudaSuccess, "Failed to create texture");
+-        return tex;
+-    }
+-
+-    static void destroy_texture(cudaTextureObject_t tex) {
+-        if (tex != 0) {
+-            cudaDestroyTextureObject(tex);
+-        }
+-    }
+-
+-    torch::Tensor warp_face(
+-        torch::Tensor src,
+-        torch::Tensor affine,
+-        int64_t width,
+-        int64_t height
+-    ) {
+-        TORCH_CHECK(src.is_cuda(), "src must be CUDA");
+-        TORCH_CHECK(affine.is_cuda(), "affine must be CUDA");
+-        TORCH_CHECK(src.dtype() == torch::kFloat32, "src tensor expects float32");
+-        TORCH_CHECK(affine.dtype() == torch::kFloat32, "affine tensor expects float32");
+-        TORCH_CHECK(affine.numel() == 6, "affine must have 6 elements");
+-        TORCH_CHECK(width > 0 && height > 0, "output width/height must be positive");
+-
+-        int channels = static_cast<int>(src.size(2));
+-        auto options = src.options();
+-        auto out = torch::empty({height, width, channels}, options);
+-
+-        cudaTextureObject_t tex = create_texture(src);
+-
+-        const dim3 block(16, 16);
+-        const dim3 grid(
+-            static_cast<unsigned int>((width + block.x - 1) / block.x),
+-            static_cast<unsigned int>((height + block.y - 1) / block.y)
+-        );
+-
+-        auto stream = at::cuda::getCurrentCUDAStream();
+-        size_t out_stride_bytes = static_cast<size_t>(out.stride(0)) * out.element_size();
+-
+-        warp_catmull_kernel<<<grid, block, 0, stream.stream()>>>(
+-            tex,
+-            out.data_ptr<float>(),
+-            affine.data_ptr<float>(),
+-            static_cast<int>(width),
+-            static_cast<int>(height),
+-            channels,
+-            out_stride_bytes
+-        );
+-        destroy_texture(tex);
+-        AT_CUDA_CHECK(cudaGetLastError());
+-        return out;
+-    }
+-
+-    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+-        m.def("warp_face", &warp_face, "Catmull-Rom warp of source ROI into destination frame");
+-    }
+-    """
+-    return load_inline(
+-        name="facefusion_cuda_kernels",
+-        cpp_sources="",
+-        cuda_sources=cuda_src,
+-        functions=["warp_face"],
+-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+-    )
+-
+-
+-def warp_face(src_rgba: torch.Tensor, affine: torch.Tensor, width: int, height: int) -> torch.Tensor:
+-    """Warp ``src_rgba`` (BGR + extra channel) into an ROI with Catmull-Rom sampling."""
+-    module = _load_module()
+-    return module.warp_face(src_rgba, affine, int(width), int(height))
+diff --git a/facefusion/gpu/preprocess.py b/facefusion/gpu/preprocess.py
+deleted file mode 100644
+index bd829d9..0000000
+--- a/facefusion/gpu/preprocess.py
++++ /dev/null
+@@ -1,41 +0,0 @@
+-"""GPU-native preprocessing helpers using CV-CUDA when available."""
+-from __future__ import annotations
+-
+-from typing import Optional, Tuple
+-
+-import torch
+-
+-try:
+-    import cvcuda  # type: ignore
+-    _HAS_CVCUDA = True
+-except Exception:
+-    cvcuda = None  # type: ignore
+-    _HAS_CVCUDA = False
+-
+-
+-def to_nchw_float(frame_bgr: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+-    if frame_bgr.dtype != torch.float32:
+-        frame_bgr = frame_bgr.to(torch.float32)
+-    frame = frame_bgr / 255.0
+-    frame = (frame - mean) / std
+-    return frame.permute(0, 3, 1, 2).contiguous()
+-
+-
+-def from_nchw_float(frame: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+-    frame = frame.permute(0, 2, 3, 1)
+-    frame = frame * std + mean
+-    frame = frame.clamp(0.0, 1.0) * 255.0
+-    return frame.to(torch.uint8)
+-
+-
+-def resize_affine(frame: torch.Tensor, matrices: torch.Tensor, out_size: Tuple[int, int]) -> torch.Tensor:
+-    batch = frame.shape[0]
+-    if _HAS_CVCUDA:
+-        tensor = cvcuda.Tensor(frame)
+-        mats = cvcuda.Tensor(matrices)
+-        warped = cvcuda.warpaffine(tensor, mats, out_size, interpolation=cvcuda.Interp.LINEAR, border_mode=cvcuda.Border.CLAMP)  # type: ignore[attr-defined]
+-        return torch.as_tensor(warped.cuda(), device=frame.device)
+-    grid = torch.nn.functional.affine_grid(matrices, torch.Size((batch, frame.shape[3], *out_size)), align_corners=False)
+-    frame_t = frame.permute(0, 3, 1, 2)
+-    warped = torch.nn.functional.grid_sample(frame_t, grid, mode='bilinear', padding_mode='border', align_corners=False)
+-    return warped.permute(0, 2, 3, 1)
+diff --git a/facefusion/gpu_video_pipeline.py b/facefusion/gpu_video_pipeline.py
+deleted file mode 100644
+index 4042caa..0000000
+--- a/facefusion/gpu_video_pipeline.py
++++ /dev/null
+@@ -1,278 +0,0 @@
+-"""GPU video pipeline using NVDEC for decode and NVENC for encode.
+-
+-This module builds an end-to-end GPU pipeline that keeps video frames on
+-CUDA memory from ingest through post-processing to final encode. The
+-implementation follows the recommendations outlined in the FaceFusion
+-3.4.0 performance plan: frames are decoded with NVDEC, processed on a
+-user-supplied CUDA stream, and encoded with NVENC after a GPU-side color
+-conversion to NV12. Decode, compute, and encode run on separate CUDA
+-streams and are synchronised with CUDA events so that the specialised
+-hardware engines can overlap as much work as possible.
+-"""
+-from __future__ import annotations
+-
+-import contextlib
+-from collections import deque
+-from concurrent.futures import Future, ThreadPoolExecutor
+-from dataclasses import dataclass
+-from typing import Callable, Deque, Optional, Tuple
+-
+-import numpy
+-import torch
+-
+-try:
+-    import torchaudio  # type: ignore
+-    _HAS_TORCHAUDIO = True
+-except Exception:  # pragma: no cover - optional dependency
+-    torchaudio = None  # type: ignore
+-    _HAS_TORCHAUDIO = False
+-
+-try:
+-    import cvcuda  # type: ignore
+-    _HAS_CVCUDA = True
+-except Exception:  # pragma: no cover - optional dependency
+-    cvcuda = None  # type: ignore
+-    _HAS_CVCUDA = False
+-
+-from facefusion import logger
+-
+-
+-DecodeCallback = Callable[[int, numpy.ndarray], numpy.ndarray]
+-
+-
+-@dataclass
+-class PipelineConfig:
+-    src: str
+-    dst: str
+-    fps: float
+-    width: int
+-    height: int
+-    device: int = 0
+-    chunk_size: int = 1
+-
+-
+-def is_available() -> bool:
+-    """Return ``True`` when the NVDEC/NVENC pipeline can run."""
+-    if not _HAS_TORCHAUDIO:
+-        logger.debug('GPU pipeline unavailable: torchaudio missing', __name__)
+-        return False
+-    if not torch.cuda.is_available():
+-        logger.debug('GPU pipeline unavailable: CUDA not available', __name__)
+-        return False
+-    return True
+-
+-
+-class _Nv12Converter:
+-    """Helper to convert RGB tensors on CUDA into NV12 layout."""
+-
+-    def __init__(self, width: int, height: int, device: int) -> None:
+-        self.width = width
+-        self.height = height
+-        self.device = device
+-
+-    def rgb_to_nv12(self, rgb: torch.Tensor) -> torch.Tensor:
+-        """Convert ``rgb`` (B,H,W,3) uint8 tensor on CUDA to NV12 format."""
+-        if rgb.dtype != torch.uint8:
+-            rgb = rgb.to(torch.uint8)
+-        if rgb.shape[-1] != 3:
+-            raise ValueError('Expected last dimension to be 3 (RGB).')
+-        if rgb.dim() == 4:
+-            # assume batch dimension of 1
+-            if rgb.shape[0] != 1:
+-                raise ValueError('Only batch size 1 supported for NV12 conversion.')
+-            rgb = rgb[0]
+-        if rgb.device.index != self.device:
+-            rgb = rgb.to(self.device, non_blocking=True)
+-
+-        if _HAS_CVCUDA:
+-            # CV-CUDA expects NHWC tensors; wrap and convert directly.
+-            image = cvcuda.Tensor(rgb.unsqueeze(0))  # type: ignore[attr-defined]
+-            # Convert RGB -> NV12, result height = H * 3/2, width = W, channels = 1
+-            nv12 = cvcuda.cvtcolor(image, cvcuda.ColorConversion.RGB2NV12)  # type: ignore[attr-defined]
+-            return torch.as_tensor(nv12.cuda(), device=rgb.device)
+-
+-        # Manual conversion fallback using Torch ops on GPU.
+-        rgb_f = rgb.to(dtype=torch.float32)
+-        r = rgb_f[..., 0]
+-        g = rgb_f[..., 1]
+-        b = rgb_f[..., 2]
+-        y = (0.257 * r + 0.504 * g + 0.098 * b + 16.0)
+-        u = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0)
+-        v = (0.439 * r - 0.368 * g - 0.071 * b + 128.0)
+-
+-        y = y.clamp(0.0, 255.0).round().to(torch.uint8)
+-        u = u.clamp(0.0, 255.0)
+-        v = v.clamp(0.0, 255.0)
+-
+-        # Downsample 2x2 blocks for chroma (nearest-neighbour average).
+-        u_plane = torch.nn.functional.avg_pool2d(
+-            u.view(1, 1, self.height, self.width), kernel_size=2, stride=2
+-        )[0, 0]
+-        v_plane = torch.nn.functional.avg_pool2d(
+-            v.view(1, 1, self.height, self.width), kernel_size=2, stride=2
+-        )[0, 0]
+-        u_plane = u_plane.round().to(torch.uint8)
+-        v_plane = v_plane.round().to(torch.uint8)
+-
+-        interleaved_uv = torch.stack((u_plane, v_plane), dim=-1)
+-        interleaved_uv = interleaved_uv.view(-1, self.width)
+-        y_plane = y.view(self.height, self.width)
+-        nv12 = torch.cat((y_plane, interleaved_uv), dim=0)
+-        return nv12.contiguous()
+-
+-
+-class NvdecNvencPipeline:
+-    """High-throughput GPU video pipeline with overlapped stages."""
+-
+-    def __init__(self, config: PipelineConfig) -> None:
+-        if not is_available():
+-            raise RuntimeError('GPU video pipeline not available on this system.')
+-        self.config = config
+-        self.device = torch.device('cuda', index=config.device)
+-        self.decode_stream = torch.cuda.Stream(device=self.device)
+-        self.encode_stream = torch.cuda.Stream(device=self.device)
+-        self._reader = self._build_reader(config)
+-        self._writer = self._build_writer(config)
+-        self._converter = _Nv12Converter(config.width, config.height, config.device)
+-        self._closed = False
+-        self._buffer_pool: list[torch.Tensor] = []
+-        self._max_workers = max(2, min(8, (torch.get_num_threads() or 4)))
+-
+-    def _build_reader(self, config: PipelineConfig) -> "torchaudio.io.StreamReader":
+-        reader = torchaudio.io.StreamReader(
+-            src=config.src,
+-            format=None,
+-            buffer_chunk_size=0
+-        )
+-        reader.add_video_stream(
+-            frames_per_chunk=config.chunk_size,
+-            decoder='h264_cuvid',
+-            hw_accel=f'cuda:{config.device}',
+-            format='rgb24'
+-        )
+-        return reader
+-
+-    def _build_writer(self, config: PipelineConfig) -> "torchaudio.io.StreamWriter":
+-        writer = torchaudio.io.StreamWriter(
+-            dst=config.dst,
+-            format='mp4'
+-        )
+-        with contextlib.suppress(Exception):
+-            writer.set_muxer_option('vsync', 'cfr')
+-        writer.add_video_stream(
+-            frame_rate=config.fps,
+-            width=config.width,
+-            height=config.height,
+-            encoder='h264_nvenc',
+-            hw_accel=f'cuda:{config.device}',
+-            pixel_format='nv12',
+-            encoder_option={
+-                'preset': 'p4',
+-                'tune': 'hq',
+-                'rc': 'vbr_hq',
+-                'cq': '19',
+-                'bf': '2',
+-                'spatial_aq': '1',
+-                'temporal_aq': '1',
+-                'look_ahead': '0',
+-            },
+-        )
+-        writer.set_audio_stream(None)
+-        writer.open()
+-        return writer
+-
+-    def close(self) -> None:
+-        if self._closed:
+-            return
+-        with contextlib.suppress(Exception):
+-            self._writer.close()
+-        self._closed = True
+-
+-    def __enter__(self) -> "NvdecNvencPipeline":
+-        return self
+-
+-    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+-        self.close()
+-
+-    def run(self, process_frame: DecodeCallback) -> int:
+-        """Decode, process, and encode all frames; return processed count."""
+-        frame_total = 0
+-        inflight: Deque[Tuple[int, torch.Tensor, Future[numpy.ndarray]]] = deque()
+-
+-        def submit_job(index: int, cpu_buffer: torch.Tensor, ready_event: torch.cuda.Event) -> Future[numpy.ndarray]:
+-
+-            def _worker() -> numpy.ndarray:
+-                ready_event.synchronize()
+-                frame_np = cpu_buffer.numpy()
+-                result = process_frame(index, frame_np)
+-                if not isinstance(result, numpy.ndarray):
+-                    raise RuntimeError('process_frame callback must return numpy.ndarray')
+-                if result.dtype != numpy.uint8:
+-                    result = result.clip(0, 255).astype(numpy.uint8)
+-                return result
+-
+-            return executor.submit(_worker)
+-
+-        executor = ThreadPoolExecutor(max_workers=self._max_workers)
+-        try:
+-            for chunk in self._reader.stream():
+-                if not chunk:
+-                    break
+-                (frame_tensor,) = chunk
+-                cpu_buffer = self._acquire_buffer()
+-                decode_event = torch.cuda.Event()
+-                with torch.cuda.stream(self.decode_stream):
+-                    frame_tensor = frame_tensor.to(self.device, non_blocking=True)
+-                    frame_tensor = frame_tensor[:, [2, 1, 0], ...]  # RGB -> BGR
+-                    frame_tensor = frame_tensor.permute(0, 2, 3, 1).contiguous()
+-                    cpu_buffer.copy_(frame_tensor[0], non_blocking=True)
+-                decode_event.record(self.decode_stream)
+-
+-                future = submit_job(frame_total, cpu_buffer, decode_event)
+-                inflight.append((frame_total, cpu_buffer, future))
+-                self._drain_inflight(inflight, flush=False)
+-                frame_total += 1
+-
+-            self._drain_inflight(inflight, flush=True)
+-        finally:
+-            executor.shutdown(wait=True, cancel_futures=False)
+-
+-        self._writer.flush()
+-        return frame_total
+-
+-    def _drain_inflight(self, inflight: Deque[Tuple[int, torch.Tensor, Future[numpy.ndarray]]], flush: bool) -> None:
+-        while inflight:
+-            index, buffer, future = inflight[0]
+-            if not flush and not future.done():
+-                break
+-            inflight.popleft()
+-            try:
+-                processed_bgr = future.result()  # raises if callback failed
+-            finally:
+-                self._release_buffer(buffer)
+-            self._encode_frame(index, processed_bgr)
+-
+-    def _encode_frame(self, frame_index: int, frame_bgr: numpy.ndarray) -> None:
+-        if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+-            raise ValueError('Encoded frame must have shape (H, W, 3)')
+-        rgb_frame = numpy.ascontiguousarray(frame_bgr[..., ::-1])
+-        rgb_tensor = torch.from_numpy(rgb_frame)
+-        with torch.cuda.stream(self.encode_stream):
+-            rgb_tensor = rgb_tensor.to(self.device, non_blocking=True)
+-            rgb_tensor = rgb_tensor.unsqueeze(0)  # (1, H, W, 3)
+-            nv12 = self._converter.rgb_to_nv12(rgb_tensor)
+-            self._writer.encode_video(0, nv12, pts=frame_index)
+-
+-    def _acquire_buffer(self) -> torch.Tensor:
+-        if self._buffer_pool:
+-            return self._buffer_pool.pop()
+-        return torch.empty((self.config.height, self.config.width, 3), dtype=torch.uint8, pin_memory=True)
+-
+-    def _release_buffer(self, buffer: torch.Tensor) -> None:
+-        self._buffer_pool.append(buffer)
+-
+-
+-def run_pipeline(config: PipelineConfig, process_frame: DecodeCallback) -> int:
+-    """Utility to execute the NVDEC/NVENC pipeline if available."""
+-    with NvdecNvencPipeline(config) as pipeline:
+-        return pipeline.run(process_frame)
+diff --git a/facefusion/inference_manager.py b/facefusion/inference_manager.py
+index c91c0fc..780ada6 100644
+--- a/facefusion/inference_manager.py
++++ b/facefusion/inference_manager.py
+@@ -1,11 +1,9 @@
+ import importlib
+ import random
+ from time import sleep, time
+-from typing import List, Optional
++from typing import List
+ 
+-from onnxruntime import InferenceSession, SessionOptions, GraphOptimizationLevel, ExecutionMode
+-
+-import torch
++from onnxruntime import InferenceSession
+ 
+ from facefusion import logger, process_manager, state_manager, wording
+ from facefusion.app_context import detect_app_context
+@@ -67,65 +65,18 @@ def clear_inference_pool(module_name : str, model_names : List[str]) -> None:
+ 
+ 
+ def create_inference_session(model_path : str, execution_device_id : str, execution_providers : List[ExecutionProvider]) -> InferenceSession:
+-    model_file_name = get_file_name(model_path)
+-    start_time = time()
+-
+-    inference_session: Optional[InferenceSession] = None
+-    try:
+-        inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers)
+-        sess_options = SessionOptions()
+-        # Maximize graph optimizations
+-        sess_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+-        sess_options.enable_mem_pattern = True
+-
+-        lower_providers = [p.lower() for p in execution_providers]
+-        uses_gpu = any(p in ('cuda', 'tensorrt') for p in lower_providers)
+-
+-        thread_count = state_manager.get_item('execution_thread_count')
+-        configured_threads = thread_count if isinstance(thread_count, int) and thread_count > 0 else None
+-
+-        if not uses_gpu:
+-            try:
+-                sess_options.execution_mode = ExecutionMode.ORT_PARALLEL
+-            except Exception:
+-                pass
+-        else:
+-            try:
+-                device_index = int(execution_device_id)
+-            except Exception:
+-                device_index = 0
+-            try:
+-                with torch.cuda.device(device_index):
+-                    user_stream = torch.cuda.current_stream()
+-                    stream_ptr = str(user_stream.cuda_stream)  # type: ignore[attr-defined]
+-                updated_providers = []
+-                for provider, options in inference_session_providers:
+-                    if isinstance(options, dict) and provider in ('TensorrtExecutionProvider', 'CUDAExecutionProvider'):
+-                        provider_options = dict(options)
+-                        provider_options['has_user_compute_stream'] = '1'
+-                        provider_options['user_compute_stream'] = stream_ptr
+-                        if provider == 'TensorrtExecutionProvider':
+-                            provider_options.setdefault('trt_fp16_enable', True)
+-                            provider_options.setdefault('trt_timing_cache_enable', True)
+-                        updated_providers.append((provider, provider_options))
+-                    else:
+-                        updated_providers.append((provider, options))
+-                inference_session_providers = updated_providers
+-            except Exception as stream_exception:
+-                logger.debug(f'Falling back to provider-managed stream: {stream_exception}', __name__)
+-
+-        if configured_threads:
+-            sess_options.intra_op_num_threads = configured_threads
+-            sess_options.inter_op_num_threads = max(1, configured_threads // 2)
+-        inference_session = InferenceSession(model_path, sess_options = sess_options, providers = inference_session_providers)
+-    except Exception as exception:
+-        logger.error(wording.get('loading_model_failed').format(model_name = model_file_name), __name__)
+-        logger.debug(str(exception), __name__)
+-        fatal_exit(1)
+-
+-    assert inference_session is not None
+-    logger.debug(wording.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
+-    return inference_session
++	model_file_name = get_file_name(model_path)
++	start_time = time()
++
++	try:
++		inference_session_providers = create_inference_session_providers(execution_device_id, execution_providers)
++		inference_session = InferenceSession(model_path, providers = inference_session_providers)
++		logger.debug(wording.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
++		return inference_session
++
++	except Exception:
++		logger.error(wording.get('loading_model_failed').format(model_name = model_file_name), __name__)
++		fatal_exit(1)
+ 
+ 
+ def get_inference_context(module_name : str, model_names : List[str], execution_device_id : str, execution_providers : List[ExecutionProvider]) -> str:
+diff --git a/facefusion/processors/choices.py b/facefusion/processors/choices.py
+index 7e71216..ed80d9f 100755
+--- a/facefusion/processors/choices.py
++++ b/facefusion/processors/choices.py
+@@ -221,7 +221,6 @@ face_editor_head_roll_range : Sequence[float] = create_float_range(-1.0, 1.0, 0.
+ face_enhancer_blend_range : Sequence[int] = create_int_range(0, 100, 1)
+ face_enhancer_weight_range : Sequence[float] = create_float_range(0.0, 1.0, 0.05)
+ face_swapper_weight_range : Sequence[FaceSwapperWeight] = create_float_range(0.0, 1.0, 0.05)
+-face_swapper_trt_max_batch_range : Sequence[int] = create_int_range(1, 256, 1)
+ frame_colorizer_blend_range : Sequence[int] = create_int_range(0, 100, 1)
+ frame_enhancer_blend_range : Sequence[int] = create_int_range(0, 100, 1)
+ lip_syncer_weight_range : Sequence[float] = create_float_range(0.0, 1.0, 0.05)
+diff --git a/facefusion/processors/modules/face_swapper.py b/facefusion/processors/modules/face_swapper.py
+index 1e34623..394e9ed 100755
+--- a/facefusion/processors/modules/face_swapper.py
++++ b/facefusion/processors/modules/face_swapper.py
+@@ -1,9 +1,6 @@
+ from argparse import ArgumentParser
+ from functools import lru_cache
+-from typing import List, Optional, Tuple, Dict, Any
+-from concurrent.futures import ThreadPoolExecutor
+-from time import time
+-from facefusion import profiler
++from typing import List, Optional, Tuple
+ 
+ import cv2
+ import numpy
+@@ -11,7 +8,7 @@ import numpy
+ import facefusion.choices
+ import facefusion.jobs.job_manager
+ import facefusion.jobs.job_store
+-from facefusion import config, content_analyser, face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, face_tracker, inference_manager, logger, state_manager, tensorrt_runner, video_manager, wording
++from facefusion import config, content_analyser, face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, inference_manager, logger, state_manager, video_manager, wording
+ from facefusion.common_helper import get_first, is_macos
+ from facefusion.download import conditional_download_hashes, conditional_download_sources, resolve_download_url
+ from facefusion.execution import has_execution_provider
+@@ -25,54 +22,10 @@ from facefusion.processors import choices as processors_choices
+ from facefusion.processors.pixel_boost import explode_pixel_boost, implode_pixel_boost
+ from facefusion.processors.types import FaceSwapperInputs
+ from facefusion.program_helper import find_argument_group
+-from facefusion.thread_helper import conditional_thread_semaphore, thread_lock
+-from facefusion.hash_helper import create_hash
++from facefusion.thread_helper import conditional_thread_semaphore
+ from facefusion.types import ApplyStateItem, Args, DownloadScope, Embedding, Face, InferencePool, ModelOptions, ModelSet, ProcessMode, VisionFrame
+ from facefusion.vision import read_static_image, read_static_images, read_static_video_frame, unpack_resolution
+ 
+-# Shared caches for multi-threaded frame processing
+-CACHE_LOCK = thread_lock()
+-_SOURCE_FACE_CACHE : Dict[str, Face] = {}
+-_SOURCE_EMBEDDING_CACHE : Dict[str, Embedding] = {}
+-
+-# Optional CUDA I/O binding via CuPy (reduces copies on CUDA EP)
+-try:
+-    import cupy as cp  # type: ignore
+-    _HAS_CUPY = True
+-except Exception:
+-    _HAS_CUPY = False
+-
+-_GPU_MODEL_STATS: Dict[Tuple[float, ...], Any] = {}
+-
+-# Dynamic strategy heuristic for CPU/CoreML
+-_HEURISTIC_FRAMES_TO_OBSERVE = 12
+-_heuristic_state : Dict[str, Any] = {
+-    'observed': 0,
+-    'single_or_zero_frames': 0,
+-    'decided': False,
+-    'prefer_sequential': False
+-}
+-
+-def _is_gpu_providers() -> bool:
+-    providers = [str(p).lower() for p in (state_manager.get_item('execution_providers') or [])]
+-    return any(p in ('cuda', 'tensorrt') for p in providers)
+-
+-def _record_face_count_for_heuristic(face_count: int) -> None:
+-    if _is_gpu_providers():
+-        # Always batch on GPU; no heuristic needed
+-        _heuristic_state['decided'] = True
+-        _heuristic_state['prefer_sequential'] = False
+-        return
+-    if _heuristic_state['decided']:
+-        return
+-    _heuristic_state['observed'] += 1
+-    if face_count <= 1:
+-        _heuristic_state['single_or_zero_frames'] += 1
+-    if _heuristic_state['observed'] >= _HEURISTIC_FRAMES_TO_OBSERVE:
+-        ratio = _heuristic_state['single_or_zero_frames'] / max(1, _heuristic_state['observed'])
+-        _heuristic_state['prefer_sequential'] = ratio >= 0.8
+-        _heuristic_state['decided'] = True
+-
+ 
+ @lru_cache()
+ def create_static_model_set(download_scope : DownloadScope) -> ModelSet:
+@@ -486,22 +439,13 @@ def register_args(program : ArgumentParser) -> None:
+ 		face_swapper_pixel_boost_choices = processors_choices.face_swapper_set.get(known_args.face_swapper_model)
+ 		group_processors.add_argument('--face-swapper-pixel-boost', help = wording.get('help.face_swapper_pixel_boost'), default = config.get_str_value('processors', 'face_swapper_pixel_boost', get_first(face_swapper_pixel_boost_choices)), choices = face_swapper_pixel_boost_choices)
+ 		group_processors.add_argument('--face-swapper-weight', help = wording.get('help.face_swapper_weight'), type = float, default = config.get_float_value('processors', 'face_swapper_weight', '0.5'), choices = processors_choices.face_swapper_weight_range)
+-		# Batching control: auto|always|never
+-		group_processors.add_argument('--face-swapper-batching', help = 'Batching strategy for face swapper: auto, always or never', default = config.get_str_value('processors', 'face_swapper_batching', 'auto'), choices = [ 'auto', 'always', 'never' ])
+-		default_trt = config.get_bool_value('processors', 'face_swapper_use_trt', 'true')
+-		group_processors.add_argument('--face-swapper-use-trt', dest = 'face_swapper_use_trt', help = wording.get('help.face_swapper_use_trt'), action = 'store_true', default = True if default_trt is None else default_trt)
+-		group_processors.add_argument('--face-swapper-disable-trt', dest = 'face_swapper_use_trt', help = wording.get('help.face_swapper_disable_trt'), action = 'store_false')
+-		group_processors.add_argument('--face-swapper-trt-max-batch', help = wording.get('help.face_swapper_trt_max_batch'), type = int, default = config.get_int_value('processors', 'face_swapper_trt_max_batch', '64'), choices = processors_choices.face_swapper_trt_max_batch_range)
+-		facefusion.jobs.job_store.register_step_keys([ 'face_swapper_model', 'face_swapper_pixel_boost', 'face_swapper_weight', 'face_swapper_batching', 'face_swapper_use_trt', 'face_swapper_trt_max_batch' ])
++		facefusion.jobs.job_store.register_step_keys([ 'face_swapper_model', 'face_swapper_pixel_boost', 'face_swapper_weight' ])
+ 
+ 
+ def apply_args(args : Args, apply_state_item : ApplyStateItem) -> None:
+ 	apply_state_item('face_swapper_model', args.get('face_swapper_model'))
+ 	apply_state_item('face_swapper_pixel_boost', args.get('face_swapper_pixel_boost'))
+ 	apply_state_item('face_swapper_weight', args.get('face_swapper_weight'))
+-	apply_state_item('face_swapper_batching', args.get('face_swapper_batching'))
+-	apply_state_item('face_swapper_use_trt', args.get('face_swapper_use_trt'))
+-	apply_state_item('face_swapper_trt_max_batch', args.get('face_swapper_trt_max_batch'))
+ 
+ 
+ def pre_check() -> bool:
+@@ -516,11 +460,9 @@ def pre_process(mode : ProcessMode) -> bool:
+ 		logger.error(wording.get('choose_image_source') + wording.get('exclamation_mark'), __name__)
+ 		return False
+ 
+-	face_tracker.reset_tracker()
+-
+ 	source_image_paths = filter_image_paths(state_manager.get_item('source_paths'))
+ 	source_frames = read_static_images(source_image_paths)
+-	source_faces = get_many_faces(source_frames, use_tracking = False)
++	source_faces = get_many_faces(source_frames)
+ 
+ 	if not get_one_face(source_faces):
+ 		logger.error(wording.get('no_source_face_detected') + wording.get('exclamation_mark'), __name__)
+@@ -555,492 +497,6 @@ def post_process() -> None:
+ 		face_landmarker.clear_inference_pool()
+ 		face_masker.clear_inference_pool()
+ 		face_recognizer.clear_inference_pool()
+-	# Clear local caches between runs
+-	with CACHE_LOCK:
+-		_SOURCE_FACE_CACHE.clear()
+-		_SOURCE_EMBEDDING_CACHE.clear()
+-	face_tracker.reset_tracker()
+-
+-def _build_prepared_source_for_face(source_face: Face, target_face: Face) -> Dict[str, Any]:
+-	"""Precompute the 'source' tensor once per target face.
+-	- For frame-based models (blendswap/uniface): returns the prepared source frame (1,C,H,W)
+-	- For embedding-based models: returns the balanced source embedding (1,D)
+-	"""
+-	model_options = get_model_options()
+-	model_type = model_options.get('type')
+-	if model_type in [ 'blendswap', 'uniface' ]:
+-		return { 'kind': 'frame', 'tensor': prepare_source_frame(source_face) }
+-	# embedding-based path
+-	src = _get_cached_source_embedding(source_face)
+-	if src is None:
+-		src = prepare_source_embedding(source_face)
+-	src = balance_source_embedding(src, target_face.embedding)
+-	return { 'kind': 'embedding', 'tensor': src }
+-
+-def _forward_swap_face_prepared(prepared_source: Dict[str, Any], crop_vision_frame: VisionFrame) -> VisionFrame:
+-	"""Same as forward_swap_face, but uses a precomputed 'source' tensor to avoid per-tile work."""
+-	face_swapper = get_inference_pool().get('face_swapper')
+-	model_type = get_model_options().get('type')
+-	face_swapper_inputs : Dict[str, Any] = {}
+-
+-	# Keep the CoreML fallback behavior consistent on macOS for certain models
+-	if is_macos() and has_execution_provider('coreml') and model_type in [ 'ghost', 'uniface' ]:
+-		face_swapper.set_providers([ facefusion.choices.execution_provider_set.get('cpu') ])
+-
+-	for face_swapper_input in face_swapper.get_inputs():
+-		if face_swapper_input.name == 'source':
+-			face_swapper_inputs[face_swapper_input.name] = prepared_source['tensor']
+-		elif face_swapper_input.name == 'target':
+-			face_swapper_inputs[face_swapper_input.name] = crop_vision_frame
+-
+-	with conditional_thread_semaphore():
+-		out = face_swapper.run(None, face_swapper_inputs)[0][0]
+-	return out
+-
+-def _swap_face_to_layers(prepared_source: Dict[str, Any], target_face: Face, base_frame: VisionFrame) -> Tuple[VisionFrame, numpy.ndarray, numpy.ndarray]:
+-	"""Heavy compute for one face; return layers to paste.
+-
+-	Returns: (swapped_crop: HxWx3 uint8-like, crop_mask: HxW float32 in [0,1], affine_matrix)
+-	"""
+-	model_template = get_model_options().get('template')
+-	model_size = get_model_options().get('size')
+-	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
+-	pixel_boost_total = pixel_boost_size[0] // model_size[0]
+-
+-	# 1) Warp to face-aligned crop
+-	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(
+-		base_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size
+-	)
+-
+-	# 2) Masks (box/occlusion)
+-	crop_masks : List[numpy.ndarray] = []
+-	if 'box' in state_manager.get_item('face_mask_types'):
+-		box_mask = create_box_mask(crop_vision_frame,
+-			state_manager.get_item('face_mask_blur'),
+-			state_manager.get_item('face_mask_padding'))
+-		crop_masks.append(box_mask)
+-
+-	if 'occlusion' in state_manager.get_item('face_mask_types'):
+-		occlusion_mask = create_occlusion_mask(crop_vision_frame)
+-		crop_masks.append(occlusion_mask)
+-
+-	# 3) Pixel-boost tiles -> run model on each tile with precomputed 'source'
+-	temp_tiles : List[VisionFrame] = []
+-	pb_tiles = implode_pixel_boost(crop_vision_frame, pixel_boost_total, model_size)
+-	for tile in pb_tiles:
+-		tile = prepare_crop_frame(tile)
+-		tile = _forward_swap_face_prepared(prepared_source, tile)
+-		tile = normalize_crop_frame(tile)
+-		temp_tiles.append(tile)
+-	swapped_crop = explode_pixel_boost(temp_tiles, pixel_boost_total, model_size, pixel_boost_size)
+-
+-	# 4) Extra masks (area/region) computed on the final crop
+-	if 'area' in state_manager.get_item('face_mask_types'):
+-		face_landmark_68 = cv2.transform(target_face.landmark_set.get('68').reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
+-		area_mask = create_area_mask(swapped_crop, face_landmark_68, state_manager.get_item('face_mask_areas'))
+-		crop_masks.append(area_mask)
+-
+-	if 'region' in state_manager.get_item('face_mask_types'):
+-		region_mask = create_region_mask(swapped_crop, state_manager.get_item('face_mask_regions'))
+-		crop_masks.append(region_mask)
+-
+-	crop_mask = numpy.minimum.reduce(crop_masks).clip(0, 1) if crop_masks else numpy.ones(swapped_crop.shape[:2], dtype=numpy.float32)
+-	return swapped_crop, crop_mask, affine_matrix
+-
+-def _build_source_key() -> str:
+-	"""Create a stable key for current source(s) and model to cache face/embedding."""
+-	source_paths = state_manager.get_item('source_paths') or []
+-	model_name = get_model_name()
+-	parts : List[str] = [model_name]
+-	for p in source_paths:
+-		try:
+-			with open(p, 'rb') as f:
+-				parts.append(create_hash(f.read()))
+-		except Exception:
+-			parts.append(p)
+-	return '|'.join(parts)
+-
+-def _get_cached_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Face]:
+-	key = _build_source_key()
+-	with CACHE_LOCK:
+-		cached = _SOURCE_FACE_CACHE.get(key)
+-	if cached:
+-		return cached
+-	# Fallback: extract and cache
+-	source_face = extract_source_face(source_vision_frames)
+-	if source_face:
+-		with CACHE_LOCK:
+-			_SOURCE_FACE_CACHE[key] = source_face
+-	return source_face
+-
+-def _get_cached_source_embedding(source_face : Face) -> Optional[Embedding]:
+-	key = _build_source_key() + '#embedding'
+-	with CACHE_LOCK:
+-		cached = _SOURCE_EMBEDDING_CACHE.get(key)
+-	if cached is not None:
+-		return cached
+-	try:
+-		emb = prepare_source_embedding(source_face)
+-		with CACHE_LOCK:
+-			_SOURCE_EMBEDDING_CACHE[key] = emb
+-		return emb
+-	except Exception:
+-		return None
+-
+-def _supports_batch() -> bool:
+-	"""Conservatively detect if model supports batching on both inputs."""
+-	face_swapper = get_inference_pool().get('face_swapper')
+-	try:
+-		inputs = face_swapper.get_inputs()
+-	except Exception:
+-		return False
+-	batch_ok = True
+-	for i in inputs:
+-		shape = list(i.shape or [])
+-		if not shape:
+-			continue
+-		b = shape[0]
+-		# Dynamic or unknown dims are represented by None or strings in ORT
+-		if isinstance(b, int) and b == 1:
+-			batch_ok = False
+-	return batch_ok
+-
+-def _prepare_crop_frame_batch(frames : List[VisionFrame], as_gpu : bool = False) -> Any:
+-	if as_gpu and _HAS_CUPY:
+-		return _prepare_crop_frame_batch_gpu(frames)
+-	return _prepare_crop_frame_batch_cpu(frames)
+-
+-
+-
+-def _prepare_crop_frame_batch_cpu(frames : List[VisionFrame]) -> numpy.ndarray:
+-	model_mean = get_model_options().get('mean')
+-	model_standard_deviation = get_model_options().get('standard_deviation')
+-	arr = numpy.stack([(f[:, :, ::-1] / 255.0) for f in frames], axis = 0)
+-	arr = (arr - model_mean) / model_standard_deviation
+-	arr = arr.transpose(0, 3, 1, 2).astype(numpy.float32)
+-	return arr
+-
+-
+-
+-def _prepare_crop_frame_batch_gpu(frames : List[VisionFrame]) -> "cp.ndarray":
+-	model_mean = get_model_options().get('mean')
+-	model_standard_deviation = get_model_options().get('standard_deviation')
+-	mean_gpu, std_gpu, inv_std_gpu = _get_model_stats_gpu(model_mean, model_standard_deviation)
+-	arr_gpu = cp.stack([cp.asarray(frame, dtype = cp.float32) for frame in frames], axis = 0)
+-	arr_gpu = arr_gpu[:, :, :, ::-1] * (1.0 / 255.0)
+-	arr_gpu = (arr_gpu - mean_gpu) * inv_std_gpu
+-	arr_gpu = cp.transpose(arr_gpu, (0, 3, 1, 2)).astype(cp.float32, copy = False)
+-	return arr_gpu
+-
+-
+-
+-def _get_model_stats_gpu(model_mean : Any, model_standard_deviation : Any) -> Tuple["cp.ndarray", "cp.ndarray", "cp.ndarray"]:
+-	key = tuple(map(float, model_mean)) + tuple(map(float, model_standard_deviation))
+-	stats = _GPU_MODEL_STATS.get(key)
+-	if stats is None:
+-		mean_gpu = cp.asarray(model_mean, dtype = cp.float32).reshape(1, 1, 1, 3)
+-		std_gpu = cp.asarray(model_standard_deviation, dtype = cp.float32).reshape(1, 1, 1, 3)
+-		inv_std_gpu = 1.0 / std_gpu
+-		stats = (mean_gpu, std_gpu, inv_std_gpu)
+-		_GPU_MODEL_STATS[key] = stats
+-	return stats
+-
+-
+-
+-def _normalize_crop_frame_batch(batch : Any) -> List[VisionFrame]:
+-	model_type = get_model_options().get('type')
+-	model_mean = get_model_options().get('mean')
+-	model_standard_deviation = get_model_options().get('standard_deviation')
+-
+-	if _HAS_CUPY and isinstance(batch, cp.ndarray):
+-		arr_gpu = cp.transpose(batch, (0, 2, 3, 1))
+-		if model_type in [ 'ghost', 'hififace', 'hyperswap', 'uniface' ]:
+-			mean_gpu, std_gpu, _ = _get_model_stats_gpu(model_mean, model_standard_deviation)
+-			arr_gpu = arr_gpu * std_gpu + mean_gpu
+-		arr_gpu = cp.clip(arr_gpu, 0.0, 1.0)
+-		arr_gpu = cp.flip(arr_gpu, axis = -1) * 255.0
+-		arr_np = cp.asnumpy(arr_gpu)
+-		return [arr_np[i] for i in range(arr_np.shape[0])]
+-
+-	arr_np = batch.transpose(0, 2, 3, 1)
+-	if model_type in [ 'ghost', 'hififace', 'hyperswap', 'uniface' ]:
+-		arr_np = arr_np * model_standard_deviation + model_mean
+-	arr_np = arr_np.clip(0, 1)
+-	arr_np = (arr_np[:, :, :, ::-1] * 255.0)
+-	return [arr_np[i] for i in range(arr_np.shape[0])]
+-
+-def swap_faces_batch(source_face : Face, target_faces : List[Face], target_vision_frame : VisionFrame, temp_vision_frame : VisionFrame) -> VisionFrame:
+-	"""Batch all crops (including pixel boost tiles) across all faces into one ONNX run."""
+-	if not target_faces:
+-		return temp_vision_frame
+-	model_options = get_model_options()
+-	model_template = model_options.get('template')
+-	model_size = model_options.get('size')
+-	model_path = model_options.get('sources').get('face_swapper').get('path')
+-	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
+-	pixel_boost_total = pixel_boost_size[0] // model_size[0]
+-
+-	# Record face count for dynamic heuristic
+-	_record_face_count_for_heuristic(len(target_faces))
+-
+-	# Prepare per-tile inputs
+-	tile_inputs : List[VisionFrame] = []
+-	map_items : List[Dict[str, Any]] = []  # map tile index to face index and bookkeeping
+-	box_occ_masks : Dict[int, List[numpy.ndarray]] = {}
+-
+-	# Precompute source input (frame or base embedding)
+-	model_type = get_model_options().get('type')
+-	base_source_emb : Optional[Embedding] = None
+-	source_frame_tensor : Optional[numpy.ndarray] = None
+-	if model_type in [ 'blendswap', 'uniface' ]:
+-		source_frame_tensor = prepare_source_frame(source_face)  # shape (1,C,H,W)
+-	else:
+-		base_source_emb = _get_cached_source_embedding(source_face)
+-
+-	# Scale faces to temp_vision_frame size for correct warping
+-	scaled_faces_unsorted : List[Face] = [scale_face(tf, target_vision_frame, temp_vision_frame) for tf in target_faces]
+-
+-	# CRITICAL FIX: Sort faces by track_id to ensure stable batch index mapping
+-	# This prevents face A and face B from swapping batch slots between frames
+-	track_tokens_unsorted : Dict[int, Optional[int]] = {}
+-	try:
+-		tracker_instance = face_tracker.get_tracker()
+-		for face_index, scaled_face in enumerate(scaled_faces_unsorted):
+-			track_id = tracker_instance.get_track_token(scaled_face)
+-			track_tokens_unsorted[face_index] = track_id
+-	except Exception:
+-		track_tokens_unsorted = { face_index: None for face_index in range(len(scaled_faces_unsorted)) }
+-
+-	# Sort faces by track_id (None/untracked faces go last, stable order)
+-	face_track_pairs = []
+-	for face_index, scaled_face in enumerate(scaled_faces_unsorted):
+-		track_id = track_tokens_unsorted.get(face_index)
+-		# Use (track_id, face_index) as sort key: track_id primary, face_index secondary for stability
+-		sort_key = (track_id if track_id is not None else float('inf'), face_index)
+-		face_track_pairs.append((sort_key, scaled_face, track_id))
+-
+-	# Sort by track_id to ensure same faces always get same batch slots
+-	face_track_pairs.sort(key=lambda x: x[0])
+-
+-	# Extract sorted faces and rebuild track_tokens mapping
+-	scaled_faces : List[Face] = [pair[1] for pair in face_track_pairs]
+-	track_tokens : Dict[int, Optional[str]] = {}
+-	for new_index, (_, _, track_id) in enumerate(face_track_pairs):
+-		track_tokens[new_index] = str(track_id) if track_id is not None else None
+-
+-	# The common single-face / no-tiling case gains nothing from the batch path and
+-	# pays extra Cupy/IO-binding setup cost, so keep the lean sequential swap.
+-	if len(scaled_faces) == 1 and pixel_boost_total <= 1:
+-		return swap_face(source_face, scaled_faces[0], temp_vision_frame)
+-
+-	for face_index, tface in enumerate(scaled_faces):
+-		# Pass track_token to warp to enable temporal smoothing of affine transforms
+-		track_token = track_tokens.get(face_index)
+-		crop_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, tface.landmark_set.get('5/68'), model_template, pixel_boost_size, track_token=track_token)
+-		# Precompute content-agnostic masks
+-		masks = []
+-		if 'box' in state_manager.get_item('face_mask_types'):
+-			masks.append(create_box_mask(crop_frame, state_manager.get_item('face_mask_blur'), state_manager.get_item('face_mask_padding')))
+-		if 'occlusion' in state_manager.get_item('face_mask_types'):
+-			masks.append(create_occlusion_mask(crop_frame))
+-		box_occ_masks[face_index] = masks
+-
+-		# Pixel boost tiles
+-		tiles = implode_pixel_boost(crop_frame, pixel_boost_total, model_size)
+-		# Prepare tiles for model input
+-		for tile_idx in range(tiles.shape[0]):
+-			tile_inputs.append(tiles[tile_idx])
+-			map_items.append({'face_index': face_index, 'affine': affine_matrix})
+-
+-		# If nothing to process, return
+-		if not tile_inputs:
+-			return temp_vision_frame
+-
+-		# Heuristic: on non-GPU providers, small face counts without tiling favor sequential path
+-		providers = state_manager.get_item('execution_providers') or []
+-		providers = [str(p).lower() for p in providers]
+-		is_gpu = any(p in ('cuda', 'tensorrt') for p in providers)
+-		batching_mode = state_manager.get_item('face_swapper_batching') or 'auto'
+-		prefer_seq = (not is_gpu) and (_heuristic_state.get('decided') and _heuristic_state.get('prefer_sequential'))
+-		if batching_mode == 'never':
+-			prefer_seq = True
+-		if batching_mode == 'always':
+-			prefer_seq = False
+-		if (not is_gpu) and ((len(target_faces) <= 2 and pixel_boost_total <= 1) or prefer_seq):
+-			# Run original sequential per-face path (fastest for CPU/CoreML single-face cases)
+-			seq_start = time()
+-			for sf in [scale_face(tf, target_vision_frame, temp_vision_frame) for tf in target_faces]:
+-				temp_vision_frame = swap_face(source_face, sf, temp_vision_frame)
+-			seq_total = (time() - seq_start) * 1000.0
+-			# per-frame verbose logs removed for speed at info level
+-			return temp_vision_frame
+-
+-	# Build batched inputs for ONNX
+-	face_swapper = get_inference_pool().get('face_swapper')
+-
+-	# Compose per-tile source inputs (balance if needed)
+-	source_inputs_batch : Optional[numpy.ndarray] = None
+-	if model_type in [ 'blendswap', 'uniface' ] and source_frame_tensor is not None:
+-		# Repeat source frame per tile
+-		source_inputs_batch = numpy.repeat(source_frame_tensor, repeats=len(tile_inputs), axis=0)
+-	else:
+-		# Embedding-based models: balance once per face, then repeat per tile
+-		per_face_src : List[numpy.ndarray] = []
+-		for sf in scaled_faces:
+-			src = prepare_source_embedding(source_face) if base_source_emb is None else base_source_emb
+-			per_face_src.append(balance_source_embedding(src, sf.embedding))
+-		# map tiles -> face embeddings
+-		emb_list : List[numpy.ndarray] = []
+-		for mi in map_items:
+-			fi = mi['face_index']
+-			emb_list.append(per_face_src[fi])
+-		source_inputs_batch = numpy.vstack(emb_list).astype(numpy.float32, copy = False)
+-
+-	# Prepare target batch (CPU/GPU aware)
+-	target_inputs_batch_cpu : Optional[numpy.ndarray] = None
+-	target_inputs_batch_gpu : Optional['cp.ndarray'] = None
+-
+-	# Detect batch capability; if unsupported, fallback per-tile
+-	batched = _supports_batch()
+-	outputs_batch : Optional[Any] = None
+-	use_trt = False
+-
+-	# Attempt TensorRT execution when available and requested
+-	if batched and tensorrt_runner.is_available() and state_manager.get_item('face_swapper_use_trt') and 'tensorrt' in providers and _HAS_CUPY:
+-		if target_inputs_batch_gpu is None:
+-			target_inputs_batch_gpu = _prepare_crop_frame_batch(tile_inputs, as_gpu = True)
+-		src_cu = cp.asarray(source_inputs_batch, dtype = cp.float32)
+-		trt_limit = state_manager.get_item('face_swapper_trt_max_batch') or 64
+-		try:
+-			tensorrt_runner.set_max_batch_limit(int(trt_limit))
+-		except Exception:
+-			pass
+-		batch_total = len(tile_inputs)
+-		engine_batch = max(1, tensorrt_runner.canonicalize_batch_size(batch_total))
+-		source_engine_shape = (engine_batch, *source_inputs_batch.shape[1:])
+-		target_engine_shape = (engine_batch, *target_inputs_batch_gpu.shape[1:])
+-		runner = tensorrt_runner.get_runner(model_path, source_engine_shape, target_engine_shape, engine_batch)
+-		if runner:
+-			use_trt = True
+-			outputs_parts : List["cp.ndarray"] = []
+-			cursor = 0
+-			while cursor < batch_total:
+-				end = min(cursor + runner.max_batch, batch_total)
+-				src_slice = src_cu[cursor:end]
+-				tgt_slice = target_inputs_batch_gpu[cursor:end]
+-				run_out = runner.run(src_slice, tgt_slice)
+-				outputs_parts.append(run_out)
+-				cursor = end
+-			if outputs_parts:
+-				outputs_batch = cp.concatenate(outputs_parts, axis = 0)
+-
+-	if batched and not use_trt:
+-		use_iobinding = _HAS_CUPY and ('cuda' in state_manager.get_item('execution_providers'))
+-		if use_iobinding:
+-			try:
+-				if target_inputs_batch_gpu is None:
+-					target_inputs_batch_gpu = _prepare_crop_frame_batch(tile_inputs, as_gpu = True)
+-				device_id = int(get_first(state_manager.get_item('execution_device_ids')))
+-				io_binding = face_swapper.io_binding()
+-				src_cu = cp.asarray(source_inputs_batch, dtype = cp.float32)
+-				tgt_cu = target_inputs_batch_gpu
+-				N, C, H, W = tgt_cu.shape
+-				out_cu = cp.empty((N, C, H, W), dtype = cp.float32)
+-				inputs_by_name = { i.name: i for i in face_swapper.get_inputs() }
+-				outputs_by_name = { o.name: o for o in face_swapper.get_outputs() }
+-				src_name = 'source' if 'source' in inputs_by_name else list(inputs_by_name.keys())[0]
+-				tgt_name = 'target' if 'target' in inputs_by_name else list(inputs_by_name.keys())[1]
+-				out_name = list(outputs_by_name.keys())[0]
+-				io_binding.bind_input(name = src_name, device_type = 'cuda', device_id = device_id, element_type = numpy.float32, shape = tuple(source_inputs_batch.shape), buffer_ptr = src_cu.data.ptr)
+-				io_binding.bind_input(name = tgt_name, device_type = 'cuda', device_id = device_id, element_type = numpy.float32, shape = tuple(tgt_cu.shape), buffer_ptr = tgt_cu.data.ptr)
+-				io_binding.bind_output(name = out_name, device_type = 'cuda', device_id = device_id, shape = (N, C, H, W), buffer_ptr = out_cu.data.ptr)
+-				t_run_start = time()
+-				with conditional_thread_semaphore():
+-					face_swapper.run_with_iobinding(io_binding)
+-				t_run_end = time()
+-				outputs_batch = out_cu
+-			except Exception:
+-				use_iobinding = False
+-				target_inputs_batch_cpu = _prepare_crop_frame_batch(tile_inputs)
+-		if not use_iobinding:
+-			if target_inputs_batch_cpu is None:
+-				target_inputs_batch_cpu = _prepare_crop_frame_batch(tile_inputs)
+-			face_swapper_inputs = {}
+-			for face_swapper_input in face_swapper.get_inputs():
+-				if face_swapper_input.name == 'source':
+-					face_swapper_inputs[face_swapper_input.name] = source_inputs_batch
+-				if face_swapper_input.name == 'target':
+-					face_swapper_inputs[face_swapper_input.name] = target_inputs_batch_cpu
+-			t_run_start = time()
+-			with conditional_thread_semaphore():
+-				outputs_batch = face_swapper.run(None, face_swapper_inputs)[0]
+-			t_run_end = time()
+-	else:
+-		# Fallback: parallelize by face with precomputed source, then paste sequentially
+-		prepared_by_face = [ _build_prepared_source_for_face(source_face, sf) for sf in scaled_faces ]
+-		results : Dict[int, Tuple[VisionFrame, numpy.ndarray, numpy.ndarray]] = {}
+-		max_workers = max(1, state_manager.get_item('execution_thread_count') or 4)
+-		with ThreadPoolExecutor(max_workers=max_workers) as ex:
+-			futs = []
+-			for fi, sf in enumerate(scaled_faces):
+-				futs.append((fi, ex.submit(_swap_face_to_layers, prepared_by_face[fi], sf, temp_vision_frame)))
+-			for fi, fut in futs:
+-				results[fi] = fut.result()
+-		# Paste back in stable order (by face index)
+-		for fi in range(len(scaled_faces)):
+-			crop_swapped, crop_mask, affine_matrix = results[fi]
+-			track_token = track_tokens.get(fi)
+-			temp_vision_frame = paste_back(temp_vision_frame, crop_swapped, crop_mask, affine_matrix, track_token=track_token)
+-		return temp_vision_frame
+-
+-	if outputs_batch is None:
+-		return temp_vision_frame
+-
+-	# Post-process outputs and paste back face-by-face
+-	# Convert model outputs to HWC per-tile
+-	tiles_out : List[VisionFrame] = _normalize_crop_frame_batch(outputs_batch)
+-
+-	# Group tiles per face and paste
+-	per_face_tiles : Dict[int, List[VisionFrame]] = {}
+-	for tile, mi in zip(tiles_out, map_items):
+-		fi = mi['face_index']
+-		per_face_tiles.setdefault(fi, []).append(tile)
+-
+-	paste_start = time()
+-	for fi, tiles in per_face_tiles.items():
+-		# Reassemble boosted crop
+-		crop_swapped = explode_pixel_boost(tiles, pixel_boost_total, model_size, pixel_boost_size)
+-		# Compose masks: box/occlusion + dynamic area/region
+-		masks = list(box_occ_masks.get(fi, []))
+-		# Area mask depends on transformed 68-landmarks
+-		# Recompute affine for this face from first tile's map item
+-		affine_matrix = None
+-		for mi in map_items:
+-			if mi['face_index'] == fi:
+-				affine_matrix = mi['affine']
+-				break
+-		if 'area' in state_manager.get_item('face_mask_types') and affine_matrix is not None:
+-			face_landmark_68 = scaled_faces[fi].landmark_set.get('68')
+-			face_landmark_68 = cv2.transform(face_landmark_68.reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
+-			masks.append(create_area_mask(crop_swapped, face_landmark_68, state_manager.get_item('face_mask_areas')))
+-		if 'region' in state_manager.get_item('face_mask_types'):
+-			masks.append(create_region_mask(crop_swapped, state_manager.get_item('face_mask_regions')))
+-		if masks:
+-			crop_mask = numpy.minimum.reduce(masks).clip(0, 1)
+-		else:
+-			crop_mask = numpy.ones(crop_swapped.shape[:2], dtype=numpy.float32)
+-			# Paste back
+-			affine_matrix = affine_matrix if affine_matrix is not None else numpy.eye(2, 3, dtype=numpy.float32)
+-			track_token = track_tokens.get(fi)
+-			temp_vision_frame = paste_back(temp_vision_frame, crop_swapped, crop_mask, affine_matrix, track_token=track_token)
+-	paste_end = time()
+-
+-	faces_batched = len(scaled_faces)
+-	tiles_batched = len(map_items)
+-	onnx_ms = ((t_run_end - t_run_start) * 1000.0) if 't_run_start' in locals() and 't_run_end' in locals() else -1.0
+-	paste_ms = (paste_end - paste_start) * 1000.0
+-	# per-frame verbose logs removed for speed at info level
+-	return temp_vision_frame
+ 
+ 
+ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : VisionFrame) -> VisionFrame:
+@@ -1048,21 +504,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
+ 	model_size = get_model_options().get('size')
+ 	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
+ 	pixel_boost_total = pixel_boost_size[0] // model_size[0]
+-	# Get track_token early for use in warp
+-	track_token = None
+-	try:
+-		tracker_instance = face_tracker.get_tracker()
+-		track_id = tracker_instance.get_track_token(target_face)
+-		if track_id is not None:
+-			track_token = str(track_id)
+-		# Confidence gating: skip swap if confidence dropped significantly
+-		if face_tracker.is_enabled() and not tracker_instance.should_use_face(target_face):
+-			# Low confidence frame - return unmodified to avoid injecting garbage
+-			# The temporal smoothing in compositor will handle the gap gracefully
+-			return temp_vision_frame
+-	except Exception:
+-		track_token = None
+-	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size, track_token=track_token)
++	crop_vision_frame, affine_matrix = warp_face_by_face_landmark_5(temp_vision_frame, target_face.landmark_set.get('5/68'), model_template, pixel_boost_size)
+ 	temp_vision_frames = []
+ 	crop_masks = []
+ 
+@@ -1074,19 +516,13 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
+ 		occlusion_mask = create_occlusion_mask(crop_vision_frame)
+ 		crop_masks.append(occlusion_mask)
+ 
+-	# Fast path when pixel boost is 1: avoid reshape/loop overhead
+-	if pixel_boost_total <= 1:
+-		pixel_boost_vision_frame = prepare_crop_frame(crop_vision_frame)
++	pixel_boost_vision_frames = implode_pixel_boost(crop_vision_frame, pixel_boost_total, model_size)
++	for pixel_boost_vision_frame in pixel_boost_vision_frames:
++		pixel_boost_vision_frame = prepare_crop_frame(pixel_boost_vision_frame)
+ 		pixel_boost_vision_frame = forward_swap_face(source_face, target_face, pixel_boost_vision_frame)
+-		crop_vision_frame = normalize_crop_frame(pixel_boost_vision_frame)
+-	else:
+-		pixel_boost_vision_frames = implode_pixel_boost(crop_vision_frame, pixel_boost_total, model_size)
+-		for pixel_boost_vision_frame in pixel_boost_vision_frames:
+-			pixel_boost_vision_frame = prepare_crop_frame(pixel_boost_vision_frame)
+-			pixel_boost_vision_frame = forward_swap_face(source_face, target_face, pixel_boost_vision_frame)
+-			pixel_boost_vision_frame = normalize_crop_frame(pixel_boost_vision_frame)
+-			temp_vision_frames.append(pixel_boost_vision_frame)
+-		crop_vision_frame = explode_pixel_boost(temp_vision_frames, pixel_boost_total, model_size, pixel_boost_size)
++		pixel_boost_vision_frame = normalize_crop_frame(pixel_boost_vision_frame)
++		temp_vision_frames.append(pixel_boost_vision_frame)
++	crop_vision_frame = explode_pixel_boost(temp_vision_frames, pixel_boost_total, model_size, pixel_boost_size)
+ 
+ 	if 'area' in state_manager.get_item('face_mask_types'):
+ 		face_landmark_68 = cv2.transform(target_face.landmark_set.get('68').reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
+@@ -1098,8 +534,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
+ 		crop_masks.append(region_mask)
+ 
+ 	crop_mask = numpy.minimum.reduce(crop_masks).clip(0, 1)
+-	# track_token already retrieved earlier for warp, reuse for paste_back
+-	paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix, track_token=track_token)
++	paste_vision_frame = paste_back(temp_vision_frame, crop_vision_frame, crop_mask, affine_matrix)
+ 	return paste_vision_frame
+ 
+ 
+@@ -1234,7 +669,7 @@ def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Fa
+ 
+ 	if source_vision_frames:
+ 		for source_vision_frame in source_vision_frames:
+-			temp_faces = get_many_faces([source_vision_frame], use_tracking = False)
++			temp_faces = get_many_faces([source_vision_frame])
+ 			temp_faces = sort_faces_by_order(temp_faces, 'large-small')
+ 
+ 			if temp_faces:
+@@ -1244,16 +679,16 @@ def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Fa
+ 
+ 
+ def process_frame(inputs : FaceSwapperInputs) -> VisionFrame:
+-    reference_vision_frame = inputs.get('reference_vision_frame')
+-    source_vision_frames = inputs.get('source_vision_frames')
+-    target_vision_frame = inputs.get('target_vision_frame')
+-    temp_vision_frame = inputs.get('temp_vision_frame')
+-    # Cache source face across frames for multi-thread speed
+-    source_face = _get_cached_source_face(source_vision_frames)
+-    target_faces = select_faces(reference_vision_frame, target_vision_frame)
+-
+-    if source_face and target_faces:
+-        # Batch all faces + pixel boost tiles through a single ONNX run
+-        temp_vision_frame = swap_faces_batch(source_face, target_faces, target_vision_frame, temp_vision_frame)
+-
+-    return temp_vision_frame
++	reference_vision_frame = inputs.get('reference_vision_frame')
++	source_vision_frames = inputs.get('source_vision_frames')
++	target_vision_frame = inputs.get('target_vision_frame')
++	temp_vision_frame = inputs.get('temp_vision_frame')
++	source_face = extract_source_face(source_vision_frames)
++	target_faces = select_faces(reference_vision_frame, target_vision_frame)
++
++	if source_face and target_faces:
++		for target_face in target_faces:
++			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
++			temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
++
++	return temp_vision_frame
+diff --git a/facefusion/profiler.py b/facefusion/profiler.py
+deleted file mode 100644
+index b12ac98..0000000
+--- a/facefusion/profiler.py
++++ /dev/null
+@@ -1,48 +0,0 @@
+-import threading
+-from typing import Dict
+-
+-from facefusion import logger
+-
+-_LOCK = threading.Lock()
+-_METRICS: Dict[str, float] = {
+-    'frames': 0.0,
+-    'detector_ms': 0.0,
+-    'landmarker_ms': 0.0,
+-    'recognizer_ms': 0.0,
+-    'classifier_ms': 0.0,
+-    'swapper_onnx_ms': 0.0,
+-    'swapper_paste_ms': 0.0,
+-    'swapper_seq_ms': 0.0,
+-}
+-
+-def add(name: str, ms: float) -> None:
+-    with _LOCK:
+-        _METRICS[name] = _METRICS.get(name, 0.0) + float(ms)
+-
+-def inc_frames(n: int = 1) -> None:
+-    add('frames', float(n))
+-
+-def get_and_reset() -> Dict[str, float]:
+-    with _LOCK:
+-        snapshot = dict(_METRICS)
+-        for k in _METRICS.keys():
+-            _METRICS[k] = 0.0
+-        return snapshot
+-
+-def log_summary(context: str = 'job') -> None:
+-    m = get_and_reset()
+-    frames = max(1.0, m.get('frames', 0.0))
+-    def pf(key: str) -> float:
+-        return m.get(key, 0.0)
+-    logger.info(
+-        f"[profiler] context={context} frames={int(frames)} "
+-        f"detector_total_ms={pf('detector_ms'):.1f} per_frame={pf('detector_ms')/frames:.2f} "
+-        f"landmarker_total_ms={pf('landmarker_ms'):.1f} per_frame={pf('landmarker_ms')/frames:.2f} "
+-        f"recognizer_total_ms={pf('recognizer_ms'):.1f} per_frame={pf('recognizer_ms')/frames:.2f} "
+-        f"classifier_total_ms={pf('classifier_ms'):.1f} per_frame={pf('classifier_ms')/frames:.2f} "
+-        f"swapper_onnx_total_ms={pf('swapper_onnx_ms'):.1f} per_frame={pf('swapper_onnx_ms')/frames:.2f} "
+-        f"swapper_paste_total_ms={pf('swapper_paste_ms'):.1f} per_frame={pf('swapper_paste_ms')/frames:.2f} "
+-        f"swapper_seq_total_ms={pf('swapper_seq_ms'):.1f} per_frame={pf('swapper_seq_ms')/frames:.2f}",
+-        __name__
+-    )
+-
+diff --git a/facefusion/program.py b/facefusion/program.py
+index ddfab4d..8bbfdab 100755
+--- a/facefusion/program.py
++++ b/facefusion/program.py
+@@ -130,21 +130,6 @@ def create_face_selector_program() -> ArgumentParser:
+ 	return program
+ 
+ 
+-def create_face_tracker_program() -> ArgumentParser:
+-	program = ArgumentParser(add_help = False)
+-	group_face_tracker = program.add_argument_group('face tracker')
+-	default_enable = config.get_bool_value('face_tracker', 'enable_face_tracking', 'true')
+-	enable_default = True if default_enable is None else default_enable
+-	group_face_tracker.add_argument('--enable-face-tracking', dest = 'enable_face_tracking', help = wording.get('help.enable_face_tracking'), action = 'store_true', default = enable_default)
+-	group_face_tracker.add_argument('--disable-face-tracking', dest = 'enable_face_tracking', help = wording.get('help.disable_face_tracking'), action = 'store_false')
+-	group_face_tracker.add_argument('--face-tracker-detection-interval', help = wording.get('help.face_tracker_detection_interval'), type = int, default = config.get_int_value('face_tracker', 'face_tracker_detection_interval', '6'), choices = facefusion.choices.face_tracker_detection_interval_range, metavar = create_int_metavar(facefusion.choices.face_tracker_detection_interval_range))
+-	group_face_tracker.add_argument('--face-tracker-max-missed', help = wording.get('help.face_tracker_max_missed'), type = int, default = config.get_int_value('face_tracker', 'face_tracker_max_missed', '2'), choices = facefusion.choices.face_tracker_max_missed_range, metavar = create_int_metavar(facefusion.choices.face_tracker_max_missed_range))
+-	group_face_tracker.add_argument('--face-tracker-min-points', help = wording.get('help.face_tracker_min_points'), type = int, default = config.get_int_value('face_tracker', 'face_tracker_min_points', '12'), choices = facefusion.choices.face_tracker_min_points_range, metavar = create_int_metavar(facefusion.choices.face_tracker_min_points_range))
+-	group_face_tracker.add_argument('--face-tracker-match-iou', help = wording.get('help.face_tracker_match_iou'), type = float, default = config.get_float_value('face_tracker', 'face_tracker_match_iou', '0.35'), choices = facefusion.choices.face_tracker_match_iou_range, metavar = create_float_metavar(facefusion.choices.face_tracker_match_iou_range))
+-	job_store.register_step_keys([ 'enable_face_tracking', 'face_tracker_detection_interval', 'face_tracker_max_missed', 'face_tracker_min_points', 'face_tracker_match_iou' ])
+-	return program
+-
+-
+ def create_face_masker_program() -> ArgumentParser:
+ 	program = ArgumentParser(add_help = False)
+ 	group_face_masker = program.add_argument_group('face masker')
+@@ -249,11 +234,7 @@ def create_execution_program() -> ArgumentParser:
+ 	group_execution.add_argument('--execution-device-ids', help = wording.get('help.execution_device_ids'), default = config.get_str_list('execution', 'execution_device_ids', '0'), nargs = '+', metavar = 'EXECUTION_DEVICE_IDS')
+ 	group_execution.add_argument('--execution-providers', help = wording.get('help.execution_providers').format(choices = ', '.join(available_execution_providers)), default = config.get_str_list('execution', 'execution_providers', get_first(available_execution_providers)), choices = available_execution_providers, nargs = '+', metavar = 'EXECUTION_PROVIDERS')
+ 	group_execution.add_argument('--execution-thread-count', help = wording.get('help.execution_thread_count'), type = int, default = config.get_int_value('execution', 'execution_thread_count', '4'), choices = facefusion.choices.execution_thread_count_range, metavar = create_int_metavar(facefusion.choices.execution_thread_count_range))
+-	default_streaming = config.get_bool_value('execution', 'enable_streaming_pipeline', 'true')
+-	streaming_default = True if default_streaming is None else default_streaming
+-	group_execution.add_argument('--enable-streaming-pipeline', dest = 'enable_streaming_pipeline', help = wording.get('help.enable_streaming_pipeline'), action = 'store_true', default = streaming_default)
+-	group_execution.add_argument('--disable-streaming-pipeline', dest = 'enable_streaming_pipeline', help = wording.get('help.disable_streaming_pipeline'), action = 'store_false')
+-	job_store.register_job_keys([ 'execution_device_ids', 'execution_providers', 'execution_thread_count', 'enable_streaming_pipeline' ])
++	job_store.register_job_keys([ 'execution_device_ids', 'execution_providers', 'execution_thread_count' ])
+ 	return program
+ 
+ 
+@@ -273,13 +254,6 @@ def create_log_level_program() -> ArgumentParser:
+ 	job_store.register_job_keys([ 'log_level' ])
+ 	return program
+ 
+-def create_content_program() -> ArgumentParser:
+-	program = ArgumentParser(add_help = False)
+-	group_content = program.add_argument_group('content')
+-	group_content.add_argument('--skip-content-analysis', help = 'Skip content (NSFW) analysis for faster processing', action = 'store_true', default = True)
+-	job_store.register_job_keys([ 'skip_content_analysis' ])
+-	return program
+-
+ 
+ def create_halt_on_error_program() -> ArgumentParser:
+ 	program = ArgumentParser(add_help = False)
+@@ -309,7 +283,7 @@ def create_step_index_program() -> ArgumentParser:
+ 
+ 
+ def collect_step_program() -> ArgumentParser:
+-	return ArgumentParser(parents = [ create_face_detector_program(), create_face_tracker_program(), create_face_landmarker_program(), create_face_selector_program(), create_face_masker_program(), create_voice_extractor_program(), create_frame_extraction_program(), create_output_creation_program(), create_processors_program() ], add_help = False)
++	return ArgumentParser(parents = [ create_face_detector_program(), create_face_landmarker_program(), create_face_selector_program(), create_face_masker_program(), create_voice_extractor_program(), create_frame_extraction_program(), create_output_creation_program(), create_processors_program() ], add_help = False)
+ 
+ 
+ def collect_job_program() -> ArgumentParser:
+@@ -322,9 +296,9 @@ def create_program() -> ArgumentParser:
+ 	program.add_argument('-v', '--version', version = metadata.get('name') + ' ' + metadata.get('version'), action = 'version')
+ 	sub_program = program.add_subparsers(dest = 'command')
+ 	# general
+-	sub_program.add_parser('run', help = wording.get('help.run'), parents = [ create_config_path_program(), create_temp_path_program(), create_jobs_path_program(), create_source_paths_program(), create_target_path_program(), create_output_path_program(), collect_step_program(), create_uis_program(), create_benchmark_program(), create_content_program(), collect_job_program() ], formatter_class = create_help_formatter_large)
+-	sub_program.add_parser('headless-run', help = wording.get('help.headless_run'), parents = [ create_config_path_program(), create_temp_path_program(), create_jobs_path_program(), create_source_paths_program(), create_target_path_program(), create_output_path_program(), collect_step_program(), create_content_program(), collect_job_program() ], formatter_class = create_help_formatter_large)
+-	sub_program.add_parser('batch-run', help = wording.get('help.batch_run'), parents = [ create_config_path_program(), create_temp_path_program(), create_jobs_path_program(), create_source_pattern_program(), create_target_pattern_program(), create_output_pattern_program(), collect_step_program(), create_content_program(), collect_job_program() ], formatter_class = create_help_formatter_large)
++	sub_program.add_parser('run', help = wording.get('help.run'), parents = [ create_config_path_program(), create_temp_path_program(), create_jobs_path_program(), create_source_paths_program(), create_target_path_program(), create_output_path_program(), collect_step_program(), create_uis_program(), create_benchmark_program(), collect_job_program() ], formatter_class = create_help_formatter_large)
++	sub_program.add_parser('headless-run', help = wording.get('help.headless_run'), parents = [ create_config_path_program(), create_temp_path_program(), create_jobs_path_program(), create_source_paths_program(), create_target_path_program(), create_output_path_program(), collect_step_program(), collect_job_program() ], formatter_class = create_help_formatter_large)
++	sub_program.add_parser('batch-run', help = wording.get('help.batch_run'), parents = [ create_config_path_program(), create_temp_path_program(), create_jobs_path_program(), create_source_pattern_program(), create_target_pattern_program(), create_output_pattern_program(), collect_step_program(), collect_job_program() ], formatter_class = create_help_formatter_large)
+ 	sub_program.add_parser('force-download', help = wording.get('help.force_download'), parents = [ create_download_providers_program(), create_download_scope_program(), create_log_level_program() ], formatter_class = create_help_formatter_large)
+ 	sub_program.add_parser('benchmark', help = wording.get('help.benchmark'), parents = [ create_temp_path_program(), collect_step_program(), create_benchmark_program(), collect_job_program() ], formatter_class = create_help_formatter_large)
+ 	# job manager
+diff --git a/facefusion/temporal_filters.py b/facefusion/temporal_filters.py
+deleted file mode 100644
+index ced8a42..0000000
+--- a/facefusion/temporal_filters.py
++++ /dev/null
+@@ -1,175 +0,0 @@
+-"""Similarity-transform smoothing with bounded derivatives."""
+-from __future__ import annotations
+-
+-import math
+-from collections import deque
+-from dataclasses import dataclass
+-from typing import Deque, Dict, Optional, Tuple
+-
+-import numpy
+-
+-WINDOW = 9
+-ORDER = 2
+-_MAX_ROT_STEP = math.radians(3.0)
+-_MAX_LOGS_STEP = 0.02
+-_MAX_TRANS_STEP = 6.0
+-
+-
+-@dataclass
+-class Se2Components:
+-    scale: float
+-    theta: float
+-    tx: float
+-    ty: float
+-
+-
+-class _SimilarityHistory:
+-    """Maintain a causal history of similarity parameters and smooth them."""
+-
+-    def __init__(self) -> None:
+-        self._scale: Deque[float] = deque(maxlen=WINDOW)
+-        self._theta: Deque[float] = deque(maxlen=WINDOW)
+-        self._tx: Deque[float] = deque(maxlen=WINDOW)
+-        self._ty: Deque[float] = deque(maxlen=WINDOW)
+-        self._theta_ref: Optional[float] = None
+-        self._last: Optional[Se2Components] = None
+-
+-    def push(self, comp: Se2Components) -> Se2Components:
+-        """Insert a new observation and return the smoothed components."""
+-        theta = float(comp.theta)
+-        if self._theta_ref is None:
+-            self._theta_ref = theta
+-        else:
+-            theta = _unwrap(theta, self._theta_ref)
+-            self._theta_ref = theta
+-
+-        self._scale.append(max(comp.scale, 1e-6))
+-        self._theta.append(theta)
+-        self._tx.append(comp.tx)
+-        self._ty.append(comp.ty)
+-
+-        smoothed = Se2Components(
+-            scale=self._smooth_channel(self._scale, _MAX_LOGS_STEP, is_log=True),
+-            theta=self._smooth_channel(self._theta, _MAX_ROT_STEP, is_angle=True),
+-            tx=self._smooth_channel(self._tx, _MAX_TRANS_STEP),
+-            ty=self._smooth_channel(self._ty, _MAX_TRANS_STEP),
+-        )
+-        self._last = smoothed
+-        return smoothed
+-
+-    def _smooth_channel(self, channel: Deque[float], max_step: float, is_log: bool = False, is_angle: bool = False) -> float:
+-        arr = numpy.array(channel, dtype=numpy.float64)
+-        if is_log:
+-            arr = numpy.log(numpy.clip(arr, 1e-6, None))
+-        if arr.size == 0:
+-            return 0.0
+-        target = arr[-1]
+-        if arr.size < 3:
+-            return _bounded_step(self._last_value(channel, is_log, is_angle), target, max_step, is_log)
+-
+-        x = numpy.arange(arr.size, dtype=numpy.float64)
+-        try:
+-            coeffs = numpy.polyfit(x, arr, ORDER)
+-            smoothed = numpy.polyval(coeffs, x[-1])
+-        except numpy.linalg.LinAlgError:
+-            smoothed = float(target)
+-
+-        return _bounded_step(self._last_value(channel, is_log, is_angle), float(smoothed), max_step, is_log)
+-
+-    def _last_value(self, channel: Deque[float], is_log: bool, is_angle: bool) -> float:
+-        if self._last is None:
+-            if is_log:
+-                return math.log(max(channel[-1], 1e-6))
+-            return channel[-1]
+-        if is_log:
+-            return math.log(max(self._last.scale, 1e-6))
+-        if is_angle:
+-            return self._last.theta
+-        if channel is self._tx:
+-            return self._last.tx
+-        if channel is self._ty:
+-            return self._last.ty
+-        return self._last.scale
+-
+-
+-def _bounded_step(previous: float, current: float, max_step: float, is_log: bool) -> float:
+-    delta = current - previous
+-    if delta > max_step:
+-        current = previous + max_step
+-    elif delta < -max_step:
+-        current = previous - max_step
+-    if is_log:
+-        return float(math.exp(current))
+-    return float(current)
+-
+-
+-def _unwrap(theta: float, reference: float) -> float:
+-    delta = theta - reference
+-    while delta <= -math.pi:
+-        delta += 2.0 * math.pi
+-    while delta > math.pi:
+-        delta -= 2.0 * math.pi
+-    return reference + delta
+-
+-
+-def affine_to_similarity(matrix: numpy.ndarray) -> Se2Components:
+-    if matrix.shape != (2, 3):
+-        raise ValueError('Expected 2x3 affine matrix.')
+-    a, b, tx = float(matrix[0, 0]), float(matrix[0, 1]), float(matrix[0, 2])
+-    d, e, ty = float(matrix[1, 0]), float(matrix[1, 1]), float(matrix[1, 2])
+-
+-    sx = math.sqrt(max(a * a + d * d, 1e-12))
+-    sy = math.sqrt(max(b * b + e * e, 1e-12))
+-    scale = 0.5 * (sx + sy)
+-    if (a * e - b * d) < 0.0:
+-        scale = -scale
+-    theta = math.atan2(d, a)
+-    return Se2Components(scale=scale, theta=theta, tx=tx, ty=ty)
+-
+-
+-def similarity_to_affine(components: Se2Components) -> numpy.ndarray:
+-    s = float(components.scale)
+-    theta = float(components.theta)
+-    tx = float(components.tx)
+-    ty = float(components.ty)
+-    cos_t = math.cos(theta)
+-    sin_t = math.sin(theta)
+-    return numpy.array(
+-        [
+-            [s * cos_t, -s * sin_t, tx],
+-            [s * sin_t,  s * cos_t, ty],
+-        ],
+-        dtype=numpy.float32,
+-    )
+-
+-
+-class _FilterStore:
+-    def __init__(self) -> None:
+-        self._filters: Dict[str, _SimilarityHistory] = {}
+-
+-    def get(self, key: str) -> _SimilarityHistory:
+-        filt = self._filters.get(key)
+-        if filt is None:
+-            filt = _SimilarityHistory()
+-            self._filters[key] = filt
+-        return filt
+-
+-    def reset(self) -> None:
+-        self._filters.clear()
+-
+-
+-_STORE = _FilterStore()
+-
+-
+-def resolve_filter_key(track_token: Optional[str]) -> str:
+-    return track_token if track_token else '__default__'
+-
+-
+-def reset_all_filters() -> None:
+-    _STORE.reset()
+-
+-
+-def filter_affine(matrix: numpy.ndarray, key: str) -> numpy.ndarray:
+-    components = affine_to_similarity(matrix)
+-    smooth = _STORE.get(key).push(components)
+-    return similarity_to_affine(smooth)
+diff --git a/facefusion/tensorrt_runner.py b/facefusion/tensorrt_runner.py
+deleted file mode 100644
+index 0d2569e..0000000
+--- a/facefusion/tensorrt_runner.py
++++ /dev/null
+@@ -1,169 +0,0 @@
+-"""Thin TensorRT wrapper for face swapper acceleration."""
+-from __future__ import annotations
+-
+-import hashlib
+-import os
+-from pathlib import Path
+-from typing import Any, Dict, Optional, Tuple
+-
+-try:
+-    import tensorrt as trt  # type: ignore
+-    _HAS_TRT = True
+-except Exception:
+-    trt = None  # type: ignore
+-    _HAS_TRT = False
+-
+-try:
+-    import cupy as cp  # type: ignore
+-except Exception:
+-    cp = None  # type: ignore
+-
+-LOGGER = trt.Logger(trt.Logger.WARNING) if _HAS_TRT else None
+-_ENGINE_CACHE: Dict[Tuple[str, Tuple[int, ...], Tuple[int, ...], int], "TensorRTRunner"] = {}
+-_CACHE_DIR = Path('.caches/trt')
+-_MAX_BATCH_LIMIT = 64
+-
+-
+-def is_available() -> bool:
+-    return _HAS_TRT and cp is not None
+-
+-
+-def set_max_batch_limit(limit: int) -> None:
+-    global _MAX_BATCH_LIMIT
+-    _MAX_BATCH_LIMIT = max(1, int(limit))
+-
+-
+-def get_max_batch_limit() -> int:
+-    return _MAX_BATCH_LIMIT
+-
+-
+-def canonicalize_batch_size(batch: int) -> int:
+-    if batch <= 0:
+-        return 1
+-    size = 1
+-    while size < batch:
+-        size <<= 1
+-    return min(size, _MAX_BATCH_LIMIT)
+-
+-
+-def get_runner(model_path: str, source_shape: Tuple[int, ...], target_shape: Tuple[int, ...], max_batch: int, enable_fp16: bool = True) -> Optional["TensorRTRunner"]:
+-    if not is_available():
+-        return None
+-    max_batch = canonicalize_batch_size(max_batch)
+-    key = (model_path, tuple(source_shape[1:]), tuple(target_shape[1:]), max_batch)
+-    runner = _ENGINE_CACHE.get(key)
+-    if runner and runner.max_batch >= source_shape[0]:
+-        return runner
+-    try:
+-        engine = _load_or_build_engine(model_path, source_shape, target_shape, max_batch, enable_fp16)
+-    except Exception:
+-        return None
+-    runner = TensorRTRunner(engine, max_batch)
+-    _ENGINE_CACHE[key] = runner
+-    return runner
+-
+-
+-class TensorRTRunner:
+-    def __init__(self, engine: "trt.ICudaEngine", max_batch: int) -> None:
+-        self.engine = engine
+-        self.context = engine.create_execution_context()
+-        self.binding_names = [self.engine.get_binding_name(i) for i in range(self.engine.num_bindings)]
+-        self.binding_indices = {name: i for i, name in enumerate(self.binding_names)}
+-        self.input_indices = [i for i in range(self.engine.num_bindings) if self.engine.binding_is_input(i)]
+-        self.output_indices = [i for i in range(self.engine.num_bindings) if not self.engine.binding_is_input(i)]
+-        self.max_batch = max_batch
+-
+-    def run(self, source_tensor: "cp.ndarray", target_tensor: "cp.ndarray", stream: Optional["cp.cuda.Stream"] = None) -> "cp.ndarray":
+-        stream = stream or cp.cuda.get_current_stream()
+-        bindings: list[int] = [0] * self.engine.num_bindings
+-
+-        # Bind inputs
+-        for idx in self.input_indices:
+-            name = self.binding_names[idx]
+-            if 'source' in name:
+-                arr = source_tensor
+-            else:
+-                arr = target_tensor
+-            self.context.set_binding_shape(idx, tuple(arr.shape))
+-            bindings[idx] = arr.data.ptr  # type: ignore[attr-defined]
+-
+-        # Determine output shapes after input binding
+-        output_shapes = []
+-        for idx in self.output_indices:
+-            out_shape = tuple(self.context.get_binding_shape(idx))
+-            output_shapes.append(out_shape)
+-
+-        if not output_shapes:
+-            raise RuntimeError('TensorRT engine returned no outputs')
+-
+-        output_shape = output_shapes[0]
+-        output_tensor = cp.empty(output_shape, dtype=cp.float32)
+-        bindings[self.output_indices[0]] = output_tensor.data.ptr  # type: ignore[attr-defined]
+-
+-        self.context.execute_async_v2(bindings, stream.ptr)  # type: ignore[attr-defined]
+-        stream.synchronize()
+-        return output_tensor
+-
+-
+-def _load_or_build_engine(model_path: str, source_shape: Tuple[int, ...], target_shape: Tuple[int, ...], max_batch: int, enable_fp16: bool) -> "trt.ICudaEngine":
+-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+-    engine_path = _resolve_engine_path(model_path, max_batch)
+-
+-    if engine_path.exists():
+-        runtime = trt.Runtime(LOGGER)
+-        with engine_path.open('rb') as f:
+-            engine_bytes = f.read()
+-        engine = runtime.deserialize_cuda_engine(engine_bytes)
+-        if engine is not None:
+-            return engine
+-
+-    runtime = trt.Runtime(LOGGER)
+-    with trt.Builder(LOGGER) as builder:
+-        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+-        parser = trt.OnnxParser(network, LOGGER)
+-
+-        with open(model_path, 'rb') as model_file:
+-            if not parser.parse(model_file.read()):
+-                raise RuntimeError('Failed to parse ONNX for TensorRT')
+-
+-        config = builder.create_builder_config()
+-        config.max_workspace_size = 1 << 29  # 512 MB
+-        if enable_fp16 and builder.platform_has_fast_fp16:
+-            config.set_flag(trt.BuilderFlag.FP16)
+-
+-        profile = builder.create_optimization_profile()
+-        src_min, src_opt, src_max = _profile_bounds(source_shape, max_batch)
+-        tgt_min, tgt_opt, tgt_max = _profile_bounds(target_shape, max_batch)
+-
+-        inputs = [network.get_input(i) for i in range(network.num_inputs)]
+-        source_input = next((inp for inp in inputs if 'source' in inp.name.lower()), inputs[0])
+-        target_input = next((inp for inp in inputs if 'target' in inp.name.lower()), inputs[min(1, len(inputs) - 1)])
+-
+-        profile.set_shape(source_input.name, src_min, src_opt, src_max)
+-        profile.set_shape(target_input.name, tgt_min, tgt_opt, tgt_max)
+-        config.add_optimization_profile(profile)
+-
+-        engine = builder.build_engine(network, config)
+-        if engine is None:
+-            raise RuntimeError('Failed to build TensorRT engine')
+-
+-    with engine_path.open('wb') as f:
+-        f.write(engine.serialize())
+-    return engine
+-
+-
+-def _profile_bounds(shape: Tuple[int, ...], max_batch: int) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+-    batch = max(1, shape[0])
+-    min_shape = (1, *shape[1:])
+-    opt_batch = min(max_batch, max(batch, 4))
+-    opt_shape = (opt_batch, *shape[1:])
+-    max_shape = (max_batch, *shape[1:])
+-    return min_shape, opt_shape, max_shape
+-
+-
+-def _resolve_engine_path(model_path: str, max_batch: int) -> Path:
+-    onnx_path = Path(model_path)
+-    with open(onnx_path, 'rb') as f:
+-        digest = hashlib.sha1(f.read()).hexdigest()[:12]
+-    engine_name = f"{onnx_path.stem}_b{max_batch}_{digest}.engine"
+-    return _CACHE_DIR / engine_name
+diff --git a/facefusion/types.py b/facefusion/types.py
+index a4e8ab3..6af0bb9 100755
+--- a/facefusion/types.py
++++ b/facefusion/types.py
+@@ -303,8 +303,6 @@ StateKey = Literal\
+ 	'output_video_scale',
+ 	'output_video_fps',
+ 	'processors',
+-	'face_swapper_batching',
+-	'skip_content_analysis',
+ 	'open_browser',
+ 	'ui_layouts',
+ 	'ui_workflow',
+@@ -390,3 +388,4 @@ State = TypedDict('State',
+ })
+ ApplyStateItem : TypeAlias = Callable[[Any, Any], None]
+ StateSet : TypeAlias = Dict[AppContext, State]
++
+diff --git a/facefusion/uis/components/face_selector.py b/facefusion/uis/components/face_selector.py
+index 9b0c47a..778d37d 100644
+--- a/facefusion/uis/components/face_selector.py
++++ b/facefusion/uis/components/face_selector.py
+@@ -213,7 +213,7 @@ def update_reference_position_gallery(frame_number : int = 0) -> gradio.Gallery:
+ 
+ def extract_gallery_frames(target_vision_frame : VisionFrame) -> List[VisionFrame]:
+ 	gallery_vision_frames = []
+-	faces = get_many_faces([ target_vision_frame ], use_tracking = False)
++	faces = get_many_faces([ target_vision_frame ])
+ 	faces = sort_and_filter_faces(faces)
+ 
+ 	for face in faces:
+diff --git a/facefusion/wording.py b/facefusion/wording.py
+index 2fb188e..70dcd38 100755
+--- a/facefusion/wording.py
++++ b/facefusion/wording.py
+@@ -127,13 +127,6 @@ WORDING : Dict[str, Any] =\
+ 		'reference_face_position': 'specify the position used to create the reference face',
+ 		'reference_face_distance': 'specify the similarity between the reference face and target face',
+ 		'reference_frame_number': 'specify the frame used to create the reference face',
+-		# face tracker
+-		'enable_face_tracking': 'enable LK-based landmark tracking to skip redundant detections',
+-		'disable_face_tracking': 'disable the landmark tracker and detect every frame',
+-		'face_tracker_detection_interval': 'run a full detector every N frames to refresh tracks',
+-		'face_tracker_max_missed': 'number of consecutive tracking failures before forcing re-detect',
+-		'face_tracker_min_points': 'minimum tracked landmarks required to keep a face alive',
+-		'face_tracker_match_iou': 'IoU threshold used to associate detections with existing tracks',
+ 		# face masker
+ 		'face_occluder_model': 'choose the model responsible for the occlusion mask',
+ 		'face_parser_model': 'choose the model responsible for the region mask',
+@@ -165,9 +158,6 @@ WORDING : Dict[str, Any] =\
+ 		'age_modifier_model': 'choose the model responsible for aging the face',
+ 		'age_modifier_direction': 'specify the direction in which the age should be modified',
+ 		'deep_swapper_model': 'choose the model responsible for swapping the face',
+-		'face_swapper_use_trt': 'enable TensorRT acceleration when the engine can be built',
+-		'face_swapper_disable_trt': 'disable TensorRT and fall back to ONNX Runtime execution',
+-		'face_swapper_trt_max_batch': 'cap TensorRT engine batch size to balance build-time and VRAM',
+ 		'deep_swapper_morph': 'morph between source face and target faces',
+ 		'expression_restorer_model': 'choose the model responsible for restoring the expression',
+ 		'expression_restorer_factor': 'restore factor of expression from the target face',
+@@ -216,8 +206,6 @@ WORDING : Dict[str, Any] =\
+ 		'execution_device_ids': 'specify the devices used for processing',
+ 		'execution_providers': 'inference using different providers (choices: {choices}, ...)',
+ 		'execution_thread_count': 'specify the amount of parallel threads while processing',
+-		'enable_streaming_pipeline': 'stream decoded frames directly through the pipeline (best for CUDA)',
+-		'disable_streaming_pipeline': 'fallback to the legacy temp-frame pipeline',
+ 		# memory
+ 		'video_memory_strategy': 'balance fast processing and low VRAM usage',
+ 		'system_memory_limit': 'limit the available RAM that can be used while processing',
+diff --git a/requirements.txt b/requirements.txt
+index 3346745..1b80cca 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,6 @@
+ gradio-rangeslider==0.0.8
+ gradio==5.42.0
+-numpy==2.2.2
++numpy==2.3.2
+ onnx==1.19.0
+ onnxruntime==1.22.1
+ opencv-python==4.12.0.88
+diff --git a/tests/test_face_analyser.py b/tests/test_face_analyser.py
+index 6d9e2f3..9499a6b 100644
+--- a/tests/test_face_analyser.py
++++ b/tests/test_face_analyser.py
+@@ -54,7 +54,7 @@ def test_get_one_face_with_retinaface() -> None:
+ 
+ 	for source_path in source_paths:
+ 		source_frame = read_static_image(source_path)
+-		many_faces = get_many_faces([ source_frame ], use_tracking = False)
++		many_faces = get_many_faces([ source_frame ])
+ 
+ 		assert len(many_faces) == 1
+ 
+@@ -74,7 +74,7 @@ def test_get_one_face_with_scrfd() -> None:
+ 
+ 	for source_path in source_paths:
+ 		source_frame = read_static_image(source_path)
+-		many_faces = get_many_faces([ source_frame ], use_tracking = False)
++		many_faces = get_many_faces([ source_frame ])
+ 
+ 		assert len(many_faces) == 1
+ 
+@@ -94,7 +94,7 @@ def test_get_one_face_with_yoloface() -> None:
+ 
+ 	for source_path in source_paths:
+ 		source_frame = read_static_image(source_path)
+-		many_faces = get_many_faces([ source_frame ], use_tracking = False)
++		many_faces = get_many_faces([ source_frame ])
+ 
+ 		assert len(many_faces) == 1
+ 
+@@ -114,7 +114,7 @@ def test_get_one_face_with_yunet() -> None:
+ 
+ 	for source_path in source_paths:
+ 		source_frame = read_static_image(source_path)
+-		many_faces = get_many_faces([ source_frame ], use_tracking = False)
++		many_faces = get_many_faces([ source_frame ])
+ 
+ 		assert len(many_faces) == 1
+ 
+@@ -122,6 +122,6 @@ def test_get_one_face_with_yunet() -> None:
+ def test_get_many_faces() -> None:
+ 	source_path = get_test_example_file('source.jpg')
+ 	source_frame = read_static_image(source_path)
+-	many_faces = get_many_faces([ source_frame, source_frame, source_frame ], use_tracking = False)
++	many_faces = get_many_faces([ source_frame, source_frame, source_frame ])
+ 
+ 	assert len(many_faces) == 3

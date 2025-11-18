@@ -1,43 +1,11 @@
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import cv2
 import numpy
 from cv2.typing import Size
 
-try:
-    import torch  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    torch = None  # type: ignore
-
-try:
-    from facefusion.gpu.compositor import get_composer  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    get_composer = None  # type: ignore
-
-try:
-    from cv2 import ximgproc  # type: ignore[attr-defined]
-    _HAS_XIMGPROC = True
-except Exception:  # pragma: no cover - optional dependency
-    ximgproc = None  # type: ignore
-    _HAS_XIMGPROC = False
-
-try:
-    from facefusion import temporal_filters  # type: ignore
-    _HAS_TEMPORAL_FILTERS = True
-except Exception:
-    temporal_filters = None  # type: ignore
-    _HAS_TEMPORAL_FILTERS = False
-
 from facefusion.types import Anchors, Angle, BoundingBox, Distance, FaceDetectorModel, FaceLandmark5, FaceLandmark68, Mask, Matrix, Points, Scale, Score, Translation, VisionFrame, WarpTemplate, WarpTemplateSet
-from facefusion import state_manager
-
-# Detect CUDA support in OpenCV if available
-def _has_cv2_cuda() -> bool:
-    try:
-        return hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0
-    except Exception:
-        return False
 
 WARP_TEMPLATE_SET : WarpTemplateSet =\
 {
@@ -100,100 +68,16 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
 }
 
 
-def _smooth_affine_matrix(track_token: Optional[str], matrix: Matrix) -> Matrix:
-	"""Smooth affine matrix using robust SG-based similarity transform filter."""
-	if track_token is None:
-		return matrix
-	if not _HAS_TEMPORAL_FILTERS:
-		return matrix
-	key = temporal_filters.resolve_filter_key(str(track_token))
-	return temporal_filters.filter_affine(matrix, key)
-
-
-def reset_affine_smoothers() -> None:
-	"""Reset all temporal filters."""
-	if _HAS_TEMPORAL_FILTERS:
-		temporal_filters.reset_all_filters()
-	_LANDMARK_SMOOTHERS.clear()
-	_AFFINE_MATRIX_CACHE.clear()
-
-
-# Landmark temporal smoothing to reduce jitter
-_LANDMARK_SMOOTHERS: Dict[str, numpy.ndarray] = {}
-_LANDMARK_ALPHA = 0.2  # EMA smoothing factor: REDUCED from 0.65 to 0.2 for more stable tracking (higher = responsive, lower = smooth)
-
-# Affine matrix caching for deterministic warps (reduces micro-jitter)
-_AFFINE_MATRIX_CACHE: Dict[str, Matrix] = {}
-_AFFINE_CACHE_ALPHA = 0.2  # Smoothing factor for affine matrix blending
-
-
-def _smooth_landmarks(track_token: Optional[str], landmarks: FaceLandmark5) -> FaceLandmark5:
-	"""Apply exponential moving average smoothing to face landmarks."""
-	if track_token is None:
-		return landmarks
-
-	key = str(track_token)
-	prev_landmarks = _LANDMARK_SMOOTHERS.get(key)
-
-	if prev_landmarks is None:
-		# First observation - store and return
-		_LANDMARK_SMOOTHERS[key] = landmarks.copy()
-		return landmarks
-
-	# EMA: smoothed = alpha * current + (1 - alpha) * previous
-	# Lower alpha = more smoothing = less jitter
-	smoothed = _LANDMARK_ALPHA * landmarks + (1.0 - _LANDMARK_ALPHA) * prev_landmarks
-	_LANDMARK_SMOOTHERS[key] = smoothed
-	return smoothed
-
-
-def _cache_and_smooth_affine(track_token: Optional[str], affine_matrix: Matrix) -> Matrix:
-	"""Cache and smooth affine matrix to prevent micro-jitter in warping."""
-	if track_token is None:
-		return affine_matrix
-
-	key = str(track_token)
-	prev_matrix = _AFFINE_MATRIX_CACHE.get(key)
-
-	if prev_matrix is None:
-		# First observation - cache and return
-		_AFFINE_MATRIX_CACHE[key] = affine_matrix.copy()
-		return affine_matrix
-
-	# Blend new matrix with cached matrix for stability
-	# This prevents 0.2-0.5px jumps that cause visible jitter
-	smoothed = _AFFINE_CACHE_ALPHA * affine_matrix + (1.0 - _AFFINE_CACHE_ALPHA) * prev_matrix
-	_AFFINE_MATRIX_CACHE[key] = smoothed
-	return smoothed
-
-
-def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token: Optional[str] = None) -> Matrix:
-	# Apply temporal smoothing to landmarks before computing affine matrix
-	smoothed_landmarks = _smooth_landmarks(track_token, face_landmark_5)
+def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Matrix:
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
-	affine_matrix = cv2.estimateAffinePartial2D(smoothed_landmarks, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
-	# Cache and smooth the affine matrix itself to prevent micro-jitter
-	affine_matrix = _cache_and_smooth_affine(track_token, affine_matrix)
+	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
 	return affine_matrix
 
 
-def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token: Optional[str] = None) -> Tuple[VisionFrame, Matrix]:
-    affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size, track_token)
-    # Force consistent interpolation: INTER_LINEAR for stability (INTER_AREA can have slight rounding differences)
-    # Use BORDER_REPLICATE to match baseline behavior exactly
-    if _has_cv2_cuda():
-        try:
-            gpu_img = cv2.cuda_GpuMat()
-            gpu_img.upload(temp_vision_frame)
-            # Use INTER_LINEAR for consistency across GPU/CPU paths
-            crop_gpu = cv2.cuda.warpAffine(gpu_img, affine_matrix, crop_size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            crop_vision_frame = crop_gpu.download()
-            return crop_vision_frame, affine_matrix
-        except Exception:
-            pass
-    # CPU fallback: use same flags for consistency
-    crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_LINEAR)
-    return crop_vision_frame, affine_matrix
+def warp_face_by_face_landmark_5(temp_vision_frame : VisionFrame, face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size) -> Tuple[VisionFrame, Matrix]:
+	affine_matrix = estimate_matrix_by_face_landmark_5(face_landmark_5, warp_template, crop_size)
+	crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size, borderMode = cv2.BORDER_REPLICATE, flags = cv2.INTER_AREA)
+	return crop_vision_frame, affine_matrix
 
 
 def warp_face_by_bounding_box(temp_vision_frame : VisionFrame, bounding_box : BoundingBox, crop_size : Size) -> Tuple[VisionFrame, Matrix]:
@@ -214,168 +98,19 @@ def warp_face_by_translation(temp_vision_frame : VisionFrame, translation : Tran
 	return crop_vision_frame, affine_matrix
 
 
-def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix, track_token: Optional[object] = None) -> VisionFrame:
-	track_key = str(track_token) if track_token is not None else None
-	if track_key is not None:
-		affine_matrix = _smooth_affine_matrix(track_key, affine_matrix)
+def paste_back(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, crop_mask : Mask, affine_matrix : Matrix) -> VisionFrame:
 	paste_bounding_box, paste_matrix = calculate_paste_area(temp_vision_frame, crop_vision_frame, affine_matrix)
 	x1, y1, x2, y2 = paste_bounding_box
 	paste_width = x2 - x1
 	paste_height = y2 - y1
-
-	crop_mask = _refine_mask_with_guided_filter(crop_vision_frame, crop_mask)
-	sdf_map = _compute_signed_distance(crop_mask)
-
-	if paste_width <= 0 or paste_height <= 0:
-		return temp_vision_frame
-
-	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1).astype(numpy.float32)
-	if not numpy.any(inverse_mask):
-		return temp_vision_frame
-
-	gpu_result = _paste_back_cuda(temp_vision_frame, crop_vision_frame, inverse_mask, paste_matrix, paste_bounding_box, track_key, sdf_map)
-	if gpu_result is not None:
-		return gpu_result
-
-	if _has_cv2_cuda():
-		try:
-			# Warp on GPU with consistent INTER_LINEAR, blend on CPU in fp32 for stability
-			gpu_mask = cv2.cuda_GpuMat()
-			gpu_mask.upload(crop_mask.astype(numpy.float32))
-			inv_mask_gpu = cv2.cuda.warpAffine(gpu_mask, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR)
-			mask_roi = inv_mask_gpu.download().clip(0, 1)
-			mask_roi = numpy.expand_dims(mask_roi, axis = -1)
-
-			gpu_crop = cv2.cuda_GpuMat()
-			gpu_crop.upload(crop_vision_frame)
-			inv_frame_gpu = cv2.cuda.warpAffine(gpu_crop, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-			inverse_vision_frame = inv_frame_gpu.download()
-
-			# Blend in fp32 for numerical stability
-			temp_vision_frame = temp_vision_frame.copy()
-			paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-			paste_f32 = paste_vision_frame.astype(numpy.float32)
-			inv_f32 = inverse_vision_frame.astype(numpy.float32)
-			mask3 = numpy.repeat(mask_roi, 3, axis=-1)
-			blended = paste_f32 * (1.0 - mask3) + inv_f32 * mask3
-			temp_vision_frame[y1:y2, x1:x2] = numpy.clip(blended, 0, 255).astype(temp_vision_frame.dtype)
-			return temp_vision_frame
-		except Exception:
-			pass
-
-	# CPU fallback: use INTER_LINEAR for consistency and blend in fp32
-	inverse_mask_expanded = numpy.expand_dims(inverse_mask, axis = -1)
-	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+	inverse_mask = cv2.warpAffine(crop_mask, paste_matrix, (paste_width, paste_height)).clip(0, 1)
+	inverse_mask = numpy.expand_dims(inverse_mask, axis = -1)
+	inverse_vision_frame = cv2.warpAffine(crop_vision_frame, paste_matrix, (paste_width, paste_height), borderMode = cv2.BORDER_REPLICATE)
 	temp_vision_frame = temp_vision_frame.copy()
 	paste_vision_frame = temp_vision_frame[y1:y2, x1:x2]
-	# Convert to float32 for stable blending - prevents rounding artifacts
-	paste_f32 = paste_vision_frame.astype(numpy.float32)
-	inv_frame_f32 = inverse_vision_frame.astype(numpy.float32)
-	# Expand mask to 3 channels via OpenCV
-	mask3 = cv2.merge([ inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0], inverse_mask_expanded[:, :, 0] ])
-	one_minus = 1.0 - mask3
-	part_a = cv2.multiply(paste_f32, one_minus)
-	part_b = cv2.multiply(inv_frame_f32, mask3)
-	blend = cv2.add(part_a, part_b)
-	temp_vision_frame[y1:y2, x1:x2] = numpy.clip(blend, 0, 255).astype(temp_vision_frame.dtype)
+	paste_vision_frame = paste_vision_frame * (1 - inverse_mask) + inverse_vision_frame * inverse_mask
+	temp_vision_frame[y1:y2, x1:x2] = paste_vision_frame.astype(temp_vision_frame.dtype)
 	return temp_vision_frame
-
-
-_GPU_WARP_AVAILABLE: Optional[bool] = None
-
-
-def _should_use_cuda_warp(area: int) -> bool:
-	global _GPU_WARP_AVAILABLE
-	if torch is None or not torch.cuda.is_available():
-		return False
-	if _GPU_WARP_AVAILABLE is False:
-		return False
-	if area < 65_536:  # Skip very small regions to avoid kernel launch overhead
-		return False
-	try:
-		from facefusion import state_manager
-		providers = state_manager.get_item('execution_providers') or []
-		if not any(str(provider).lower() in ('cuda', 'tensorrt') for provider in providers):
-			return False
-	except Exception:
-		pass
-	return True
-
-
-def _paste_back_cuda(temp_frame: VisionFrame, crop_frame: VisionFrame, roi_mask: Mask, paste_matrix: Matrix, paste_box: BoundingBox, track_token: Optional[str], sdf_map: Optional[Mask]) -> Optional[VisionFrame]:
-	global _GPU_WARP_AVAILABLE
-	if torch is None or get_composer is None:
-		return None
-	x1, y1, x2, y2 = map(int, paste_box)
-	width = x2 - x1
-	height = y2 - y1
-	area = width * height
-	if width <= 0 or height <= 0 or not _should_use_cuda_warp(area):
-		return None
-	device = torch.device('cuda')
-	try:
-		bg_roi = temp_frame[y1:y2, x1:x2]
-		if bg_roi.shape[0] != height or bg_roi.shape[1] != width:
-			return None
-
-		composer = get_composer(device, height, width)
-		crop_contig = numpy.ascontiguousarray(crop_frame)
-		mask_contig = numpy.ascontiguousarray(roi_mask)
-		bg_contig = numpy.ascontiguousarray(bg_roi)
-		src_tensor = torch.from_numpy(crop_contig).to(device, non_blocking=True)
-		mask_tensor = torch.from_numpy(mask_contig).to(device, non_blocking=True)
-		bg_tensor = torch.from_numpy(bg_contig).to(device, non_blocking=True)
-		affine_tensor = torch.from_numpy(paste_matrix.astype(numpy.float32)).to(device, non_blocking=True)
-		extra_payload = { 'bg_reference': bg_contig }
-		if sdf_map is not None:
-			sdf_tensor = torch.from_numpy(numpy.ascontiguousarray(sdf_map)).to(device, non_blocking=True)
-			extra_payload['sdf'] = sdf_tensor
-
-		result = composer.compose(
-			src_tensor,
-			mask_tensor,
-			bg_tensor,
-			affine_tensor,
-			track_token=track_token,
-			extras=extra_payload
-		)
-		out_np = result.frame_bgr.contiguous().cpu().numpy()
-		_GPU_WARP_AVAILABLE = True
-		temp_out = temp_frame.copy()
-		temp_out[y1:y2, x1:x2] = out_np
-		return temp_out
-	except Exception:
-		_GPU_WARP_AVAILABLE = False
-		return None
-
-
-def _refine_mask_with_guided_filter(crop_frame: VisionFrame, mask: Mask) -> Mask:
-	if mask.size == 0:
-		return mask
-	mask_f = mask.astype(numpy.float32)
-	mask_f = numpy.clip(mask_f, 0.0, 1.0)
-	if _HAS_XIMGPROC:
-		try:
-			guide = cv2.cvtColor(crop_frame, cv2.COLOR_BGR2GRAY)
-			radius = 8
-			eps = 1e-4
-			refined = ximgproc.guidedFilter(guide, mask_f, radius, eps)
-			return numpy.clip(refined, 0.0, 1.0)
-		except Exception:
-			pass
-	# lightweight fallback: gentle gaussian smooth
-	return cv2.GaussianBlur(mask_f, (0, 0), 1.2)
-
-
-def _compute_signed_distance(mask: Mask) -> Mask:
-	if mask.size == 0:
-		return numpy.zeros_like(mask, dtype = numpy.float32)
-	mask_binary = (mask >= 0.5).astype(numpy.uint8)
-	if not mask_binary.any():
-		return numpy.zeros_like(mask, dtype = numpy.float32)
-	inside = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 3)
-	out = cv2.distanceTransform(1 - mask_binary, cv2.DIST_L2, 3)
-	return (inside - out).astype(numpy.float32)
 
 
 def calculate_paste_area(temp_vision_frame : VisionFrame, crop_vision_frame : VisionFrame, affine_matrix : Matrix) -> Tuple[BoundingBox, Matrix]:
