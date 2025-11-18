@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 
 import numpy
 from tqdm import tqdm
@@ -27,7 +27,7 @@ _FRAME_CACHE_SOURCE_FRAMES: List[numpy.ndarray] = []
 _CACHE_ENABLED: bool = False
 _RUNTIME_SOURCE_AUDIO_PATH: Optional[str] = None
 _RUNTIME_TEMP_VIDEO_FPS: Optional[float] = None
-
+_RUNTIME_PROCESSOR_MODULES: List[Any] = []
 
 def process(start_time : float) -> ErrorCode:
 	tasks =\
@@ -106,7 +106,7 @@ def process_video() -> ErrorCode:
 						future.result()
 						progress.update()
 
-		for processor_module in get_processors_modules(state_manager.get_item('processors')):
+		for processor_module in _RUNTIME_PROCESSOR_MODULES:
 			processor_module.post_process()
 		if is_process_stopping():
 			return 4
@@ -179,6 +179,8 @@ def _prepare_frame_cache() -> None:
 	"""
 	Decode reference/source frames once per job and reuse across threads.
 	"""
+	logger.info(f"[cache] enabled={_CACHE_ENABLED}", __name__)
+
 	global _FRAME_CACHE_TARGET_PATH, _FRAME_CACHE_REFERENCE_NUMBER, _FRAME_CACHE_REFERENCE_FRAME
 	global _FRAME_CACHE_SOURCE_PATHS, _FRAME_CACHE_SOURCE_FRAMES
 
@@ -206,9 +208,8 @@ def _prepare_runtime_cache() -> None:
 	_FRAME_CACHE_TARGET_PATH = state_manager.get_item('target_path')
 	_FRAME_CACHE_REFERENCE_NUMBER = state_manager.get_item('reference_frame_number')
 
-	# Optional: enable caching only for a specific model (supporting names with extensions).
 	model_name = state_manager.get_item('face_swapper_model')
-	model_name_str = str(model_name) if model_name is not None else ''
+	model_name_str = str(model_name).lower() if model_name is not None else ''
 	_CACHE_ENABLED = 'hyperswap_1c_256' in model_name_str
 
 	if _CACHE_ENABLED:
@@ -217,6 +218,8 @@ def _prepare_runtime_cache() -> None:
 	source_paths = state_manager.get_item('source_paths')
 	_RUNTIME_SOURCE_AUDIO_PATH = get_first(filter_audio_paths(source_paths))
 	_RUNTIME_TEMP_VIDEO_FPS = restrict_video_fps(_FRAME_CACHE_TARGET_PATH, state_manager.get_item('output_video_fps'))
+	_RUNTIME_PROCESSOR_MODULES = list(get_processors_modules(state_manager.get_item('processors')))
+	logger.info(f"[cache] enabled={_CACHE_ENABLED}, processors={len(_RUNTIME_PROCESSOR_MODULES)}", __name__)
 
 
 def _resolve_audio_frames(source_audio_path : Optional[str], temp_video_fps : float, frame_number : int) -> Tuple[numpy.ndarray, numpy.ndarray]:
@@ -247,7 +250,7 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 	temp_vision_mask = extract_vision_mask(temp_vision_frame)
 	source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
 
-	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+	for processor_module in _RUNTIME_PROCESSOR_MODULES:
 		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
 		{
 			'reference_vision_frame': reference_vision_frame,
