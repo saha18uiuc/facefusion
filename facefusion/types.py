@@ -304,7 +304,6 @@ StateKey = Literal\
 	'output_video_fps',
 	'processors',
 	'face_swapper_batching',
-	'skip_content_analysis',
 	'open_browser',
 	'ui_layouts',
 	'ui_workflow',

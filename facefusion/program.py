@@ -277,7 +277,6 @@ def create_content_program() -> ArgumentParser:
 	program = ArgumentParser(add_help = False)
 	group_content = program.add_argument_group('content')
 	group_content.add_argument('--skip-content-analysis', help = 'Skip content (NSFW) analysis for faster processing', action = 'store_true', default = True)
-	job_store.register_job_keys([ 'skip_content_analysis' ])
 	return program
 
 

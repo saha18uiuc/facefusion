@@ -354,7 +354,7 @@ def conditional_process() -> ErrorCode:
 
 
 def process_image(start_time : float) -> ErrorCode:
-	if not state_manager.get_item('skip_content_analysis') and analyse_image(state_manager.get_item('target_path')):
+	if analyse_image(state_manager.get_item('target_path')):
 		return 3
 
 	logger.debug(wording.get('clearing_temp'), __name__)
@@ -420,7 +420,7 @@ def process_image(start_time : float) -> ErrorCode:
 
 def process_video(start_time : float) -> ErrorCode:
 	trim_frame_start, trim_frame_end = restrict_trim_frame(state_manager.get_item('target_path'), state_manager.get_item('trim_frame_start'), state_manager.get_item('trim_frame_end'))
-	if not state_manager.get_item('skip_content_analysis') and analyse_video(state_manager.get_item('target_path'), trim_frame_start, trim_frame_end):
+	if analyse_video(state_manager.get_item('target_path'), trim_frame_start, trim_frame_end):
 		return 3
 
 	logger.debug(wording.get('clearing_temp'), __name__)
