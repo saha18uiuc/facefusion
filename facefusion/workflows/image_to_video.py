@@ -203,7 +203,7 @@ def _prepare_runtime_cache() -> None:
 	Prepare all per-job reusable state to minimize per-frame overhead.
 	"""
 	global _RUNTIME_SOURCE_AUDIO_PATH, _RUNTIME_TEMP_VIDEO_FPS
-	global _FRAME_CACHE_TARGET_PATH, _FRAME_CACHE_REFERENCE_NUMBER, _CACHE_ENABLED
+	global _FRAME_CACHE_TARGET_PATH, _FRAME_CACHE_REFERENCE_NUMBER, _CACHE_ENABLED, _RUNTIME_PROCESSOR_MODULES
 
 	_FRAME_CACHE_TARGET_PATH = state_manager.get_item('target_path')
 	_FRAME_CACHE_REFERENCE_NUMBER = state_manager.get_item('reference_frame_number')
@@ -291,29 +291,13 @@ def process_temp_frame(temp_frame_path: str, frame_number: int) -> bool:
     if reference_vision_frame is None:
         return False
 
-    # ------- Same processing as baseline -------
-    temp_vision_frame = target_vision_frame.copy()
-    temp_vision_mask = extract_vision_mask(temp_vision_frame)
-
-    source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number)
-    source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number)
-
-    if not numpy.any(source_audio_frame):
-        source_audio_frame = create_empty_audio_frame()
-    if not numpy.any(source_voice_frame):
-        source_voice_frame = create_empty_audio_frame()
-
-    for processor_module in get_processors_modules(state_manager.get_item('processors')):
-        temp_vision_frame, temp_vision_mask = processor_module.process_frame(
-        {
-            'reference_vision_frame': reference_vision_frame,
-            'source_vision_frames': source_vision_frames,
-            'source_audio_frame': source_audio_frame,
-            'source_voice_frame': source_voice_frame,
-            'target_vision_frame': target_vision_frame[:, :, :3],
-            'temp_vision_frame': temp_vision_frame[:, :, :3],
-            'temp_vision_mask': temp_vision_mask
-        })
-
-    temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
-    return write_image(temp_frame_path, temp_vision_frame)
+    # Delegate the actual processing to the shared runtime helper
+    processed_frame = process_frame_runtime(
+        target_vision_frame,
+        frame_number,
+        reference_vision_frame,
+        source_vision_frames,
+        source_audio_path,
+        temp_video_fps
+    )
+    return write_image(temp_frame_path, processed_frame)
