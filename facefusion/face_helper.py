@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy
@@ -68,17 +68,51 @@ WARP_TEMPLATE_SET : WarpTemplateSet =\
 }
 
 
+# Lightweight EMA smoothers (cheap; helps reduce jitter with negligible cost)
+_LANDMARK_SMOOTHERS: Dict[str, numpy.ndarray] = {}
+_AFFINE_MATRIX_CACHE: Dict[str, Matrix] = {}
+# Higher alpha = stronger smoothing. Keep modest to avoid lag.
+_LANDMARK_ALPHA = 0.85
+_AFFINE_ALPHA = 0.85
+
+
 def reset_affine_smoothers() -> None:
-	"""
-	No-op placeholder to satisfy callers that expect a temporal smoother reset.
-	Temporal smoothing was removed to avoid extra runtime.
-	"""
-	return None
+	"""Reset cached EMA state."""
+	_LANDMARK_SMOOTHERS.clear()
+	_AFFINE_MATRIX_CACHE.clear()
+
+
+def _smooth_landmarks(track_token: Optional[str], landmarks: FaceLandmark5) -> FaceLandmark5:
+	if track_token is None:
+		return landmarks
+	key = str(track_token)
+	prev = _LANDMARK_SMOOTHERS.get(key)
+	if prev is None:
+		_LANDMARK_SMOOTHERS[key] = landmarks.copy()
+		return landmarks
+	smoothed = _LANDMARK_ALPHA * prev + (1.0 - _LANDMARK_ALPHA) * landmarks
+	_LANDMARK_SMOOTHERS[key] = smoothed
+	return smoothed
+
+
+def _smooth_affine(track_token: Optional[str], affine: Matrix) -> Matrix:
+	if track_token is None:
+		return affine
+	key = str(track_token)
+	prev = _AFFINE_MATRIX_CACHE.get(key)
+	if prev is None:
+		_AFFINE_MATRIX_CACHE[key] = affine.copy()
+		return affine
+	smoothed = _AFFINE_ALPHA * prev + (1.0 - _AFFINE_ALPHA) * affine
+	_AFFINE_MATRIX_CACHE[key] = smoothed
+	return smoothed
 
 
 def estimate_matrix_by_face_landmark_5(face_landmark_5 : FaceLandmark5, warp_template : WarpTemplate, crop_size : Size, track_token : Optional[str] = None) -> Matrix:
+	landmarks = _smooth_landmarks(track_token, face_landmark_5)
 	warp_template_norm = WARP_TEMPLATE_SET.get(warp_template) * crop_size
-	affine_matrix = cv2.estimateAffinePartial2D(face_landmark_5, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
+	affine_matrix = cv2.estimateAffinePartial2D(landmarks, warp_template_norm, method = cv2.RANSAC, ransacReprojThreshold = 100)[0]
+	affine_matrix = _smooth_affine(track_token, affine_matrix)
 	return affine_matrix
 
 
