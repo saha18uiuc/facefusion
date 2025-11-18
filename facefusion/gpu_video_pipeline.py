@@ -395,6 +395,17 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	output_path = state_manager.get_item('output_path')
 
 	width, height, temp_video_fps, trim_frame_start, trim_frame_end = _get_streaming_video_props()
+	decoder_pix_fmt = 'nv12'  # default initialization
+	decoder = None
+
+	# Late initialization after decoder launch to know actual pix_fmt
+	try:
+		decoder, decoder_pix_fmt = _launch_decoder_ffmpeg(target_path, width, height, _frame_to_seconds(trim_frame_start, temp_video_fps), _frame_to_seconds(trim_frame_end, temp_video_fps) if trim_frame_end else None)
+	except Exception as e:
+		logger.error(f"Failed to launch decoder: {e}", __name__)
+		return 1
+
+	# Calculate decoder frame size based on pixel format
 	# Calculate decoder frame size based on pixel format
 	if decoder_pix_fmt == 'nv12':
 		frame_size = int(width * height * 3 // 2)
@@ -441,7 +452,6 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 		device = get_cuda_device(str(device_ids[0]))
 		logger.info(f"GPU mode enabled, using device: {device}", __name__)
 
-		decoder, decoder_pix_fmt = _launch_decoder_ffmpeg(target_path, width, height, start_sec, end_sec)
 	encoder = _launch_encoder_ffmpeg(output_path, target_path, width, height, temp_video_fps, start_sec, end_sec)
 
 	if decoder.stdout is None or encoder.stdin is None:
