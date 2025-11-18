@@ -63,6 +63,13 @@ def _nv12_bytes_to_bgr(raw: bytes, width: int, height: int) -> Optional[numpy.nd
 	return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
 
 
+def _bgr_bytes_to_bgr(raw: bytes, width: int, height: int) -> Optional[numpy.ndarray]:
+	expected = width * height * 3
+	if len(raw) < expected:
+		return None
+	return numpy.frombuffer(raw, dtype=numpy.uint8).reshape((height, width, 3))
+
+
 def _frame_to_seconds(frame_index: int, fps: float) -> Optional[float]:
 	if frame_index and fps:
 		return frame_index / fps
@@ -78,9 +85,17 @@ def _append_trim_args(cmd: List[str], start_sec: Optional[float], end_sec: Optio
 
 def _launch_decoder_ffmpeg(input_path: str, width: int, height: int,
                            start_sec: Optional[float],
-                           end_sec: Optional[float]) -> subprocess.Popen:
+                           end_sec: Optional[float]) -> Tuple[subprocess.Popen, str]:
+	"""
+	Launch FFmpeg decoder. Returns process handle and pixel format ('nv12' or 'bgr24').
+	"""
 	use_hwscale = state_manager.get_item('prefer_hwscale')
 	use_hwscale = True if use_hwscale is None else bool(use_hwscale)
+
+	# Allow forcing pixel format to avoid NV12->BGR conversions if that is a bottleneck.
+	decoder_pix_fmt = (state_manager.get_item('decoder_pixel_format') or 'nv12').lower()
+	if decoder_pix_fmt not in ('nv12', 'bgr24'):
+		decoder_pix_fmt = 'nv12'
 
 	if use_hwscale and _ffmpeg_supports_filter('scale_cuda'):
 		scale_filter = 'scale_cuda'
@@ -101,20 +116,20 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int,
 
 	_append_trim_args(cmd, start_sec, end_sec)
 
-	# Keep decoder output in NV12 all the way; final BGR conversion happens in Python.
+	# Build filter chain
 	filter_chain: List[str] = []
 	if scale_filter == 'scale_cuda':
 		filter_chain.append(f"scale_cuda={width}:{height}")
 		filter_chain.append("hwdownload")
-		filter_chain.append("format=nv12")
+		filter_chain.append(f"format={decoder_pix_fmt}")
 	else:
 		filter_chain.append(f"scale={width}:{height}:flags=lanczos")
-		filter_chain.append("format=nv12")
+		filter_chain.append(f"format={decoder_pix_fmt}")
 
 	cmd += [
 		'-i', input_path,
 		'-vf', ','.join(filter_chain),
-		'-pix_fmt', 'nv12',
+		'-pix_fmt', decoder_pix_fmt,
 		'-f', 'rawvideo',
 		'pipe:1'
 	]
@@ -125,7 +140,7 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int,
 		stdout=subprocess.PIPE,
 		stderr=subprocess.PIPE,
 		bufsize=10 ** 8
-	)
+	), decoder_pix_fmt
 
 
 
@@ -380,8 +395,11 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	output_path = state_manager.get_item('output_path')
 
 	width, height, temp_video_fps, trim_frame_start, trim_frame_end = _get_streaming_video_props()
-	# NV12 frame size (1.5 bytes per pixel)
-	frame_size = int(width * height * 3 // 2)
+	# Calculate decoder frame size based on pixel format
+	if decoder_pix_fmt == 'nv12':
+		frame_size = int(width * height * 3 // 2)
+	else:
+		frame_size = width * height * 3
 	start_sec = _frame_to_seconds(trim_frame_start, temp_video_fps)
 	end_sec = _frame_to_seconds(trim_frame_end, temp_video_fps) if trim_frame_end else None
 
@@ -423,7 +441,7 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 		device = get_cuda_device(str(device_ids[0]))
 		logger.info(f"GPU mode enabled, using device: {device}", __name__)
 
-	decoder = _launch_decoder_ffmpeg(target_path, width, height, start_sec, end_sec)
+		decoder, decoder_pix_fmt = _launch_decoder_ffmpeg(target_path, width, height, start_sec, end_sec)
 	encoder = _launch_encoder_ffmpeg(output_path, target_path, width, height, temp_video_fps, start_sec, end_sec)
 
 	if decoder.stdout is None or encoder.stdin is None:
@@ -444,9 +462,13 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 				logger.info(f"Decoder finished after {frame_number} frames", __name__)
 				break
 
-			bgr_frame = _nv12_bytes_to_bgr(raw, width, height)
+			if decoder_pix_fmt == 'nv12':
+				bgr_frame = _nv12_bytes_to_bgr(raw, width, height)
+			else:
+				bgr_frame = _bgr_bytes_to_bgr(raw, width, height)
+
 			if bgr_frame is None:
-				logger.error(f"Failed to decode NV12 frame {frame_number}", __name__)
+				logger.error(f"Failed to decode frame {frame_number} (pix_fmt={decoder_pix_fmt})", __name__)
 				break
 
 			if frame_number == 0:
