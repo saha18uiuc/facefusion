@@ -67,53 +67,57 @@ def _append_trim_args(cmd: List[str], start_sec: Optional[float], end_sec: Optio
 		cmd.extend([ '-to', f'{end_sec:.3f}' ])
 
 
-def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: Optional[float], end_sec: Optional[float]) -> subprocess.Popen:
-	# Try CUDA hardware decode first, but don't require hwaccel_output_format
-	# This allows fallback to software decode if CUDA isn't available
-	use_hwscale = state_manager.get_item('prefer_hwscale')
-	use_hwscale = True if use_hwscale is None else bool(use_hwscale)
+def _launch_decoder_ffmpeg(input_path: str, width: int, height: int,
+                           start_sec: Optional[float],
+                           end_sec: Optional[float]) -> subprocess.Popen:
+    use_hwscale = state_manager.get_item('prefer_hwscale')
+    use_hwscale = True if use_hwscale is None else bool(use_hwscale)
 
-	# Prefer scale_cuda if available (fully on GPU), otherwise fall back to CPU scale.
-	if use_hwscale and _ffmpeg_supports_filter('scale_cuda'):
-		scale_filter = 'scale_cuda'
-	else:
-		use_hwscale = False
-		scale_filter = 'scale'
+    if use_hwscale and _ffmpeg_supports_filter('scale_cuda'):
+        scale_filter = 'scale_cuda'
+    else:
+        use_hwscale = False
+        scale_filter = 'scale'
 
-	cmd = [
-		'ffmpeg',
-		'-hide_banner',
-		'-loglevel', 'warning',  # Changed from 'error' to see warnings
-		'-hwaccel', 'cuda',
-		'-hwaccel_device', '0',
-	]
+    cmd = [
+        'ffmpeg',
+        '-hide_banner',
+        '-loglevel', 'warning',
+        '-hwaccel', 'cuda',
+        '-hwaccel_device', '0',
+    ]
 
-	# Prefer hardware scaling to stay on GPU; fall back to CPU scaling when disabled
-	if use_hwscale:
-		cmd += [ '-hwaccel_output_format', 'cuda' ]
+    if use_hwscale:
+        cmd += ['-hwaccel_output_format', 'cuda']
 
-	_append_trim_args(cmd, start_sec, end_sec)
+    _append_trim_args(cmd, start_sec, end_sec)
 
-	# Build filter chain; keep on GPU when using scale_cuda, otherwise CPU scale
-	filter_chain: List[str] = []
-	if scale_filter == 'scale_cuda':
-		filter_chain.append(f"scale_cuda={width}:{height}")
-		filter_chain.append("hwdownload")
-		filter_chain.append("format=bgr24")
-	else:
-		filter_chain.append(f"scale={width}:{height}:flags=lanczos")
-		filter_chain.append("format=bgr24")
+    filter_chain: List[str] = []
+    if scale_filter == 'scale_cuda':
+        # ✅ Force a CUDA hw format that hwdownload can handle
+        filter_chain.append(f"scale_cuda={width}:{height}:format=nv12")
+        filter_chain.append("hwdownload")
+        filter_chain.append("format=bgr24")
+    else:
+        filter_chain.append(f"scale={width}:{height}:flags=lanczos")
+        filter_chain.append("format=bgr24")
 
-	cmd += [
-		'-i', input_path,
-		'-vf', ','.join(filter_chain),
-		'-pix_fmt', 'bgr24',
-		'-f', 'rawvideo',
-		'pipe:1'
-	]
+    cmd += [
+        '-i', input_path,
+        '-vf', ','.join(filter_chain),
+        '-pix_fmt', 'bgr24',
+        '-f', 'rawvideo',
+        'pipe:1'
+    ]
 
-	logger.info(f"Decoder command: {' '.join(cmd)}", __name__)
-	return subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE, bufsize = 10 ** 8)
+    logger.info(f"Decoder command: {' '.join(cmd)}", __name__)
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=10 ** 8
+    )
+
 
 
 def _launch_encoder_ffmpeg(output_path: str, input_path: str, width: int, height: int, fps: float, start_sec: Optional[float], end_sec: Optional[float]) -> subprocess.Popen:
