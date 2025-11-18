@@ -88,14 +88,14 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 		session_options = None
 		is_hyperswap = 'hyperswap_1c_256' in model_path.lower()
 
-		if is_hyperswap:
-			logger.info(f'Detected hyperswap_1c_256, applying advanced optimizations...', __name__)
-			try:
-				session_options = SessionOptions()
+			if is_hyperswap:
+				logger.info(f'Detected hyperswap_1c_256, applying advanced optimizations...', __name__)
+				try:
+					session_options = SessionOptions()
 
-				# Enable all graph optimizations for maximum performance
-				# This includes constant folding, layer fusion, and layout optimizations
-				session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+					# Enable all graph optimizations for maximum performance
+					# This includes constant folding, layer fusion, and layout optimizations
+					session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
 
 					# Reduce allocator fragmentation risk while keeping graphs/IO binding on
 					session_options.enable_mem_pattern = False
@@ -105,8 +105,8 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 					parallel_mode = getattr(ExecutionMode, 'ORT_PARALLEL', None)
 					if parallel_mode is not None:
 						session_options.execution_mode = parallel_mode
-				else:
-					logger.warn('ExecutionMode.ORT_PARALLEL not available in this onnxruntime build, keeping default execution mode', __name__)
+					else:
+						logger.warn('ExecutionMode.ORT_PARALLEL not available in this onnxruntime build, keeping default execution mode', __name__)
 
 				# Set intra-op and inter-op thread counts for optimal performance
 				execution_thread_count = state_manager.get_item('execution_thread_count')
