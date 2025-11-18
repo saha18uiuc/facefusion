@@ -262,60 +262,55 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 	return conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
 
 
-def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
-	"""
-	Per-frame worker:
-	1. Load baseline reference/source/audio/fps/target (original behavior).
-	2. If cache is enabled and populated, override with cached values.
-	3. Run processors and write result.
-	"""
-	# --- Baseline behavior (stock FaceFusion) ---
-	target_path = state_manager.get_item('target_path')
-	reference_frame_number = state_manager.get_item('reference_frame_number')
-	reference_vision_frame = read_static_video_frame(target_path, reference_frame_number)
-	source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
-	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
-	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
-	target_vision_frame = read_static_image(temp_frame_path, 'rgba')
+def process_temp_frame(temp_frame_path: str, frame_number: int) -> bool:
+    target_path = state_manager.get_item('target_path')
+    reference_frame_number = state_manager.get_item('reference_frame_number')
 
-	if target_vision_frame is None or reference_vision_frame is None:
-		return False
+    # Always read the target frame (this is per-frame by design)
+    target_vision_frame = read_static_image(temp_frame_path, 'rgba')
+    if target_vision_frame is None:
+        return False
 
-	temp_vision_frame = target_vision_frame.copy()
-	temp_vision_mask = extract_vision_mask(temp_vision_frame)
+    # ------- Choose between cached and baseline paths -------
+    if _CACHE_ENABLED and _FRAME_CACHE_REFERENCE_FRAME is not None and _FRAME_CACHE_SOURCE_FRAMES:
+        # Use cached, pre-decoded tensors + precomputed audio path/fps
+        reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
+        source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
+        source_audio_path = _RUNTIME_SOURCE_AUDIO_PATH
+        temp_video_fps = _RUNTIME_TEMP_VIDEO_FPS
+    else:
+        # Fallback to original FaceFusion behavior
+        reference_vision_frame = read_static_video_frame(target_path, reference_frame_number)
+        source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
+        source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
+        temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
 
-	# --- Cache override: reuse predecoded frames and precomputed audio/fps when enabled ---
-	if _CACHE_ENABLED:
-		if _FRAME_CACHE_REFERENCE_FRAME is not None:
-			reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
-		if _FRAME_CACHE_SOURCE_FRAMES:
-			source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
-		if _RUNTIME_SOURCE_AUDIO_PATH is not None:
-			source_audio_path = _RUNTIME_SOURCE_AUDIO_PATH
-		if _RUNTIME_TEMP_VIDEO_FPS is not None:
-			temp_video_fps = _RUNTIME_TEMP_VIDEO_FPS
+    if reference_vision_frame is None:
+        return False
 
-	# Per-frame audio sampling (remains per-frame even with cache)
-	source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number)
-	source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number)
-	if not numpy.any(source_audio_frame):
-		source_audio_frame = create_empty_audio_frame()
-	if not numpy.any(source_voice_frame):
-		source_voice_frame = create_empty_audio_frame()
+    # ------- Same processing as baseline -------
+    temp_vision_frame = target_vision_frame.copy()
+    temp_vision_mask = extract_vision_mask(temp_vision_frame)
 
-	# --- Actual processing ---
-	for processor_module in get_processors_modules(state_manager.get_item('processors')):
-		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
-		{
-			'reference_vision_frame': reference_vision_frame,
-			'source_vision_frames': source_vision_frames,
-			'source_audio_frame': source_audio_frame,
-			'source_voice_frame': source_voice_frame,
-			'target_vision_frame': target_vision_frame[:, :, :3],
-			'temp_vision_frame': temp_vision_frame[:, :, :3],
-			'temp_vision_mask': temp_vision_mask
-		})
+    source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number)
+    source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number)
 
-	temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
-	return write_image(temp_frame_path, temp_vision_frame)
-	
+    if not numpy.any(source_audio_frame):
+        source_audio_frame = create_empty_audio_frame()
+    if not numpy.any(source_voice_frame):
+        source_voice_frame = create_empty_audio_frame()
+
+    for processor_module in get_processors_modules(state_manager.get_item('processors')):
+        temp_vision_frame, temp_vision_mask = processor_module.process_frame(
+        {
+            'reference_vision_frame': reference_vision_frame,
+            'source_vision_frames': source_vision_frames,
+            'source_audio_frame': source_audio_frame,
+            'source_voice_frame': source_voice_frame,
+            'target_vision_frame': target_vision_frame[:, :, :3],
+            'temp_vision_frame': temp_vision_frame[:, :, :3],
+            'temp_vision_mask': temp_vision_mask
+        })
+
+    temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
+    return write_image(temp_frame_path, temp_vision_frame)
