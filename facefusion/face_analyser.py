@@ -93,7 +93,7 @@ def get_average_face(faces : List[Face]) -> Optional[Face]:
 	return None
 
 
-def get_many_faces(vision_frames : List[VisionFrame]) -> List[Face]:
+def get_many_faces(vision_frames : List[VisionFrame], use_tracking : bool = True) -> List[Face]:
 	many_faces : List[Face] = []
 
 	for vision_frame in vision_frames:
