@@ -6,7 +6,7 @@ import numpy
 
 from facefusion import logger, state_manager, translator
 from facefusion.audio import create_empty_audio_frame, get_audio_frame, get_voice_frame
-from facefusion.common_helper import get_first
+from facefusion.common_helper import get_first 
 from facefusion.filesystem import filter_audio_paths
 from facefusion.processors.core import get_processors_modules
 from facefusion import ffmpeg_builder
@@ -73,17 +73,11 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 	use_hwscale = state_manager.get_item('prefer_hwscale')
 	use_hwscale = True if use_hwscale is None else bool(use_hwscale)
 
-	# Pick best available scale filter: prefer scale_npp > scale_cuda > scale
-	if use_hwscale:
-		if _ffmpeg_supports_filter('scale_npp'):
-			scale_filter = 'scale_npp'
-		elif _ffmpeg_supports_filter('scale_cuda'):
-			# scale_cuda can be finicky with formats; add explicit format bridge when we use it
-			scale_filter = 'scale_cuda'
-		else:
-			use_hwscale = False
-			scale_filter = 'scale'
+	# Prefer scale_cuda if available (fully on GPU), otherwise fall back to CPU scale.
+	if use_hwscale and _ffmpeg_supports_filter('scale_cuda'):
+		scale_filter = 'scale_cuda'
 	else:
+		use_hwscale = False
 		scale_filter = 'scale'
 
 	cmd = [
@@ -100,15 +94,15 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 
 	_append_trim_args(cmd, start_sec, end_sec)
 
-	# Build filter chain; handle scale_cuda/scale_npp format expectations
+	# Build filter chain; keep on GPU when using scale_cuda, otherwise CPU scale
 	filter_chain: List[str] = []
-	if scale_filter in ('scale_cuda', 'scale_npp'):
-		filter_chain.append(f"{scale_filter}={width}:{height}")
-		# Ensure output is in a CUDA-friendly pixel format; nv12 is broadly supported
-		filter_chain.append('format=nv12')
+	if scale_filter == 'scale_cuda':
+		filter_chain.append(f"scale_cuda={width}:{height}")
+		filter_chain.append("hwdownload")
+		filter_chain.append("format=bgr24")
 	else:
-		filter_chain.append(f"{scale_filter}={width}:{height}:flags=lanczos")
-	filter_chain.append('format=bgr24')
+		filter_chain.append(f"scale={width}:{height}:flags=lanczos")
+		filter_chain.append("format=bgr24")
 
 	cmd += [
 		'-i', input_path,
