@@ -332,15 +332,28 @@ def process_frame_gpu(
 	temp_vision_frame = inputs.get('temp_vision_frame')
 	temp_vision_mask = inputs.get('temp_vision_mask')
 
-	# Ensure inputs are CUDA tensors
+	# Ensure temp frame and mask are CUDA tensors
 	temp_vision_frame_cuda = ensure_cuda_tensor(temp_vision_frame, device=device)
 	temp_vision_mask_cuda = ensure_cuda_tensor(temp_vision_mask, device=device)
 
-	# Face extraction and selection (CPU-based for now)
+	# Face detection needs NumPy arrays - ensure they are NumPy
+	reference_vision_frame_np = ensure_numpy_array(reference_vision_frame)
+	target_vision_frame_np = ensure_numpy_array(target_vision_frame)
+	temp_vision_frame_np = ensure_numpy_array(temp_vision_frame)  # For scale_face
+
+	# Face extraction and selection (CPU-based)
 	source_face = extract_source_face(source_vision_frames)
-	target_faces = select_faces(reference_vision_frame, target_vision_frame)
+	target_faces = select_faces(reference_vision_frame_np, target_vision_frame_np)
+
+	# Debug logging
+	if not source_face:
+		print("[GPU] WARNING: No source face detected!")
+	if not target_faces:
+		print("[GPU] WARNING: No target faces detected!")
 
 	if source_face and target_faces:
+		print(f"[GPU] Processing {len(target_faces)} target face(s)")
+
 		# Get model options
 		from facefusion.processors.modules.face_swapper.core import get_model_options
 
@@ -348,11 +361,12 @@ def process_frame_gpu(
 		model_size = get_model_options().get('size')
 		pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
 
-		for target_face in target_faces:
-			# Scale face (CPU-based)
-			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
+		for idx, target_face in enumerate(target_faces):
+			# Scale face (CPU-based) - needs NumPy arrays
+			target_face = scale_face(target_face, target_vision_frame_np, temp_vision_frame_np)
 
 			# Swap face on GPU
+			print(f"[GPU] Swapping face {idx + 1}/{len(target_faces)}")
 			temp_vision_frame_cuda = swap_face_gpu(
 				source_face,
 				target_face,
@@ -362,5 +376,6 @@ def process_frame_gpu(
 				pixel_boost_size,
 				device=device
 			)
+			print(f"[GPU] Face {idx + 1} swapped successfully")
 
 	return temp_vision_frame_cuda, temp_vision_mask_cuda
