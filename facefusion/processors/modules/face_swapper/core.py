@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy
@@ -34,6 +34,7 @@ from facefusion.processors.enhanced_blending import EnhancedBlender
 # Global instances for temporal smoothing and enhanced blending
 _temporal_smoother = None
 _enhanced_blender = None
+_SOURCE_FACE_CACHE: Dict[Tuple[int, ...], Optional[Face]] = {}
 
 # CUDA memory management
 try:
@@ -688,6 +689,7 @@ def post_process() -> None:
 	read_static_video_frame.cache_clear()
 	video_manager.clear_video_pool()
 	reset_temporal_smoother()  # Reset temporal smoother after processing
+	_SOURCE_FACE_CACHE.clear()
 
 	# Aggressive CUDA memory cleanup after processing
 	cleanup_cuda_memory(aggressive=True)
@@ -960,6 +962,26 @@ def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Fa
 	return get_average_face(source_faces)
 
 
+def _build_source_key(source_vision_frames : List[VisionFrame]) -> Tuple[int, ...]:
+	meta : List[int] = []
+	for frame in source_vision_frames or []:
+		if frame is None:
+			meta.extend([0, 0, 0])
+		else:
+			height, width, channel = frame.shape
+			meta.extend([height, width, channel])
+	return tuple(meta)
+
+
+def _get_cached_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Face]:
+	source_key = _build_source_key(source_vision_frames)
+
+	if source_key not in _SOURCE_FACE_CACHE:
+		_SOURCE_FACE_CACHE[source_key] = extract_source_face(source_vision_frames)
+
+	return _SOURCE_FACE_CACHE.get(source_key)
+
+
 def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	global _frame_count
 
@@ -968,7 +990,7 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	target_vision_frame = inputs.get('target_vision_frame')
 	temp_vision_frame = inputs.get('temp_vision_frame')
 	temp_vision_mask = inputs.get('temp_vision_mask')
-	source_face = extract_source_face(source_vision_frames)
+	source_face = _get_cached_source_face(source_vision_frames)
 	target_faces = select_faces(reference_vision_frame, target_vision_frame)
 
 	if source_face and target_faces:
