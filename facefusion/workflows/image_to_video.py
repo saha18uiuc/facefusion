@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
+from functools import lru_cache, partial
+from typing import List, Optional, Tuple
 
 import numpy
 from tqdm import tqdm
@@ -19,6 +20,17 @@ from facefusion.workflows.core import is_process_stopping
 
 
 def process(start_time : float) -> ErrorCode:
+	if state_manager.get_item('enable_streaming_pipeline') and is_video(state_manager.get_item('target_path')):
+		process_manager.start()
+		error_code = setup()
+		if error_code == 0:
+			from facefusion import gpu_video_pipeline
+			error_code = gpu_video_pipeline.run_streaming_video_job(start_time)
+			if error_code == 0:
+				error_code = finalize_video(start_time)
+		process_manager.end()
+		return error_code
+
 	tasks =\
 	[
 		setup,
