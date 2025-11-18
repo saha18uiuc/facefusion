@@ -78,6 +78,7 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 		if _ffmpeg_supports_filter('scale_npp'):
 			scale_filter = 'scale_npp'
 		elif _ffmpeg_supports_filter('scale_cuda'):
+			# scale_cuda can be finicky with formats; add explicit format bridge when we use it
 			scale_filter = 'scale_cuda'
 		else:
 			use_hwscale = False
@@ -99,15 +100,19 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 
 	_append_trim_args(cmd, start_sec, end_sec)
 
-	# scale_cuda/scale_npp do not accept the "flags" option; only use flags with CPU scale
+	# Build filter chain; handle scale_cuda/scale_npp format expectations
+	filter_chain: List[str] = []
 	if scale_filter in ('scale_cuda', 'scale_npp'):
-		scale_args = f"{scale_filter}={width}:{height}"
+		filter_chain.append(f"{scale_filter}={width}:{height}")
+		# Ensure output is in a CUDA-friendly pixel format; nv12 is broadly supported
+		filter_chain.append('format=nv12')
 	else:
-		scale_args = f"{scale_filter}={width}:{height}:flags=lanczos"
+		filter_chain.append(f"{scale_filter}={width}:{height}:flags=lanczos")
+	filter_chain.append('format=bgr24')
 
 	cmd += [
 		'-i', input_path,
-		'-vf', scale_args,
+		'-vf', ','.join(filter_chain),
 		'-pix_fmt', 'bgr24',
 		'-f', 'rawvideo',
 		'pipe:1'
