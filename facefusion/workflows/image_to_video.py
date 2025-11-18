@@ -24,6 +24,10 @@ _FRAME_CACHE_REFERENCE_NUMBER: Optional[int] = None
 _FRAME_CACHE_REFERENCE_FRAME: Optional[numpy.ndarray] = None
 _FRAME_CACHE_SOURCE_PATHS: Tuple[str, ...] = ()
 _FRAME_CACHE_SOURCE_FRAMES: List[numpy.ndarray] = []
+_CACHE_ENABLED: bool = False
+_RUNTIME_SOURCE_AUDIO_PATH: Optional[str] = None
+_RUNTIME_TEMP_VIDEO_FPS: Optional[float] = None
+_RUNTIME_PROCESSOR_MODULES = []
 
 
 def process(start_time : float) -> ErrorCode:
@@ -80,8 +84,7 @@ def extract_frames() -> ErrorCode:
 
 
 def process_video() -> ErrorCode:
-	if _should_cache_frames():
-		_prepare_frame_cache()
+	_prepare_runtime_cache()
 	temp_frame_paths = resolve_temp_frame_paths(state_manager.get_item('target_path'))
 
 	if temp_frame_paths:
@@ -104,9 +107,8 @@ def process_video() -> ErrorCode:
 						future.result()
 						progress.update()
 
-		for processor_module in get_processors_modules(state_manager.get_item('processors')):
+		for processor_module in _RUNTIME_PROCESSOR_MODULES:
 			processor_module.post_process()
-
 		if is_process_stopping():
 			return 4
 	else:
@@ -195,11 +197,29 @@ def _prepare_frame_cache() -> None:
 		_FRAME_CACHE_SOURCE_PATHS = source_paths
 
 
-def _should_cache_frames() -> bool:
+def _prepare_runtime_cache() -> None:
 	"""
-	Cache only for specific models that most benefit (hyperswap_1c_256).
+	Prepare all per-job reusable state to minimize per-frame overhead.
 	"""
-	return state_manager.get_item('face_swapper_model') == 'hyperswap_1c_256'
+	global _RUNTIME_SOURCE_AUDIO_PATH, _RUNTIME_TEMP_VIDEO_FPS, _RUNTIME_PROCESSOR_MODULES
+	global _FRAME_CACHE_TARGET_PATH, _FRAME_CACHE_REFERENCE_NUMBER, _CACHE_ENABLED
+
+	_FRAME_CACHE_TARGET_PATH = state_manager.get_item('target_path')
+	_FRAME_CACHE_REFERENCE_NUMBER = state_manager.get_item('reference_frame_number')
+
+	_CACHE_ENABLED = state_manager.get_item('face_swapper_model') == 'hyperswap_1c_256'
+
+	if _CACHE_ENABLED:
+		_prepare_frame_cache()
+	else:
+		# Even when not caching across frames, decode once per job to avoid None.
+		_FRAME_CACHE_REFERENCE_FRAME = read_static_video_frame(_FRAME_CACHE_TARGET_PATH, _FRAME_CACHE_REFERENCE_NUMBER)
+		_FRAME_CACHE_SOURCE_FRAMES = read_static_images(state_manager.get_item('source_paths'))
+
+	source_paths = state_manager.get_item('source_paths')
+	_RUNTIME_SOURCE_AUDIO_PATH = get_first(filter_audio_paths(source_paths))
+	_RUNTIME_TEMP_VIDEO_FPS = restrict_video_fps(_FRAME_CACHE_TARGET_PATH, state_manager.get_item('output_video_fps'))
+	_RUNTIME_PROCESSOR_MODULES = list(get_processors_modules(state_manager.get_item('processors')))
 
 
 def _resolve_audio_frames(source_audio_path : Optional[str], temp_video_fps : float, frame_number : int) -> Tuple[numpy.ndarray, numpy.ndarray]:
@@ -230,7 +250,7 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 	temp_vision_mask = extract_vision_mask(temp_vision_frame)
 	source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
 
-	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+	for processor_module in _RUNTIME_PROCESSOR_MODULES:
 		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
 		{
 			'reference_vision_frame': reference_vision_frame,
@@ -246,20 +266,16 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 
 
 def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
-	target_path = state_manager.get_item('target_path')
-	reference_frame_number = state_manager.get_item('reference_frame_number')
-	caching_enabled = _should_cache_frames()
+	"""
+	Per-frame worker:
+	- Read target RGBA frame.
+	- Use cached reference/source frames if enabled.
+	- Run processors.
+	- Write back result.
+	"""
+	reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
+	source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
 
-	if caching_enabled:
-		_prepare_frame_cache()
-		reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
-		source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
-	else:
-		reference_vision_frame = read_static_video_frame(target_path, reference_frame_number)
-		source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
-
-	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
-	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
 	target_vision_frame = read_static_image(temp_frame_path, 'rgba')
 
 	if target_vision_frame is None or reference_vision_frame is None:
@@ -270,8 +286,8 @@ def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 		frame_number,
 		reference_vision_frame,
 		source_vision_frames,
-		source_audio_path,
-		temp_video_fps
+		_RUNTIME_SOURCE_AUDIO_PATH,
+		_RUNTIME_TEMP_VIDEO_FPS
 	)
 
 	return write_image(temp_frame_path, processed_frame)
