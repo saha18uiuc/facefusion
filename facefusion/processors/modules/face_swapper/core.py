@@ -961,6 +961,10 @@ def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Fa
 
 
 def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
+	"""
+	Process a frame for face swapping, preferring GPU when available but
+	falling back cleanly to CPU if anything goes wrong.
+	"""
 	global _frame_count
 
 	# Check if GPU mode is enabled and inputs are CUDA tensors
@@ -971,13 +975,17 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	except ImportError:
 		processing_mode = 'cpu'
 		gpu_available = False
+		# Stubs to avoid NameErrors below when GPU support is missing
+		def is_cuda_tensor(_): # type: ignore
+			return False
+		def ensure_numpy_array(x): # type: ignore
+			return x
 
 	temp_vision_frame = inputs.get('temp_vision_frame')
 	temp_vision_mask = inputs.get('temp_vision_mask')
 
-	# Dispatch to GPU or CPU implementation
+	# Try GPU path first when requested and tensors are CUDA-backed
 	if gpu_available and processing_mode == 'gpu' and is_cuda_tensor(temp_vision_frame):
-		# GPU path: process with GPU tensors
 		try:
 			from facefusion.processors.modules.face_swapper.core_gpu import process_frame_gpu
 			from facefusion.gpu_types import get_cuda_device
@@ -987,13 +995,9 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 
 			temp_vision_frame_cuda, temp_vision_mask_cuda = process_frame_gpu(inputs, device=device)
 
-			# Increment frame counter
 			_frame_count += 1
-
-			# Periodic CUDA memory cleanup
 			if _frame_count % _batch_cleanup_interval == 0:
 				cleanup_cuda_memory(aggressive=False)
-
 			if _frame_count % 50 == 0:
 				cleanup_cuda_memory(aggressive=True)
 
@@ -1002,35 +1006,30 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 			import traceback
 			logger.error(f"GPU processing failed, falling back to CPU: {e}", __name__)
 			traceback.print_exc()
-			# Fall through to CPU path
-			processing_mode = 'cpu'
-	else:
-		# CPU path (original implementation)
-		reference_vision_frame = inputs.get('reference_vision_frame')
-		source_vision_frames = inputs.get('source_vision_frames')
-		target_vision_frame = inputs.get('target_vision_frame')
+			# Proceed to CPU path
 
-		# Ensure inputs are NumPy arrays for CPU processing
-		if gpu_available and is_cuda_tensor(temp_vision_frame):
-			temp_vision_frame = ensure_numpy_array(temp_vision_frame)
-			temp_vision_mask = ensure_numpy_array(temp_vision_mask)
+	# CPU path (original implementation or GPU fallback)
+	reference_vision_frame = inputs.get('reference_vision_frame')
+	source_vision_frames = inputs.get('source_vision_frames')
+	target_vision_frame = inputs.get('target_vision_frame')
 
-		source_face = extract_source_face(source_vision_frames)
-		target_faces = select_faces(reference_vision_frame, target_vision_frame)
+	# Ensure inputs are NumPy arrays for CPU processing
+	if gpu_available and is_cuda_tensor(temp_vision_frame):
+		temp_vision_frame = ensure_numpy_array(temp_vision_frame)
+		temp_vision_mask = ensure_numpy_array(temp_vision_mask)
 
-		if source_face and target_faces:
-			for target_face in target_faces:
-				target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
-				temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
+	source_face = extract_source_face(source_vision_frames)
+	target_faces = select_faces(reference_vision_frame, target_vision_frame)
 
-		# Increment frame counter
-		_frame_count += 1
+	if source_face and target_faces:
+		for target_face in target_faces:
+			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
+			temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
 
-		# Periodic CUDA memory cleanup
-		if _frame_count % _batch_cleanup_interval == 0:
-			cleanup_cuda_memory(aggressive=False)
+	_frame_count += 1
+	if _frame_count % _batch_cleanup_interval == 0:
+		cleanup_cuda_memory(aggressive=False)
+	if _frame_count % 50 == 0:
+		cleanup_cuda_memory(aggressive=True)
 
-		if _frame_count % 50 == 0:
-			cleanup_cuda_memory(aggressive=True)
-
-		return temp_vision_frame, temp_vision_mask
+	return temp_vision_frame, temp_vision_mask

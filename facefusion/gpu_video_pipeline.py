@@ -52,21 +52,25 @@ def _append_trim_args(cmd: List[str], start_sec: Optional[float], end_sec: Optio
 
 
 def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: Optional[float], end_sec: Optional[float]) -> subprocess.Popen:
+	# Try CUDA hardware decode first, but don't require hwaccel_output_format
+	# This allows fallback to software decode if CUDA isn't available
 	cmd = [
 		'ffmpeg',
 		'-hide_banner',
-		'-loglevel', 'error',
+		'-loglevel', 'warning',  # Changed from 'error' to see warnings
 		'-hwaccel', 'cuda',
-		'-hwaccel_output_format', 'cuda',
+		'-hwaccel_device', '0',
 	]
 	_append_trim_args(cmd, start_sec, end_sec)
 	cmd += [
 		'-i', input_path,
-		'-vf', f'scale_npp={width}:{height}:interp_algo=lanczos',
+		'-vf', f'scale={width}:{height}:flags=lanczos',  # Use regular scale instead of scale_npp
 		'-pix_fmt', 'bgr24',
 		'-f', 'rawvideo',
 		'pipe:1'
 	]
+
+	logger.info(f"Decoder command: {' '.join(cmd)}", __name__)
 	return subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE, bufsize = 10 ** 8)
 
 
@@ -201,6 +205,9 @@ def _process_streaming_frame(bgr_frame: numpy.ndarray,
 
 	if processing_mode == 'gpu' and device is not None:
 		try:
+			if frame_number == 0:
+				print(f"[DEBUG] GPU path activated for frame {frame_number}")
+
 			# GPU path: convert to CUDA and keep on GPU throughout
 			bgr_frame_cuda = numpy_to_cuda(bgr_frame, device=device)
 
@@ -215,7 +222,13 @@ def _process_streaming_frame(bgr_frame: numpy.ndarray,
 			source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
 
 			# Process with CUDA tensors directly
-			for processor_module in processor_modules:
+			if frame_number == 0:
+				print(f"[DEBUG] Processing through {len(processor_modules)} processor modules")
+
+			for idx, processor_module in enumerate(processor_modules):
+				if frame_number == 0:
+					print(f"[DEBUG] Calling processor {idx}: {type(processor_module).__name__}")
+
 				temp_vision_frame, temp_vision_mask = processor_module.process_frame(
 				{
 					'reference_vision_frame': reference_vision_frame,  # NumPy for face detection
@@ -226,6 +239,9 @@ def _process_streaming_frame(bgr_frame: numpy.ndarray,
 					'temp_vision_frame': temp_vision_frame,  # CUDA tensor BGR (3 channels)
 					'temp_vision_mask': temp_vision_mask  # CUDA tensor mask
 				})
+
+				if frame_number == 0:
+					print(f"[DEBUG] Processor {idx} returned frame shape: {temp_vision_frame.shape}, mask shape: {temp_vision_mask.shape}")
 
 			# Processor returns BGR (3 channels), need to add alpha back for merging
 			if temp_vision_frame.shape[-1] == 3:
@@ -301,11 +317,24 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	start_sec = _frame_to_seconds(trim_frame_start, temp_video_fps)
 	end_sec = _frame_to_seconds(trim_frame_end, temp_video_fps) if trim_frame_end else None
 
+	processor_names = state_manager.get_item('processors') or []
 	reference_vision_frame = read_static_video_frame(target_path, state_manager.get_item('reference_frame_number'))
 	source_paths = state_manager.get_item('source_paths') or []
 	source_vision_frames = read_static_images(source_paths)
 	source_audio_path = get_first(filter_audio_paths(source_paths))
-	processor_modules = list(get_processors_modules(state_manager.get_item('processors')))
+	processor_modules = list(get_processors_modules(processor_names))
+
+	if not processor_modules:
+		logger.error("No processor modules configured; cannot process frames. Set --processors (e.g. face_swapper).", __name__)
+		return 1
+
+	if not source_vision_frames and ('face_swapper' in processor_names or 'deep_swapper' in processor_names):
+		logger.error("No source images loaded. Check --source-paths for your face swap inputs.", __name__)
+		return 1
+
+	if reference_vision_frame is None:
+		logger.error("Failed to load reference frame from target video; cannot proceed.", __name__)
+		return 1
 
 	# Determine GPU device if GPU mode is enabled
 	processing_mode = get_processing_mode() if GPU_AVAILABLE else 'cpu'
@@ -316,6 +345,10 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	logger.info(f"GPU mode flag from state: {gpu_mode_flag}", __name__)
 	logger.info(f"GPU_AVAILABLE: {GPU_AVAILABLE}", __name__)
 	logger.info(f"Processing mode: {processing_mode}", __name__)
+	logger.info(f"Number of processor modules loaded: {len(processor_modules)}", __name__)
+	logger.info(f"Processor modules: {[p.__name__ for p in processor_modules]}", __name__)
+	logger.info(f"Source paths: {source_paths}", __name__)
+	logger.info(f"Source vision frames count: {len(source_vision_frames)}", __name__)
 
 	if processing_mode == 'gpu':
 		device_ids = state_manager.get_item('execution_device_ids') or ['0']
@@ -335,9 +368,19 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 		while True:
 			raw = decoder.stdout.read(frame_size)
 			if not raw or len(raw) < frame_size:
+				# Check if decoder had errors
+				if decoder.stderr:
+					stderr_output = decoder.stderr.read().decode('utf-8', errors='ignore')
+					if stderr_output:
+						logger.error(f"Decoder stderr: {stderr_output}", __name__)
+				logger.info(f"Decoder finished after {frame_number} frames", __name__)
 				break
 
 			bgr_frame = numpy.frombuffer(raw, dtype = numpy.uint8).reshape((height, width, 3))
+
+			if frame_number == 0:
+				logger.info(f"Processing first frame - shape: {bgr_frame.shape}, dtype: {bgr_frame.dtype}", __name__)
+
 			processed_bgr = _process_streaming_frame(
 				bgr_frame,
 				frame_number,
@@ -348,21 +391,46 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 				temp_video_fps,
 				device=device  # Pass GPU device if GPU mode
 			)
+
+			if frame_number == 0:
+				logger.info(f"Processed first frame - shape: {processed_bgr.shape if processed_bgr is not None else 'None'}", __name__)
+
 			if processed_bgr is None:
+				logger.error(f"Frame {frame_number} processing returned None!", __name__)
 				return 1
 			encoder.stdin.write(processed_bgr.tobytes())
 			frame_number += 1
 
+			if frame_number % 30 == 0:
+				logger.info(f"Processed {frame_number} frames...", __name__)
+
 	except Exception as error:
 		logger.error(f"Streaming pipeline failed: {error}", __name__)
+		import traceback
+		traceback.print_exc()
 		return 1
 	finally:
 		if decoder.stdout:
 			decoder.stdout.close()
+		if decoder.stderr:
+			stderr_output = decoder.stderr.read().decode('utf-8', errors='ignore')
+			if stderr_output:
+				logger.warning(f"Decoder final stderr: {stderr_output}", __name__)
+			decoder.stderr.close()
 		if encoder.stdin:
 			encoder.stdin.close()
+		if encoder.stderr:
+			stderr_output = encoder.stderr.read().decode('utf-8', errors='ignore')
+			if stderr_output:
+				logger.warning(f"Encoder stderr: {stderr_output}", __name__)
+			encoder.stderr.close()
 		decoder.wait()
 		encoder.wait()
 
+	if frame_number == 0:
+		logger.error("Streaming pipeline processed 0 frames; failing to avoid empty output.", __name__)
+		return 1
+
+	logger.info(f"Total frames processed: {frame_number}", __name__)
 	logger.info(translator.get('processing_video_succeeded').format(seconds = calculate_end_time(start_time)), __name__)
 	return 0
