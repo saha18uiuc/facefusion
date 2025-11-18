@@ -432,11 +432,11 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 
 	frame_number = 0
 
-		try:
-			while True:
-				raw = decoder.stdout.read(frame_size)
-				if not raw or len(raw) < frame_size:
-					# Check if decoder had errors
+	try:
+		while True:
+			raw = decoder.stdout.read(frame_size)
+			if not raw or len(raw) < frame_size:
+				# Check if decoder had errors
 				if decoder.stderr:
 					stderr_output = decoder.stderr.read().decode('utf-8', errors='ignore')
 					if stderr_output:
