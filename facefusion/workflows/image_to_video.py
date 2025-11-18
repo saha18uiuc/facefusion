@@ -18,7 +18,7 @@ from facefusion.types import ErrorCode
 from facefusion.vision import conditional_merge_vision_mask, detect_video_resolution, extract_vision_mask, pack_resolution, read_static_image, read_static_images, read_static_video_frame, restrict_trim_frame, restrict_video_fps, restrict_video_resolution, scale_resolution, write_image
 from facefusion.workflows.core import is_process_stopping
 
-# Simple per-job cache for decoded reference and source frames.
+# Simple per-job cache for decoded reference and source frames (enabled only for targeted models).
 _FRAME_CACHE_TARGET_PATH: Optional[str] = None
 _FRAME_CACHE_REFERENCE_NUMBER: Optional[int] = None
 _FRAME_CACHE_REFERENCE_FRAME: Optional[numpy.ndarray] = None
@@ -80,7 +80,8 @@ def extract_frames() -> ErrorCode:
 
 
 def process_video() -> ErrorCode:
-	_prepare_frame_cache()
+	if _should_cache_frames():
+		_prepare_frame_cache()
 	temp_frame_paths = resolve_temp_frame_paths(state_manager.get_item('target_path'))
 
 	if temp_frame_paths:
@@ -194,6 +195,13 @@ def _prepare_frame_cache() -> None:
 		_FRAME_CACHE_SOURCE_PATHS = source_paths
 
 
+def _should_cache_frames() -> bool:
+	"""
+	Cache only for specific models that most benefit (hyperswap_1c_256).
+	"""
+	return state_manager.get_item('face_swapper_model') == 'hyperswap_1c_256'
+
+
 def _resolve_audio_frames(source_audio_path : Optional[str], temp_video_fps : float, frame_number : int) -> Tuple[numpy.ndarray, numpy.ndarray]:
 	"""
 	Load (or create empty) audio and voice frames for the current frame index.
@@ -240,10 +248,15 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 	target_path = state_manager.get_item('target_path')
 	reference_frame_number = state_manager.get_item('reference_frame_number')
-	_prepare_frame_cache()
+	caching_enabled = _should_cache_frames()
 
-	reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
-	source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
+	if caching_enabled:
+		_prepare_frame_cache()
+		reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
+		source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
+	else:
+		reference_vision_frame = read_static_video_frame(target_path, reference_frame_number)
+		source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
 
 	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
 	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
