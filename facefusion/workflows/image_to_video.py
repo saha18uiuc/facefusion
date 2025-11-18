@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
+from functools import lru_cache, partial
+from typing import List, Optional, Tuple
 
 import numpy
 from tqdm import tqdm
@@ -164,22 +165,49 @@ def finalize_video(start_time : float) -> ErrorCode:
 	return 0
 
 
-def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
-	reference_vision_frame = read_static_video_frame(state_manager.get_item('target_path'), state_manager.get_item('reference_frame_number'))
-	source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
-	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
-	temp_video_fps = restrict_video_fps(state_manager.get_item('target_path'), state_manager.get_item('output_video_fps'))
-	target_vision_frame = read_static_image(temp_frame_path, 'rgba')
-	temp_vision_frame = target_vision_frame.copy()
-	temp_vision_mask = extract_vision_mask(temp_vision_frame)
+@lru_cache(maxsize = None)
+def _cached_reference_frame(target_path : str, reference_frame_number : int) -> Optional[numpy.ndarray]:
+	"""
+	Decode the reference frame once per (target_path, reference_frame_number) and reuse it across frames.
+	"""
+	return read_static_video_frame(target_path, reference_frame_number)
 
-	source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number)
-	source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number)
+
+@lru_cache(maxsize = None)
+def _cached_source_frames(source_paths : Tuple[str, ...]) -> List[numpy.ndarray]:
+	"""
+	Decode all source images once per tuple(source_paths) and reuse them.
+	"""
+	return read_static_images(list(source_paths))
+
+
+def _resolve_audio_frames(source_audio_path : Optional[str], temp_video_fps : float, frame_number : int) -> Tuple[numpy.ndarray, numpy.ndarray]:
+	"""
+	Load (or create empty) audio and voice frames for the current frame index.
+	"""
+	source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number) if source_audio_path else create_empty_audio_frame()
+	source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number) if source_audio_path else create_empty_audio_frame()
 
 	if not numpy.any(source_audio_frame):
 		source_audio_frame = create_empty_audio_frame()
 	if not numpy.any(source_voice_frame):
 		source_voice_frame = create_empty_audio_frame()
+
+	return source_audio_frame, source_voice_frame
+
+
+def process_frame_runtime(target_vision_frame : numpy.ndarray,
+                          frame_number : int,
+                          reference_vision_frame : numpy.ndarray,
+                          source_vision_frames : List[numpy.ndarray],
+                          source_audio_path : Optional[str],
+                          temp_video_fps : float) -> numpy.ndarray:
+	"""
+	Per-frame logic that works on already-decoded inputs; returns processed frame.
+	"""
+	temp_vision_frame = target_vision_frame.copy()
+	temp_vision_mask = extract_vision_mask(temp_vision_frame)
+	source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
 
 	for processor_module in get_processors_modules(state_manager.get_item('processors')):
 		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
@@ -193,5 +221,31 @@ def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 			'temp_vision_mask': temp_vision_mask
 		})
 
-	temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
-	return write_image(temp_frame_path, temp_vision_frame)
+	return conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
+
+
+def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
+	target_path = state_manager.get_item('target_path')
+	reference_frame_number = state_manager.get_item('reference_frame_number')
+	reference_vision_frame = _cached_reference_frame(target_path, reference_frame_number)
+
+	source_paths = tuple(state_manager.get_item('source_paths') or [])
+	source_vision_frames = _cached_source_frames(source_paths)
+
+	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
+	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
+	target_vision_frame = read_static_image(temp_frame_path, 'rgba')
+
+	if target_vision_frame is None or reference_vision_frame is None:
+		return False
+
+	processed_frame = process_frame_runtime(
+		target_vision_frame,
+		frame_number,
+		reference_vision_frame,
+		source_vision_frames,
+		source_audio_path,
+		temp_video_fps
+	)
+
+	return write_image(temp_frame_path, processed_frame)
