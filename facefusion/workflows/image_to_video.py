@@ -211,10 +211,6 @@ def _prepare_runtime_cache() -> None:
 
 	if _CACHE_ENABLED:
 		_prepare_frame_cache()
-	else:
-		# Even when not caching across frames, decode once per job to avoid None.
-		_FRAME_CACHE_REFERENCE_FRAME = read_static_video_frame(_FRAME_CACHE_TARGET_PATH, _FRAME_CACHE_REFERENCE_NUMBER)
-		_FRAME_CACHE_SOURCE_FRAMES = read_static_images(state_manager.get_item('source_paths'))
 
 	source_paths = state_manager.get_item('source_paths')
 	_RUNTIME_SOURCE_AUDIO_PATH = get_first(filter_audio_paths(source_paths))
@@ -273,9 +269,31 @@ def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 	- Run processors.
 	- Write back result.
 	"""
-	reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
-	source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
+	if _CACHE_ENABLED:
+		reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
+		source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
+		target_vision_frame = read_static_image(temp_frame_path, 'rgba')
 
+		if target_vision_frame is None or reference_vision_frame is None:
+			return False
+
+		processed_frame = process_frame_runtime(
+			target_vision_frame,
+			frame_number,
+			reference_vision_frame,
+			source_vision_frames,
+			_RUNTIME_SOURCE_AUDIO_PATH,
+			_RUNTIME_TEMP_VIDEO_FPS
+		)
+		return write_image(temp_frame_path, processed_frame)
+
+	# Fallback: baseline per-frame loading for non-cached models.
+	target_path = state_manager.get_item('target_path')
+	reference_frame_number = state_manager.get_item('reference_frame_number')
+	reference_vision_frame = read_static_video_frame(target_path, reference_frame_number)
+	source_vision_frames = read_static_images(state_manager.get_item('source_paths'))
+	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
+	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
 	target_vision_frame = read_static_image(temp_frame_path, 'rgba')
 
 	if target_vision_frame is None or reference_vision_frame is None:
@@ -286,8 +304,7 @@ def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 		frame_number,
 		reference_vision_frame,
 		source_vision_frames,
-		_RUNTIME_SOURCE_AUDIO_PATH,
-		_RUNTIME_TEMP_VIDEO_FPS
+		source_audio_path,
+		temp_video_fps
 	)
-
 	return write_image(temp_frame_path, processed_frame)
