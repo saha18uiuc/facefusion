@@ -98,9 +98,16 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: 
 		cmd += [ '-hwaccel_output_format', 'cuda' ]
 
 	_append_trim_args(cmd, start_sec, end_sec)
+
+	# scale_cuda/scale_npp do not accept the "flags" option; only use flags with CPU scale
+	if scale_filter in ('scale_cuda', 'scale_npp'):
+		scale_args = f"{scale_filter}={width}:{height}"
+	else:
+		scale_args = f"{scale_filter}={width}:{height}:flags=lanczos"
+
 	cmd += [
 		'-i', input_path,
-		'-vf', f"{scale_filter}={width}:{height}:flags=lanczos",
+		'-vf', scale_args,
 		'-pix_fmt', 'bgr24',
 		'-f', 'rawvideo',
 		'pipe:1'
