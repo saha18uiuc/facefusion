@@ -206,7 +206,10 @@ def _prepare_runtime_cache() -> None:
 	_FRAME_CACHE_TARGET_PATH = state_manager.get_item('target_path')
 	_FRAME_CACHE_REFERENCE_NUMBER = state_manager.get_item('reference_frame_number')
 
-	_CACHE_ENABLED = state_manager.get_item('face_swapper_model') == 'hyperswap_1c_256'
+	# Optional: enable caching only for a specific model (supporting names with extensions).
+	model_name = state_manager.get_item('face_swapper_model')
+	model_name_str = str(model_name) if model_name is not None else ''
+	_CACHE_ENABLED = 'hyperswap_1c_256' in model_name_str
 
 	if _CACHE_ENABLED:
 		_prepare_frame_cache()
@@ -262,30 +265,11 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 	"""
 	Per-frame worker:
-	- Read target RGBA frame.
-	- Use cached reference/source frames if enabled.
-	- Run processors.
-	- Write back result.
+	1. Load baseline reference/source/audio/fps/target (original behavior).
+	2. If cache is enabled and populated, override with cached values.
+	3. Run processors and write result.
 	"""
-	if _CACHE_ENABLED:
-		reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
-		source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
-		target_vision_frame = read_static_image(temp_frame_path, 'rgba')
-
-		if target_vision_frame is None or reference_vision_frame is None:
-			return False
-
-		processed_frame = process_frame_runtime(
-			target_vision_frame,
-			frame_number,
-			reference_vision_frame,
-			source_vision_frames,
-			_RUNTIME_SOURCE_AUDIO_PATH,
-			_RUNTIME_TEMP_VIDEO_FPS
-		)
-		return write_image(temp_frame_path, processed_frame)
-
-	# Fallback: baseline per-frame loading for non-cached models.
+	# --- Baseline behavior (stock FaceFusion) ---
 	target_path = state_manager.get_item('target_path')
 	reference_frame_number = state_manager.get_item('reference_frame_number')
 	reference_vision_frame = read_static_video_frame(target_path, reference_frame_number)
@@ -297,12 +281,41 @@ def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 	if target_vision_frame is None or reference_vision_frame is None:
 		return False
 
-	processed_frame = process_frame_runtime(
-		target_vision_frame,
-		frame_number,
-		reference_vision_frame,
-		source_vision_frames,
-		source_audio_path,
-		temp_video_fps
-	)
-	return write_image(temp_frame_path, processed_frame)
+	temp_vision_frame = target_vision_frame.copy()
+	temp_vision_mask = extract_vision_mask(temp_vision_frame)
+
+	# --- Cache override: reuse predecoded frames and precomputed audio/fps when enabled ---
+	if _CACHE_ENABLED:
+		if _FRAME_CACHE_REFERENCE_FRAME is not None:
+			reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
+		if _FRAME_CACHE_SOURCE_FRAMES:
+			source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
+		if _RUNTIME_SOURCE_AUDIO_PATH is not None:
+			source_audio_path = _RUNTIME_SOURCE_AUDIO_PATH
+		if _RUNTIME_TEMP_VIDEO_FPS is not None:
+			temp_video_fps = _RUNTIME_TEMP_VIDEO_FPS
+
+	# Per-frame audio sampling (remains per-frame even with cache)
+	source_audio_frame = get_audio_frame(source_audio_path, temp_video_fps, frame_number)
+	source_voice_frame = get_voice_frame(source_audio_path, temp_video_fps, frame_number)
+	if not numpy.any(source_audio_frame):
+		source_audio_frame = create_empty_audio_frame()
+	if not numpy.any(source_voice_frame):
+		source_voice_frame = create_empty_audio_frame()
+
+	# --- Actual processing ---
+	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
+		{
+			'reference_vision_frame': reference_vision_frame,
+			'source_vision_frames': source_vision_frames,
+			'source_audio_frame': source_audio_frame,
+			'source_voice_frame': source_voice_frame,
+			'target_vision_frame': target_vision_frame[:, :, :3],
+			'temp_vision_frame': temp_vision_frame[:, :, :3],
+			'temp_vision_mask': temp_vision_mask
+		})
+
+	temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
+	return write_image(temp_frame_path, temp_vision_frame)
+	
