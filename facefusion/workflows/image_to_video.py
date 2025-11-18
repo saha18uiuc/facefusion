@@ -20,7 +20,20 @@ from facefusion.workflows.core import is_process_stopping
 
 
 def process(start_time : float) -> ErrorCode:
-	if state_manager.get_item('enable_streaming_pipeline') and is_video(state_manager.get_item('target_path')):
+	# Check if GPU mode is enabled - if so, use streaming pipeline automatically
+	try:
+		from facefusion.gpu_types import get_processing_mode
+		gpu_mode_active = get_processing_mode() == 'gpu'
+	except ImportError:
+		gpu_mode_active = False
+
+	# Use streaming pipeline if either explicitly enabled OR gpu_mode is active
+	use_streaming = state_manager.get_item('enable_streaming_pipeline') or gpu_mode_active
+
+	if use_streaming and is_video(state_manager.get_item('target_path')):
+		if gpu_mode_active:
+			logger.info("GPU mode active - using streaming pipeline for GPU-resident processing", __name__)
+
 		process_manager.start()
 		error_code = setup()
 		if error_code == 0:

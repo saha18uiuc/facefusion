@@ -275,6 +275,13 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	# Determine GPU device if GPU mode is enabled
 	processing_mode = get_processing_mode() if GPU_AVAILABLE else 'cpu'
 	device = None
+
+	# Debug logging
+	gpu_mode_flag = state_manager.get_item('gpu_mode')
+	logger.info(f"GPU mode flag from state: {gpu_mode_flag}", __name__)
+	logger.info(f"GPU_AVAILABLE: {GPU_AVAILABLE}", __name__)
+	logger.info(f"Processing mode: {processing_mode}", __name__)
+
 	if processing_mode == 'gpu':
 		device_ids = state_manager.get_item('execution_device_ids') or ['0']
 		device = get_cuda_device(str(device_ids[0]))
