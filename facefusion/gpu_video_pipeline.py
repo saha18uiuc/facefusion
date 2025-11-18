@@ -14,7 +14,7 @@ from facefusion.types import ErrorCode
 from facefusion.vision import conditional_merge_vision_mask, detect_video_resolution, extract_vision_mask, pack_resolution, read_static_image, read_static_images, read_static_video_frame, restrict_trim_frame, restrict_video_fps, restrict_video_resolution, scale_resolution, write_image
 
 
-def _get_streaming_video_props() -> Tuple[int, int, float]:
+def _get_streaming_video_props() -> Tuple[int, int, float, int, int]:
 	target_path = state_manager.get_item('target_path')
 	trim_frame_start, trim_frame_end = restrict_trim_frame(target_path, state_manager.get_item('trim_frame_start'), state_manager.get_item('trim_frame_end'))
 	base_res = detect_video_resolution(target_path)
@@ -23,16 +23,32 @@ def _get_streaming_video_props() -> Tuple[int, int, float]:
 	temp_res = restrict_video_resolution(target_path, output_res)
 	temp_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))
 	logger.info(translator.get('processing').format(resolution = pack_resolution(temp_res), fps = temp_fps), __name__)
-	return temp_res[0], temp_res[1], temp_fps
+	return temp_res[0], temp_res[1], temp_fps, trim_frame_start, trim_frame_end
 
 
-def _launch_decoder_ffmpeg(input_path: str, width: int, height: int) -> subprocess.Popen:
+def _frame_to_seconds(frame_index: int, fps: float) -> Optional[float]:
+	if frame_index and fps:
+		return frame_index / fps
+	return None
+
+
+def _append_trim_args(cmd: List[str], start_sec: Optional[float], end_sec: Optional[float]) -> None:
+	if start_sec is not None:
+		cmd.extend([ '-ss', f'{start_sec:.3f}' ])
+	if end_sec is not None and end_sec > 0:
+		cmd.extend([ '-to', f'{end_sec:.3f}' ])
+
+
+def _launch_decoder_ffmpeg(input_path: str, width: int, height: int, start_sec: Optional[float], end_sec: Optional[float]) -> subprocess.Popen:
 	cmd = [
 		'ffmpeg',
 		'-hide_banner',
 		'-loglevel', 'error',
 		'-hwaccel', 'cuda',
 		'-hwaccel_output_format', 'cuda',
+	]
+	_append_trim_args(cmd, start_sec, end_sec)
+	cmd += [
 		'-i', input_path,
 		'-vf', f'scale_npp={width}:{height}:interp_algo=lanczos',
 		'-pix_fmt', 'bgr24',
@@ -42,7 +58,7 @@ def _launch_decoder_ffmpeg(input_path: str, width: int, height: int) -> subproce
 	return subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE, bufsize = 10 ** 8)
 
 
-def _launch_encoder_ffmpeg(output_path: str, input_path: str, width: int, height: int, fps: float) -> subprocess.Popen:
+def _launch_encoder_ffmpeg(output_path: str, input_path: str, width: int, height: int, fps: float, start_sec: Optional[float], end_sec: Optional[float]) -> subprocess.Popen:
 	video_encoder = state_manager.get_item('output_video_encoder') or 'libx264'
 	video_quality = state_manager.get_item('output_video_quality') or 75
 	video_preset = state_manager.get_item('output_video_preset') or 'medium'
@@ -69,9 +85,10 @@ def _launch_encoder_ffmpeg(output_path: str, input_path: str, width: int, height
 		'-s', f'{width}x{height}',
 		'-r', str(fps),
 		'-i', 'pipe:0',
+	]
+	_append_trim_args(cmd, start_sec, end_sec)
+	cmd += [
 		'-i', input_path,
-		'-map', '0:v:0',
-		'-map', '1:a?',
 	] + ffmpeg_builder.set_video_encoder(video_encoder) + video_quality_args + video_preset_args + [
 		'-map', '0:v:0',
 		'-map', '1:a?',
@@ -136,8 +153,10 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	target_path = state_manager.get_item('target_path')
 	output_path = state_manager.get_item('output_path')
 
-	width, height, temp_video_fps = _get_streaming_video_props()
+	width, height, temp_video_fps, trim_frame_start, trim_frame_end = _get_streaming_video_props()
 	frame_size = width * height * 3
+	start_sec = _frame_to_seconds(trim_frame_start, temp_video_fps)
+	end_sec = _frame_to_seconds(trim_frame_end, temp_video_fps) if trim_frame_end else None
 
 	reference_vision_frame = read_static_video_frame(target_path, state_manager.get_item('reference_frame_number'))
 	source_paths = state_manager.get_item('source_paths') or []
@@ -145,8 +164,8 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	source_audio_path = get_first(filter_audio_paths(source_paths))
 	processor_modules = list(get_processors_modules(state_manager.get_item('processors')))
 
-	decoder = _launch_decoder_ffmpeg(target_path, width, height)
-	encoder = _launch_encoder_ffmpeg(output_path, target_path, width, height, temp_video_fps)
+	decoder = _launch_decoder_ffmpeg(target_path, width, height, start_sec, end_sec)
+	encoder = _launch_encoder_ffmpeg(output_path, target_path, width, height, temp_video_fps, start_sec, end_sec)
 
 	if decoder.stdout is None or encoder.stdin is None:
 		logger.error("Failed to start streaming encoder/decoder.", __name__)
