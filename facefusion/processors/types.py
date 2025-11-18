@@ -1,8 +1,16 @@
-from typing import Any, Dict, Tuple, TypeAlias
+from typing import Any, Dict, Tuple, TypeAlias, Union
 
 from numpy.typing import NDArray
 
 from facefusion.types import AppContext, Mask, VisionFrame
+
+try:
+	from facefusion.gpu_types import CUDAFrame, CUDAMask, VisionFrameAny, MaskAny
+	GPU_AVAILABLE = True
+except ImportError:
+	GPU_AVAILABLE = False
+	VisionFrameAny = VisionFrame  # type: ignore
+	MaskAny = Mask  # type: ignore
 
 LivePortraitPitch : TypeAlias = float
 LivePortraitYaw : TypeAlias = float
@@ -18,3 +26,4 @@ ProcessorStateKey = str
 ProcessorState : TypeAlias = Dict[ProcessorStateKey, Any]
 ProcessorStateSet : TypeAlias = Dict[AppContext, ProcessorState]
 ProcessorOutputs : TypeAlias = Tuple[VisionFrame, Mask]
+ProcessorOutputsAny : TypeAlias = Tuple[VisionFrameAny, MaskAny]

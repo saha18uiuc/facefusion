@@ -1,5 +1,5 @@
 import subprocess
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy
 
@@ -12,6 +12,18 @@ from facefusion import ffmpeg_builder
 from facefusion.time_helper import calculate_end_time
 from facefusion.types import ErrorCode
 from facefusion.vision import conditional_merge_vision_mask, detect_video_resolution, extract_vision_mask, pack_resolution, read_static_image, read_static_images, read_static_video_frame, restrict_trim_frame, restrict_video_fps, restrict_video_resolution, scale_resolution, write_image
+
+try:
+	import torch
+	from facefusion.gpu_types import (
+		get_processing_mode,
+		numpy_to_cuda,
+		cuda_to_numpy,
+		get_cuda_device
+	)
+	GPU_AVAILABLE = True
+except ImportError:
+	GPU_AVAILABLE = False
 
 
 def _get_streaming_video_props() -> Tuple[int, int, float, int, int]:
@@ -121,32 +133,128 @@ def _rgba_to_bgr(frame: numpy.ndarray) -> numpy.ndarray:
 	return frame[:, :, :3]
 
 
+def _bgr_to_rgba_cuda(frame) -> 'torch.Tensor':
+	"""Convert BGR CUDA tensor to RGBA by adding alpha channel."""
+	if not GPU_AVAILABLE:
+		raise RuntimeError("GPU mode not available")
+
+	alpha = torch.full((frame.shape[0], frame.shape[1], 1), 255, dtype=frame.dtype, device=frame.device)
+	return torch.cat([frame, alpha], dim=-1)
+
+
+def _rgba_to_bgr_cuda(frame) -> 'torch.Tensor':
+	"""Convert RGBA CUDA tensor to BGR by removing alpha channel."""
+	return frame[:, :, :3]
+
+
+def extract_vision_mask_cuda(frame, device: str):
+	"""Extract vision mask from RGBA frame on GPU."""
+	if not GPU_AVAILABLE:
+		raise RuntimeError("GPU mode not available")
+
+	# Check if frame has alpha channel
+	if frame.shape[-1] == 4:
+		alpha_mask = frame[:, :, 3].float() / 255.0
+		return alpha_mask
+	else:
+		# No alpha, return full mask
+		return torch.ones((frame.shape[0], frame.shape[1]), dtype=torch.float32, device=device)
+
+
+def conditional_merge_vision_mask_cuda(frame, mask):
+	"""Merge vision frame with mask on GPU."""
+	if not GPU_AVAILABLE:
+		raise RuntimeError("GPU mode not available")
+
+	# If frame has alpha channel, update it with mask
+	if frame.shape[-1] == 4:
+		frame = frame.clone()
+		frame[:, :, 3] = (mask * 255.0).byte()
+	return frame
+
+
 def _process_streaming_frame(bgr_frame: numpy.ndarray,
                              frame_number: int,
                              reference_vision_frame: numpy.ndarray,
                              source_vision_frames: List[numpy.ndarray],
                              processor_modules: List,
                              source_audio_path: Optional[str],
-                             temp_video_fps: float) -> numpy.ndarray:
-	target_vision_frame = _bgr_to_rgba(bgr_frame)
-	temp_vision_frame = target_vision_frame.copy()
-	temp_vision_mask = extract_vision_mask(temp_vision_frame)
-	source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
+                             temp_video_fps: float,
+                             device: Optional[str] = None) -> numpy.ndarray:
+	"""
+	Process a single frame through the processor chain.
 
-	for processor_module in processor_modules:
-		temp_vision_frame, temp_vision_mask = processor_module.process_frame(
-		{
-			'reference_vision_frame': reference_vision_frame,
-			'source_vision_frames': source_vision_frames,
-			'source_audio_frame': source_audio_frame,
-			'source_voice_frame': source_voice_frame,
-			'target_vision_frame': target_vision_frame[:, :, :3],
-			'temp_vision_frame': temp_vision_frame[:, :, :3],
-			'temp_vision_mask': temp_vision_mask
-		})
+	Args:
+		bgr_frame: Input BGR frame as NumPy array
+		frame_number: Current frame number
+		reference_vision_frame: Reference frame
+		source_vision_frames: Source faces
+		processor_modules: List of processor modules
+		source_audio_path: Path to source audio
+		temp_video_fps: Video FPS
+		device: CUDA device (if GPU mode)
 
-	temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
-	return _rgba_to_bgr(temp_vision_frame)
+	Returns:
+		Processed BGR frame as NumPy array
+	"""
+	processing_mode = get_processing_mode() if GPU_AVAILABLE else 'cpu'
+
+	if processing_mode == 'gpu' and device is not None:
+		# GPU path: convert to CUDA and keep on GPU throughout
+		bgr_frame_cuda = numpy_to_cuda(bgr_frame, device=device)
+		target_vision_frame = _bgr_to_rgba_cuda(bgr_frame_cuda)
+		temp_vision_frame = target_vision_frame.clone()
+		temp_vision_mask = extract_vision_mask_cuda(temp_vision_frame, device=device)
+
+		# Convert reference and source frames to CUDA once
+		reference_vision_frame_cuda = numpy_to_cuda(reference_vision_frame, device=device)
+		source_vision_frames_cuda = [numpy_to_cuda(frame, device=device) for frame in source_vision_frames]
+
+		source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
+
+		# Process with CUDA tensors directly (processors handle CPU conversion internally if needed)
+		for processor_module in processor_modules:
+			# Pass CUDA tensors directly - processor will detect and use GPU path
+			temp_vision_frame, temp_vision_mask = processor_module.process_frame(
+			{
+				'reference_vision_frame': reference_vision_frame,  # NumPy for face detection
+				'source_vision_frames': source_vision_frames,  # NumPy for face detection
+				'source_audio_frame': source_audio_frame,
+				'source_voice_frame': source_voice_frame,
+				'target_vision_frame': cuda_to_numpy(target_vision_frame[:, :, :3]),  # NumPy for face detection
+				'temp_vision_frame': temp_vision_frame[:, :, :3],  # CUDA tensor for processing
+				'temp_vision_mask': temp_vision_mask  # CUDA tensor for processing
+			})
+
+			# Outputs should already be CUDA tensors from GPU-aware processor
+			# No need to convert unless processor falls back to CPU
+
+		temp_vision_frame = conditional_merge_vision_mask_cuda(temp_vision_frame, temp_vision_mask)
+		result_bgr = _rgba_to_bgr_cuda(temp_vision_frame)
+
+		# Convert back to NumPy only at the end for encoder
+		return cuda_to_numpy(result_bgr)
+	else:
+		# CPU path (original implementation)
+		target_vision_frame = _bgr_to_rgba(bgr_frame)
+		temp_vision_frame = target_vision_frame.copy()
+		temp_vision_mask = extract_vision_mask(temp_vision_frame)
+		source_audio_frame, source_voice_frame = _resolve_audio_frames(source_audio_path, temp_video_fps, frame_number)
+
+		for processor_module in processor_modules:
+			temp_vision_frame, temp_vision_mask = processor_module.process_frame(
+			{
+				'reference_vision_frame': reference_vision_frame,
+				'source_vision_frames': source_vision_frames,
+				'source_audio_frame': source_audio_frame,
+				'source_voice_frame': source_voice_frame,
+				'target_vision_frame': target_vision_frame[:, :, :3],
+				'temp_vision_frame': temp_vision_frame[:, :, :3],
+				'temp_vision_mask': temp_vision_mask
+			})
+
+		temp_vision_frame = conditional_merge_vision_mask(temp_vision_frame, temp_vision_mask)
+		return _rgba_to_bgr(temp_vision_frame)
 
 
 def run_streaming_video_job(start_time: float) -> ErrorCode:
@@ -163,6 +271,14 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	source_vision_frames = read_static_images(source_paths)
 	source_audio_path = get_first(filter_audio_paths(source_paths))
 	processor_modules = list(get_processors_modules(state_manager.get_item('processors')))
+
+	# Determine GPU device if GPU mode is enabled
+	processing_mode = get_processing_mode() if GPU_AVAILABLE else 'cpu'
+	device = None
+	if processing_mode == 'gpu':
+		device_ids = state_manager.get_item('execution_device_ids') or ['0']
+		device = get_cuda_device(str(device_ids[0]))
+		logger.info(f"GPU mode enabled, using device: {device}", __name__)
 
 	decoder = _launch_decoder_ffmpeg(target_path, width, height, start_sec, end_sec)
 	encoder = _launch_encoder_ffmpeg(output_path, target_path, width, height, temp_video_fps, start_sec, end_sec)
@@ -187,7 +303,8 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 				source_vision_frames,
 				processor_modules,
 				source_audio_path,
-				temp_video_fps
+				temp_video_fps,
+				device=device  # Pass GPU device if GPU mode
 			)
 			if processed_bgr is None:
 				return 1

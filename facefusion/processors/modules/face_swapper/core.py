@@ -963,29 +963,67 @@ def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Fa
 def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	global _frame_count
 
-	reference_vision_frame = inputs.get('reference_vision_frame')
-	source_vision_frames = inputs.get('source_vision_frames')
-	target_vision_frame = inputs.get('target_vision_frame')
+	# Check if GPU mode is enabled and inputs are CUDA tensors
+	try:
+		from facefusion.gpu_types import get_processing_mode, is_cuda_tensor, ensure_numpy_array
+		processing_mode = get_processing_mode()
+		gpu_available = True
+	except ImportError:
+		processing_mode = 'cpu'
+		gpu_available = False
+
 	temp_vision_frame = inputs.get('temp_vision_frame')
 	temp_vision_mask = inputs.get('temp_vision_mask')
-	source_face = extract_source_face(source_vision_frames)
-	target_faces = select_faces(reference_vision_frame, target_vision_frame)
 
-	if source_face and target_faces:
-		for target_face in target_faces:
-			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
-			temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
+	# Dispatch to GPU or CPU implementation
+	if gpu_available and processing_mode == 'gpu' and is_cuda_tensor(temp_vision_frame):
+		# GPU path: process with GPU tensors
+		from facefusion.processors.modules.face_swapper.core_gpu import process_frame_gpu
+		from facefusion.gpu_types import get_cuda_device
 
-	# Increment frame counter
-	_frame_count += 1
+		device_ids = state_manager.get_item('execution_device_ids') or ['0']
+		device = get_cuda_device(str(device_ids[0]))
 
-	# Periodic CUDA memory cleanup to prevent OOM
-	# Clean up every N frames to maintain stable memory usage
-	if _frame_count % _batch_cleanup_interval == 0:
-		cleanup_cuda_memory(aggressive=False)
+		temp_vision_frame_cuda, temp_vision_mask_cuda = process_frame_gpu(inputs, device=device)
 
-	# Aggressive cleanup every 50 frames
-	if _frame_count % 50 == 0:
-		cleanup_cuda_memory(aggressive=True)
+		# Increment frame counter
+		_frame_count += 1
 
-	return temp_vision_frame, temp_vision_mask
+		# Periodic CUDA memory cleanup
+		if _frame_count % _batch_cleanup_interval == 0:
+			cleanup_cuda_memory(aggressive=False)
+
+		if _frame_count % 50 == 0:
+			cleanup_cuda_memory(aggressive=True)
+
+		return temp_vision_frame_cuda, temp_vision_mask_cuda
+	else:
+		# CPU path (original implementation)
+		reference_vision_frame = inputs.get('reference_vision_frame')
+		source_vision_frames = inputs.get('source_vision_frames')
+		target_vision_frame = inputs.get('target_vision_frame')
+
+		# Ensure inputs are NumPy arrays for CPU processing
+		if gpu_available and is_cuda_tensor(temp_vision_frame):
+			temp_vision_frame = ensure_numpy_array(temp_vision_frame)
+			temp_vision_mask = ensure_numpy_array(temp_vision_mask)
+
+		source_face = extract_source_face(source_vision_frames)
+		target_faces = select_faces(reference_vision_frame, target_vision_frame)
+
+		if source_face and target_faces:
+			for target_face in target_faces:
+				target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
+				temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
+
+		# Increment frame counter
+		_frame_count += 1
+
+		# Periodic CUDA memory cleanup
+		if _frame_count % _batch_cleanup_interval == 0:
+			cleanup_cuda_memory(aggressive=False)
+
+		if _frame_count % 50 == 0:
+			cleanup_cuda_memory(aggressive=True)
+
+		return temp_vision_frame, temp_vision_mask

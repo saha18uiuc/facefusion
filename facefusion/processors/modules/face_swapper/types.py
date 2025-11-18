@@ -1,6 +1,14 @@
-from typing import Dict, List, Literal, TypeAlias, TypedDict
+from typing import Dict, List, Literal, TypeAlias, TypedDict, Union
 
 from facefusion.types import Mask, VisionFrame
+
+try:
+	from facefusion.gpu_types import VisionFrameAny, MaskAny
+	GPU_AVAILABLE = True
+except ImportError:
+	GPU_AVAILABLE = False
+	VisionFrameAny = VisionFrame  # type: ignore
+	MaskAny = Mask  # type: ignore
 
 FaceSwapperInputs = TypedDict('FaceSwapperInputs',
 {
@@ -9,6 +17,15 @@ FaceSwapperInputs = TypedDict('FaceSwapperInputs',
 	'target_vision_frame' : VisionFrame,
 	'temp_vision_frame' : VisionFrame,
 	'temp_vision_mask' : Mask
+})
+
+FaceSwapperInputsAny = TypedDict('FaceSwapperInputsAny',
+{
+	'reference_vision_frame' : VisionFrameAny,
+	'source_vision_frames' : List[VisionFrameAny],
+	'target_vision_frame' : VisionFrameAny,
+	'temp_vision_frame' : VisionFrameAny,
+	'temp_vision_mask' : MaskAny
 })
 
 FaceSwapperModel = Literal['blendswap_256', 'ghost_1_256', 'ghost_2_256', 'ghost_3_256', 'hififace_unofficial_256', 'hyperswap_1a_256', 'hyperswap_1b_256', 'hyperswap_1c_256', 'inswapper_128', 'inswapper_128_fp16', 'simswap_256', 'simswap_unofficial_512', 'uniface_256']
