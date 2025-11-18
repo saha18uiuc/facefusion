@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache, partial
+from functools import partial
 from typing import List, Optional, Tuple
 
 import numpy
@@ -17,6 +17,13 @@ from facefusion.time_helper import calculate_end_time
 from facefusion.types import ErrorCode
 from facefusion.vision import conditional_merge_vision_mask, detect_video_resolution, extract_vision_mask, pack_resolution, read_static_image, read_static_images, read_static_video_frame, restrict_trim_frame, restrict_video_fps, restrict_video_resolution, scale_resolution, write_image
 from facefusion.workflows.core import is_process_stopping
+
+# Simple per-job cache for decoded reference and source frames.
+_FRAME_CACHE_TARGET_PATH: Optional[str] = None
+_FRAME_CACHE_REFERENCE_NUMBER: Optional[int] = None
+_FRAME_CACHE_REFERENCE_FRAME: Optional[numpy.ndarray] = None
+_FRAME_CACHE_SOURCE_PATHS: Tuple[str, ...] = ()
+_FRAME_CACHE_SOURCE_FRAMES: List[numpy.ndarray] = []
 
 
 def process(start_time : float) -> ErrorCode:
@@ -73,6 +80,7 @@ def extract_frames() -> ErrorCode:
 
 
 def process_video() -> ErrorCode:
+	_prepare_frame_cache()
 	temp_frame_paths = resolve_temp_frame_paths(state_manager.get_item('target_path'))
 
 	if temp_frame_paths:
@@ -165,20 +173,25 @@ def finalize_video(start_time : float) -> ErrorCode:
 	return 0
 
 
-@lru_cache(maxsize = None)
-def _cached_reference_frame(target_path : str, reference_frame_number : int) -> Optional[numpy.ndarray]:
+def _prepare_frame_cache() -> None:
 	"""
-	Decode the reference frame once per (target_path, reference_frame_number) and reuse it across frames.
+	Decode reference/source frames once per job and reuse across threads.
 	"""
-	return read_static_video_frame(target_path, reference_frame_number)
+	global _FRAME_CACHE_TARGET_PATH, _FRAME_CACHE_REFERENCE_NUMBER, _FRAME_CACHE_REFERENCE_FRAME
+	global _FRAME_CACHE_SOURCE_PATHS, _FRAME_CACHE_SOURCE_FRAMES
 
+	target_path = state_manager.get_item('target_path')
+	reference_number = state_manager.get_item('reference_frame_number')
+	source_paths: Tuple[str, ...] = tuple(state_manager.get_item('source_paths') or [])
 
-@lru_cache(maxsize = None)
-def _cached_source_frames(source_paths : Tuple[str, ...]) -> List[numpy.ndarray]:
-	"""
-	Decode all source images once per tuple(source_paths) and reuse them.
-	"""
-	return read_static_images(list(source_paths))
+	if target_path != _FRAME_CACHE_TARGET_PATH or reference_number != _FRAME_CACHE_REFERENCE_NUMBER:
+		_FRAME_CACHE_REFERENCE_FRAME = read_static_video_frame(target_path, reference_number)
+		_FRAME_CACHE_TARGET_PATH = target_path
+		_FRAME_CACHE_REFERENCE_NUMBER = reference_number
+
+	if source_paths != _FRAME_CACHE_SOURCE_PATHS:
+		_FRAME_CACHE_SOURCE_FRAMES = read_static_images(list(source_paths))
+		_FRAME_CACHE_SOURCE_PATHS = source_paths
 
 
 def _resolve_audio_frames(source_audio_path : Optional[str], temp_video_fps : float, frame_number : int) -> Tuple[numpy.ndarray, numpy.ndarray]:
@@ -227,10 +240,10 @@ def process_frame_runtime(target_vision_frame : numpy.ndarray,
 def process_temp_frame(temp_frame_path : str, frame_number : int) -> bool:
 	target_path = state_manager.get_item('target_path')
 	reference_frame_number = state_manager.get_item('reference_frame_number')
-	reference_vision_frame = _cached_reference_frame(target_path, reference_frame_number)
+	_prepare_frame_cache()
 
-	source_paths = tuple(state_manager.get_item('source_paths') or [])
-	source_vision_frames = _cached_source_frames(source_paths)
+	reference_vision_frame = _FRAME_CACHE_REFERENCE_FRAME
+	source_vision_frames = _FRAME_CACHE_SOURCE_FRAMES
 
 	source_audio_path = get_first(filter_audio_paths(state_manager.get_item('source_paths')))
 	temp_video_fps = restrict_video_fps(target_path, state_manager.get_item('output_video_fps'))

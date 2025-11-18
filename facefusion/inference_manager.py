@@ -83,7 +83,9 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 
 
 def get_inference_context(module_name : str, model_names : List[str], execution_device_id : str, execution_providers : List[ExecutionProvider]) -> str:
-	parts = [ module_name ] + model_names + [ str(execution_device_id) ] + [ str(provider) for provider in execution_providers ]
+	model_key = tuple(model_names)
+	provider_names = tuple(str(provider[0]) if isinstance(provider, tuple) else str(provider) for provider in execution_providers)
+	parts = [ module_name, '.'.join(model_key), str(execution_device_id), '.'.join(provider_names) ]
 	return '.'.join(parts)
 
 
