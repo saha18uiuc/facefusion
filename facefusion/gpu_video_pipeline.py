@@ -3,6 +3,7 @@ from functools import lru_cache
 from typing import List, Optional, Tuple, Union
 
 import numpy
+import cv2
 
 from facefusion import logger, state_manager, translator
 from facefusion.audio import create_empty_audio_frame, get_audio_frame, get_voice_frame
@@ -54,6 +55,14 @@ def _get_streaming_video_props() -> Tuple[int, int, float, int, int]:
 	return temp_res[0], temp_res[1], temp_fps, trim_frame_start, trim_frame_end
 
 
+def _nv12_bytes_to_bgr(raw: bytes, width: int, height: int) -> Optional[numpy.ndarray]:
+	expected = int(width * height * 3 // 2)
+	if len(raw) < expected:
+		return None
+	yuv = numpy.frombuffer(raw, dtype=numpy.uint8).reshape((height * 3 // 2, width))
+	return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+
+
 def _frame_to_seconds(frame_index: int, fps: float) -> Optional[float]:
 	if frame_index and fps:
 		return frame_index / fps
@@ -70,53 +79,53 @@ def _append_trim_args(cmd: List[str], start_sec: Optional[float], end_sec: Optio
 def _launch_decoder_ffmpeg(input_path: str, width: int, height: int,
                            start_sec: Optional[float],
                            end_sec: Optional[float]) -> subprocess.Popen:
-    use_hwscale = state_manager.get_item('prefer_hwscale')
-    use_hwscale = True if use_hwscale is None else bool(use_hwscale)
+	use_hwscale = state_manager.get_item('prefer_hwscale')
+	use_hwscale = True if use_hwscale is None else bool(use_hwscale)
 
-    if use_hwscale and _ffmpeg_supports_filter('scale_cuda'):
-        scale_filter = 'scale_cuda'
-    else:
-        use_hwscale = False
-        scale_filter = 'scale'
+	if use_hwscale and _ffmpeg_supports_filter('scale_cuda'):
+		scale_filter = 'scale_cuda'
+	else:
+		use_hwscale = False
+		scale_filter = 'scale'
 
-    cmd = [
-        'ffmpeg',
-        '-hide_banner',
-        '-loglevel', 'warning',
-        '-hwaccel', 'cuda',
-        '-hwaccel_device', '0',
-    ]
+	cmd = [
+		'ffmpeg',
+		'-hide_banner',
+		'-loglevel', 'warning',
+		'-hwaccel', 'cuda',
+		'-hwaccel_device', '0',
+	]
 
-    if use_hwscale:
-        cmd += ['-hwaccel_output_format', 'cuda']
+	if use_hwscale:
+		cmd += ['-hwaccel_output_format', 'cuda']
 
-    _append_trim_args(cmd, start_sec, end_sec)
+	_append_trim_args(cmd, start_sec, end_sec)
 
-    filter_chain: List[str] = []
-    if scale_filter == 'scale_cuda':
-        # ✅ Force a CUDA hw format that hwdownload can handle
-        filter_chain.append(f"scale_cuda={width}:{height}:format=nv12")
-        filter_chain.append("hwdownload")
-        filter_chain.append("format=bgr24")
-    else:
-        filter_chain.append(f"scale={width}:{height}:flags=lanczos")
-        filter_chain.append("format=bgr24")
+	# Keep decoder output in NV12 all the way; final BGR conversion happens in Python.
+	filter_chain: List[str] = []
+	if scale_filter == 'scale_cuda':
+		filter_chain.append(f"scale_cuda={width}:{height}")
+		filter_chain.append("hwdownload")
+		filter_chain.append("format=nv12")
+	else:
+		filter_chain.append(f"scale={width}:{height}:flags=lanczos")
+		filter_chain.append("format=nv12")
 
-    cmd += [
-        '-i', input_path,
-        '-vf', ','.join(filter_chain),
-        '-pix_fmt', 'bgr24',
-        '-f', 'rawvideo',
-        'pipe:1'
-    ]
+	cmd += [
+		'-i', input_path,
+		'-vf', ','.join(filter_chain),
+		'-pix_fmt', 'nv12',
+		'-f', 'rawvideo',
+		'pipe:1'
+	]
 
-    logger.info(f"Decoder command: {' '.join(cmd)}", __name__)
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=10 ** 8
-    )
+	logger.info(f"Decoder command: {' '.join(cmd)}", __name__)
+	return subprocess.Popen(
+		cmd,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		bufsize=10 ** 8
+	)
 
 
 
@@ -371,7 +380,8 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 	output_path = state_manager.get_item('output_path')
 
 	width, height, temp_video_fps, trim_frame_start, trim_frame_end = _get_streaming_video_props()
-	frame_size = width * height * 3
+	# NV12 frame size (1.5 bytes per pixel)
+	frame_size = int(width * height * 3 // 2)
 	start_sec = _frame_to_seconds(trim_frame_start, temp_video_fps)
 	end_sec = _frame_to_seconds(trim_frame_end, temp_video_fps) if trim_frame_end else None
 
@@ -422,11 +432,11 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 
 	frame_number = 0
 
-	try:
-		while True:
-			raw = decoder.stdout.read(frame_size)
-			if not raw or len(raw) < frame_size:
-				# Check if decoder had errors
+		try:
+			while True:
+				raw = decoder.stdout.read(frame_size)
+				if not raw or len(raw) < frame_size:
+					# Check if decoder had errors
 				if decoder.stderr:
 					stderr_output = decoder.stderr.read().decode('utf-8', errors='ignore')
 					if stderr_output:
@@ -434,7 +444,10 @@ def run_streaming_video_job(start_time: float) -> ErrorCode:
 				logger.info(f"Decoder finished after {frame_number} frames", __name__)
 				break
 
-			bgr_frame = numpy.frombuffer(raw, dtype = numpy.uint8).reshape((height, width, 3))
+			bgr_frame = _nv12_bytes_to_bgr(raw, width, height)
+			if bgr_frame is None:
+				logger.error(f"Failed to decode NV12 frame {frame_number}", __name__)
+				break
 
 			if frame_number == 0:
 				logger.info(f"Processing first frame - shape: {bgr_frame.shape}, dtype: {bgr_frame.dtype}", __name__)
