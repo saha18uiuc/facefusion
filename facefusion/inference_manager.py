@@ -24,7 +24,7 @@ INFERENCE_POOL_SET : InferencePoolSet =\
 def get_inference_pool(module_name : str, model_names : List[str], model_source_set : DownloadSet) -> InferencePool:
 	while process_manager.is_checking():
 		sleep(0.5)
-	execution_device_ids = state_manager.get_item('execution_device_ids')
+	execution_device_ids = [ str(device_id) for device_id in state_manager.get_item('execution_device_ids') ]
 	execution_providers = resolve_execution_providers(module_name)
 	app_context = detect_app_context()
 
@@ -83,8 +83,8 @@ def create_inference_session(model_path : str, execution_device_id : str, execut
 
 
 def get_inference_context(module_name : str, model_names : List[str], execution_device_id : str, execution_providers : List[ExecutionProvider]) -> str:
-	inference_context = '.'.join([ module_name ] + model_names + [ execution_device_id ] + list(execution_providers))
-	return inference_context
+	parts = [ module_name ] + model_names + [ str(execution_device_id) ] + [ str(provider) for provider in execution_providers ]
+	return '.'.join(parts)
 
 
 def resolve_execution_providers(module_name : str) -> List[ExecutionProvider]:
